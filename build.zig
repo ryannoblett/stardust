@@ -2,18 +2,19 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-
-    const main_mod = b.createModule(.{
-        .root_source_file = b.path("main.zig"),
-        .target = target,
-    });
+    const optimize = b.standardOptimizeOption(.{});
 
     const exe = b.addExecutable(.{
         .name = "stardust",
-        .root_module = main_mod,
+        .root_source_file = b.path("main.zig"),
+        .target = target,
+        .optimize = optimize,
     });
 
+    b.installArtifact(exe);
+
     const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
 
     if (b.args) |args| {
         run_cmd.addArgs(args);
@@ -22,10 +23,23 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
-    const dev_exe = b.addExecutable(.{
-        .name = "stardust",
-        .root_module = main_mod,
+    const check_exe = b.addExecutable(.{
+        .name = "stardust-check",
+        .root_source_file = b.path("main.zig"),
+        .target = target,
+        .optimize = optimize,
     });
-    const dev_step = b.step("dev", "Development with debug optimizations");
-    dev_step.dependOn(&b.addRunArtifact(dev_exe).step);
+
+    const check_step = b.step("check", "Check compilation without linking");
+    check_step.dependOn(&check_exe.step);
+
+    const unit_tests = b.addTest(.{
+        .root_source_file = b.path("main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const run_unit_tests = b.addRunArtifact(unit_tests);
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_unit_tests.step);
 }
