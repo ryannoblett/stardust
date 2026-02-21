@@ -108,7 +108,7 @@ pub const DHCPServer = struct {
 
     /// Main server loop. Binds a UDP socket on port 67 and processes packets.
     pub fn run(self: *Self) !void {
-        const stdout = std.io.getStdOut().writer();
+        const stdout = td.fs.File.stdout().writeAll();
 
         self.running.store(true, .seq_cst);
         defer self.running.store(false, .seq_cst);

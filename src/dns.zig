@@ -35,7 +35,7 @@ pub const DNSUpdater = struct {
     }
 
     pub fn run(self: *Self) !void {
-        const stdout = std.io.getStdOut().writer();
+        const stdout = td.fs.File.stdout().writeAll();
 
         if (!self.config.enable) {
             try stdout.print("DNS updater disabled in config\n", .{});

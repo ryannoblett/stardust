@@ -16,7 +16,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const stdout = std.io.getStdOut().writer();
+    const stdout = td.fs.File.stdout().writeAll();
 
     try stdout.print("Starting Stardust DHCP Server...\n", .{});
 
