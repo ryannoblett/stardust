@@ -15,6 +15,12 @@ pub fn build(b: *std.Build) void {
         .name = "stardust",
         .root_module = main_mod,
     });
+    // Add yaml 
+    const yaml = b.dependency("yaml", .{
+      .target = target,
+      .optimize = optimize,
+    });
+    exe.root_module.addImport("yaml", yaml.module("yaml"));
     const run_cmd = b.addRunArtifact(exe);
     if (b.args) |args| run_cmd.addArgs(args);
     const run_step = b.step("run", "Run the app");
@@ -39,4 +45,5 @@ pub fn build(b: *std.Build) void {
     });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+
 }

@@ -1,0 +1,12 @@
+.{
+    .name = .stardust,
+    .version = "0.15.2",
+    .dependencies = .{
+        .yaml = .{
+            .url = "https://github.com/kubkon/zig-yaml/archive/refs/tags/0.2.0.tar.gz",
+            .hash = "zig_yaml-0.2.0-C1161pmrAgC_rL9WzjvgNg7HnmyAMwHsG3Sre0F4haPI",
+        },
+    },
+    .paths = .{""},
+    .fingerprint = 0xaa64878d2aabb77a,
+}

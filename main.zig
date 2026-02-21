@@ -15,7 +15,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    try std.fs.File.stdout().writeAll("Starting Stardust DHCP Server...\n", .{});
+    try std.fs.File.stdout().writeAll("Starting Stardust DHCP Server...\n");
 
     // Load configuration
     var cfg = config_mod.load(allocator, "config.yaml") catch |err| {
@@ -30,7 +30,7 @@ pub fn main() !void {
     const mask_c: u8 = @intCast((mask >> 8) & 0xFF);
     const mask_d: u8 = @intCast(mask & 0xFF);
 
-    try std.fs.File.stdout().writeAll("Configuration loaded successfully\n", .{});
+    try std.fs.File.stdout().writeAll("Configuration loaded successfully\n");
     try std.fs.File.stdout().writeAll("  listen:     {s}\n", .{cfg.listen_address});
     try std.fs.File.stdout().writeAll("  subnet:     {s}/{d}.{d}.{d}.{d}\n", .{
         cfg.subnet, mask_a, mask_b, mask_c, mask_d,
