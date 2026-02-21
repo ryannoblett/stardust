@@ -1,12 +1,21 @@
 const std = @import("std");
+const config_mod = @import("./config.zig");
+const state_mod = @import("./state.zig");
+
+pub const Config = config_mod.Config;
+pub const StateStore = state_mod.StateStore;
 
 pub const Error = error{
     SocketError,
     IoError,
     InvalidRequest,
+    OutOfMemory,
 };
 
-// DHCP message types
+// ---------------------------------------------------------------------------
+// DHCP message types (RFC 2132 option 53)
+// ---------------------------------------------------------------------------
+
 pub const MessageType = enum(u8) {
     DHCPDISCOVER = 1,
     DHCPOFFER = 2,
@@ -16,9 +25,13 @@ pub const MessageType = enum(u8) {
     DHCPNAK = 6,
     DHCPRELEASE = 7,
     DHCPINFORM = 8,
+    _,
 };
 
-// DHCP packet header
+// ---------------------------------------------------------------------------
+// DHCP packet header (RFC 2131)
+// ---------------------------------------------------------------------------
+
 pub const DHCPHeader = extern struct {
     op: u8,
     htype: u8,
@@ -37,284 +50,530 @@ pub const DHCPHeader = extern struct {
     magic: [4]u8,
 };
 
-// DHCP option codes (partial list)
+pub const dhcp_magic_cookie = [4]u8{ 99, 130, 83, 99 };
+pub const dhcp_min_packet_size = @sizeOf(DHCPHeader);
+pub const dhcp_options_offset = 236; // header without magic
+pub const dhcp_server_port: u16 = 67;
+pub const dhcp_client_port: u16 = 68;
+
+// ---------------------------------------------------------------------------
+// DHCP option codes (partial list, RFC 2132)
+// ---------------------------------------------------------------------------
+
 pub const OptionCode = enum(u8) {
     Pad = 0,
     SubnetMask = 1,
-    TimeOffset = 2,
     Router = 3,
-    TimeServer = 4,
-    NameServer = 5,
     DomainNameServer = 6,
-    LogServer = 7,
-    CookieServer = 8,
-    LPRServer = 9,
-    ImpressServer = 10,
-    ResourceLocationServer = 11,
     HostName = 12,
-    BootFileSize = 13,
-    MeritDumpFile = 14,
     DomainName = 15,
-    SwapServer = 16,
-    RootPath = 17,
-    ExtensionsPath = 18,
-    IPForwarding = 19,
-    NonLocalSourceRouting = 20,
-    PolicyFilter = 21,
-    MaxDatagramReassembly = 22,
-    DefaultIPTTL = 23,
-    PathMTUAgingTimeout = 24,
-    PathMTU_Plateau_Table = 25,
-    InterfaceMTU = 26,
-    AllSubnetsLocal = 27,
-    broadcastAddress = 28,
-    performMaskDiscovery = 29,
-    maskSupplier = 30,
-    PerformRouterDiscovery = 31,
-    RouterSolicitationAddress = 32,
-    StaticRoute = 33,
-    TrailerEncapsulation = 34,
-    ARPTimeout = 35,
-    EthernetEncapsulation = 36,
-    TCPDefaultTTL = 37,
-    TCPKeepaliveInterval = 38,
-    TCPKeepaliveGarbage = 39,
-    ISNS = 40,
     RequestedIPAddress = 50,
     IPAddressLeaseTime = 51,
-    Overload = 52,
     MessageType = 53,
     ServerIdentifier = 54,
     ParameterRequestList = 55,
-    Message = 56,
-    MaxMessageSize = 57,
     RenewalTimeValue = 58,
     RebindingTimeValue = 59,
     ClientID = 61,
-    ClientFQDN = 81,
-    VendorClass = 124,
-    TFTPServerName = 128,
-    BootfileName = 129,
-    DHCPMessageType = 53,
     End = 255,
+    _,
 };
+
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
 
 pub const DHCPServer = struct {
     allocator: std.mem.Allocator,
-    config: *const Config,
-    state: *const StateStore,
-    socket: std.net.Socket,
+    cfg: *const Config,
+    store: *StateStore,
     running: std.atomic.Value(bool),
 
     const Self = @This();
 
-    pub fn create(allocator: std.mem.Allocator, config: *const Config, state: *const StateStore) !*Self {
-        const socket = try std.net.Socket.create(std.net.Socket.IPv4);
-        errdefer socket.close();
-
-        try socket.setReuseaddr(true);
-
-        const listen_addr = std.net.Address.initIp(config.listen_address, 67);
-        try socket.listen(listen_addr);
-
-        return Self{
+    pub fn create(allocator: std.mem.Allocator, cfg: *const Config, store: *StateStore) !*Self {
+        const self = try allocator.create(Self);
+        self.* = .{
             .allocator = allocator,
-            .config = config,
-            .state = state,
-            .socket = socket,
+            .cfg = cfg,
+            .store = store,
             .running = std.atomic.Value(bool).init(false),
         };
+        return self;
     }
 
-    pub fn run(server: *Self) !void {
-        server.running.store(true, .monotonic);
-        defer server.running.store(false, .monotonic);
+    pub fn deinit(self: *Self) void {
+        self.allocator.destroy(self);
+    }
 
-        const stdout = std.fs.File.stdout().deprecatedWriter();
-        stdout.print("DHCP server listening on {s}:67\n", .{server.config.listen_address}) catch return;
+    /// Main server loop. Binds a UDP socket on port 67 and processes packets.
+    pub fn run(self: *Self) !void {
+        const stdout = std.io.getStdOut().writer();
 
-        var buffer: [1024]u8 = undefined;
+        self.running.store(true, .seq_cst);
+        defer self.running.store(false, .seq_cst);
 
-        while (server.running.load(.monotonic)) {
-            const packet_result = try server.socket.receiveToEnd(&buffer);
-            const packet = packet_result[0];
+        // Parse listen address
+        const listen_ip = try config_mod.parseIpv4(self.cfg.listen_address);
 
-            const response = server.processPacket(packet) catch |err| {
-                stdout.print("Error processing packet: {s}\n", .{@errorName(err)}) catch return;
+        // Bind UDP socket
+        const sock_fd = try std.posix.socket(
+            std.posix.AF.INET,
+            std.posix.SOCK.DGRAM,
+            std.posix.IPPROTO.UDP,
+        );
+        defer std.posix.close(sock_fd);
+
+        // SO_REUSEADDR
+        try std.posix.setsockopt(
+            sock_fd,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.REUSEADDR,
+            &std.mem.toBytes(@as(c_int, 1)),
+        );
+
+        // SO_BROADCAST — required to send to 255.255.255.255
+        try std.posix.setsockopt(
+            sock_fd,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.BROADCAST,
+            &std.mem.toBytes(@as(c_int, 1)),
+        );
+
+        const bind_addr = std.posix.sockaddr.in{
+            .family = std.posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, dhcp_server_port),
+            .addr = @bitCast(listen_ip),
+        };
+        try std.posix.bind(
+            sock_fd,
+            @ptrCast(&bind_addr),
+            @sizeOf(std.posix.sockaddr.in),
+        );
+
+        try stdout.print("DHCP server listening on {s}:{d}\n", .{
+            self.cfg.listen_address,
+            dhcp_server_port,
+        });
+
+        var buf: [1500]u8 = undefined;
+        var src_addr: std.posix.sockaddr.in = undefined;
+        var src_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
+
+        while (self.running.load(.seq_cst)) {
+            const n = std.posix.recvfrom(
+                sock_fd,
+                &buf,
+                0,
+                @ptrCast(&src_addr),
+                &src_len,
+            ) catch |err| {
+                try stdout.print("recvfrom error: {s}\n", .{@errorName(err)});
+                continue;
+            };
+
+            const packet = buf[0..n];
+
+            const response = self.processPacket(packet) catch |err| {
+                try stdout.print("Error processing packet: {s}\n", .{@errorName(err)});
                 continue;
             };
 
             if (response) |resp| {
-                _ = try server.socket.sendTo(resp, packet_result[0].source_address);
+                defer self.allocator.free(resp);
+
+                // Broadcast response to 255.255.255.255:68
+                const dst_addr = std.posix.sockaddr.in{
+                    .family = std.posix.AF.INET,
+                    .port = std.mem.nativeToBig(u16, dhcp_client_port),
+                    .addr = 0xFFFFFFFF,
+                };
+                _ = std.posix.sendto(
+                    sock_fd,
+                    resp,
+                    0,
+                    @ptrCast(&dst_addr),
+                    @sizeOf(std.posix.sockaddr.in),
+                ) catch |err| {
+                    try stdout.print("sendto error: {s}\n", .{@errorName(err)});
+                };
             }
         }
 
-        stdout.print("DHCP server stopped\n", .{}) catch return;
+        try stdout.print("DHCP server stopped\n", .{});
     }
 
-    fn processPacket(server: *Self, packet: std.net.Socket.UdpPacket) ?[]const u8 {
-        // Validate DHCP packet
-        if (packet.data.len < 200) return null; // DHCP min size is 200 bytes
+    fn processPacket(self: *Self, packet: []const u8) !?[]u8 {
+        if (packet.len < dhcp_min_packet_size) return null;
 
-        // Parse header
-        const header = @as(*const DHCPHeader, packet.data.ptr);
+        // Safety: packet is at least dhcp_min_packet_size bytes, and DHCPHeader
+        // is an extern struct so alignment is 1.
+        const header: *const DHCPHeader = @alignCast(@ptrCast(packet.ptr));
 
-        // Check magic cookie
-        var magic_cookie: [4]u8 = undefined;
-        @memcpy(&magic_cookie, &header.magic);
-        if (magic_cookie != [4]u8{ 99, 130, 83, 99 }) {
-            return null;
-        }
+        if (!std.mem.eql(u8, &header.magic, &dhcp_magic_cookie)) return null;
 
-        // Check message type option
-        const message_type = server.getMessageType(packet.data) orelse return null;
+        const msg_type = getMessageType(packet) orelse return null;
 
-        switch (message_type) {
-            .DHCPDISCOVER => {
-                return server.createOffer(packet.data);
+        return switch (msg_type) {
+            .DHCPDISCOVER => self.createOffer(packet),
+            .DHCPREQUEST => self.createAck(packet),
+            .DHCPRELEASE => blk: {
+                self.handleRelease(packet);
+                break :blk null;
             },
-            .DHCPREQUEST => {
-                return server.allocateLease(packet.data);
-            },
-            .DHCPRELEASE => {
-                return server.releaseLease(packet.data);
-            },
-            else => {
-                return null;
-            },
-        }
+            else => null,
+        };
     }
 
-    fn getMessageType(server: *Self, packet: []const u8) ?MessageType {
-        // Find DHCP message type option (option 53)
-        _ = server; // unused server parameter
-        const options_ptr = packet.ptr + 240; // Options start at offset 240
-
-        var pos: usize = 0;
-        while (options_ptr + pos + 1 < packet.len) : (pos + 1) {
-            const code = options_ptr[pos];
-            const len = options_ptr[pos + 1];
-
-            if (code == 255) break; // End option
-
-            if (code == 0) {
-                pos += 1;
+    fn getMessageType(packet: []const u8) ?MessageType {
+        if (packet.len < dhcp_min_packet_size + 4) return null;
+        const opts = packet[dhcp_min_packet_size..];
+        var i: usize = 0;
+        while (i + 1 < opts.len) {
+            const code = opts[i];
+            if (code == @intFromEnum(OptionCode.End)) break;
+            if (code == @intFromEnum(OptionCode.Pad)) {
+                i += 1;
                 continue;
             }
-
-            if (code == 53 and len > 0) {
-                if (len > options_ptr + pos + 2 - packet.len) break;
-                const type_val = options_ptr[pos + 2];
-                return @as(MessageType, @intFromEnum(@as(MessageType, .DHCPDISCOVER)) + type_val);
+            const len = opts[i + 1];
+            if (i + 2 + len > opts.len) break;
+            if (code == @intFromEnum(OptionCode.MessageType) and len >= 1) {
+                return @enumFromInt(opts[i + 2]);
             }
-
-            pos += 2 + len;
+            i += 2 + len;
         }
-
         return null;
     }
 
-    fn createOffer(server: *Self, request: []const u8) ?[]u8 {
-        // Validate DHCP DISCOVER message
-        if (request.len < 200) return null;
+    /// Build a DHCPOFFER in response to a DHCPDISCOVER.
+    ///
+    /// Allocates and returns a packet buffer; caller is responsible for freeing.
+    /// Returns null if no address is available to offer.
+    fn createOffer(self: *Self, request: []const u8) !?[]u8 {
+        const req_header: *const DHCPHeader = @alignCast(@ptrCast(request.ptr));
 
-        // Create response buffer
-        var response: [1024]u8 = undefined;
-        var response_data = @as([*]u8, &response);
+        // TODO: implement proper IP pool allocation. For now, derive a candidate
+        // address from the subnet + a simple offset so the stub is exercisable.
+        const offered_ip = try config_mod.parseIpv4(self.cfg.router); // placeholder
 
-        // Copy request as base
-        @memcpy(response_data[0..request.len].ptr, request.ptr);
-        const header: *DHCPHeader = @as(*DHCPHeader, response_data);
+        const server_ip = try config_mod.parseIpv4(self.cfg.listen_address);
+        const subnet_mask = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.subnet_mask));
+        const router_ip = try config_mod.parseIpv4(self.cfg.router);
+        const lease_time = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.lease_time));
+        const renewal_time = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.lease_time / 2));
+        const rebind_time = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.lease_time * 7 / 8));
 
-        // Set response fields
-        header.op = 2; // BOOTREPLY
-        header.yiaddr = [4]u8{ 192, 168, 1, 100 }; // Example IP
+        // Build options into a temporary buffer
+        var opts_buf: [256]u8 = undefined;
+        var opts_len: usize = 0;
+
+        // Option 53: DHCPOFFER
+        opts_buf[opts_len] = @intFromEnum(OptionCode.MessageType);
+        opts_buf[opts_len + 1] = 1;
+        opts_buf[opts_len + 2] = @intFromEnum(MessageType.DHCPOFFER);
+        opts_len += 3;
+
+        // Option 54: Server Identifier
+        opts_buf[opts_len] = @intFromEnum(OptionCode.ServerIdentifier);
+        opts_buf[opts_len + 1] = 4;
+        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &server_ip);
+        opts_len += 6;
+
+        // Option 51: IP Address Lease Time
+        opts_buf[opts_len] = @intFromEnum(OptionCode.IPAddressLeaseTime);
+        opts_buf[opts_len + 1] = 4;
+        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &lease_time);
+        opts_len += 6;
+
+        // Option 58: Renewal Time
+        opts_buf[opts_len] = @intFromEnum(OptionCode.RenewalTimeValue);
+        opts_buf[opts_len + 1] = 4;
+        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &renewal_time);
+        opts_len += 6;
+
+        // Option 59: Rebinding Time
+        opts_buf[opts_len] = @intFromEnum(OptionCode.RebindingTimeValue);
+        opts_buf[opts_len + 1] = 4;
+        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &rebind_time);
+        opts_len += 6;
+
+        // Option 1: Subnet Mask
+        opts_buf[opts_len] = @intFromEnum(OptionCode.SubnetMask);
+        opts_buf[opts_len + 1] = 4;
+        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &subnet_mask);
+        opts_len += 6;
+
+        // Option 3: Router
+        opts_buf[opts_len] = @intFromEnum(OptionCode.Router);
+        opts_buf[opts_len + 1] = 4;
+        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &router_ip);
+        opts_len += 6;
+
+        // Option 6: DNS Servers (up to 4)
+        if (self.cfg.dns_servers.len > 0) {
+            const count = @min(self.cfg.dns_servers.len, 4);
+            opts_buf[opts_len] = @intFromEnum(OptionCode.DomainNameServer);
+            opts_buf[opts_len + 1] = @intCast(count * 4);
+            opts_len += 2;
+            for (self.cfg.dns_servers[0..count]) |dns_str| {
+                const dns_ip = config_mod.parseIpv4(dns_str) catch continue;
+                @memcpy(opts_buf[opts_len .. opts_len + 4], &dns_ip);
+                opts_len += 4;
+            }
+        }
+
+        // Option 15: Domain Name
+        if (self.cfg.domain_name.len > 0) {
+            const dn_len = @min(self.cfg.domain_name.len, 255);
+            opts_buf[opts_len] = @intFromEnum(OptionCode.DomainName);
+            opts_buf[opts_len + 1] = @intCast(dn_len);
+            @memcpy(opts_buf[opts_len + 2 .. opts_len + 2 + dn_len], self.cfg.domain_name[0..dn_len]);
+            opts_len += 2 + dn_len;
+        }
+
+        // End
+        opts_buf[opts_len] = @intFromEnum(OptionCode.End);
+        opts_len += 1;
+
+        // Allocate response packet
+        const pkt_len = dhcp_min_packet_size + opts_len;
+        const pkt = try self.allocator.alloc(u8, pkt_len);
+        @memset(pkt, 0);
+
+        // Fill header from request
+        const resp_header: *DHCPHeader = @alignCast(@ptrCast(pkt.ptr));
+        resp_header.op = 2; // BOOTREPLY
+        resp_header.htype = req_header.htype;
+        resp_header.hlen = req_header.hlen;
+        resp_header.hops = 0;
+        resp_header.xid = req_header.xid;
+        resp_header.secs = 0;
+        resp_header.flags = req_header.flags;
+        resp_header.ciaddr = [_]u8{0} ** 4;
+        resp_header.yiaddr = offered_ip;
+        resp_header.siaddr = server_ip;
+        resp_header.giaddr = req_header.giaddr;
+        resp_header.chaddr = req_header.chaddr;
+        resp_header.magic = dhcp_magic_cookie;
+
+        @memcpy(pkt[dhcp_min_packet_size .. dhcp_min_packet_size + opts_len], opts_buf[0..opts_len]);
+
+        return pkt;
+    }
+
+    /// Build a DHCPACK in response to a DHCPREQUEST.
+    ///
+    /// Allocates and returns a packet buffer; caller is responsible for freeing.
+    fn createAck(self: *Self, request: []const u8) !?[]u8 {
+        const req_header: *const DHCPHeader = @alignCast(@ptrCast(request.ptr));
+
+        // The client's requested IP comes from option 50, or ciaddr for renewals.
+        const client_ip = getRequestedIp(request) orelse req_header.ciaddr;
+        const server_ip = try config_mod.parseIpv4(self.cfg.listen_address);
+        const subnet_mask = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.subnet_mask));
+        const router_ip = try config_mod.parseIpv4(self.cfg.router);
+        const lease_time = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.lease_time));
+        const renewal_time = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.lease_time / 2));
+        const rebind_time = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.lease_time * 7 / 8));
+
+        // Record the lease
+        const mac_bytes = req_header.chaddr[0..6];
+        var mac_str_buf: [17]u8 = undefined;
+        const mac_str = std.fmt.bufPrint(&mac_str_buf, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
+            mac_bytes[0], mac_bytes[1], mac_bytes[2],
+            mac_bytes[3], mac_bytes[4], mac_bytes[5],
+        }) catch unreachable;
+
+        var ip_str_buf: [15]u8 = undefined;
+        const ip_str = std.fmt.bufPrint(&ip_str_buf, "{d}.{d}.{d}.{d}", .{
+            client_ip[0], client_ip[1], client_ip[2], client_ip[3],
+        }) catch unreachable;
+
+        const now = std.time.timestamp();
+        self.store.addLease(.{
+            .mac = try self.allocator.dupe(u8, mac_str),
+            .ip = try self.allocator.dupe(u8, ip_str),
+            .hostname = null,
+            .expires = now + self.cfg.lease_time,
+            .client_id = null,
+        }) catch {};
 
         // Build options
-        var pos: usize = 240;
+        var opts_buf: [256]u8 = undefined;
+        var opts_len: usize = 0;
 
-        // Add DHCP server identifier (option 54)
-        response_data[pos] = 54;
-        response_data[pos + 1] = 4;
-        @memcpy(response_data[pos + 2 .. pos + 6].ptr, server.config.router.ptr);
-        pos += 6;
+        // Option 53: DHCPACK
+        opts_buf[opts_len] = @intFromEnum(OptionCode.MessageType);
+        opts_buf[opts_len + 1] = 1;
+        opts_buf[opts_len + 2] = @intFromEnum(MessageType.DHCPACK);
+        opts_len += 3;
 
-        // Add lease time (option 51)
-        response_data[pos] = 51;
-        response_data[pos + 1] = 4;
-        @memcpy(response_data[pos + 2 .. pos + 6].ptr, &server.config.lease_time);
-        pos += 6;
+        // Option 54: Server Identifier
+        opts_buf[opts_len] = @intFromEnum(OptionCode.ServerIdentifier);
+        opts_buf[opts_len + 1] = 4;
+        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &server_ip);
+        opts_len += 6;
 
-        // Add router (option 3)
-        response_data[pos] = 3;
-        response_data[pos + 1] = 4;
-        @memcpy(response_data[pos + 2 .. pos + 6].ptr, server.config.router.ptr);
-        pos += 6;
+        // Option 51: IP Address Lease Time
+        opts_buf[opts_len] = @intFromEnum(OptionCode.IPAddressLeaseTime);
+        opts_buf[opts_len + 1] = 4;
+        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &lease_time);
+        opts_len += 6;
 
-        // Add DNS servers (option 6)
-        response_data[pos] = 6;
-        response_data[pos + 1] = 4;
-        for (server.config.dns_servers, 0..) |dns, i| {
-            @memcpy(response_data[pos + 2 + i * 4 .. pos + 6 + i * 4].ptr, dns.ptr);
+        // Option 58: Renewal Time
+        opts_buf[opts_len] = @intFromEnum(OptionCode.RenewalTimeValue);
+        opts_buf[opts_len + 1] = 4;
+        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &renewal_time);
+        opts_len += 6;
+
+        // Option 59: Rebinding Time
+        opts_buf[opts_len] = @intFromEnum(OptionCode.RebindingTimeValue);
+        opts_buf[opts_len + 1] = 4;
+        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &rebind_time);
+        opts_len += 6;
+
+        // Option 1: Subnet Mask
+        opts_buf[opts_len] = @intFromEnum(OptionCode.SubnetMask);
+        opts_buf[opts_len + 1] = 4;
+        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &subnet_mask);
+        opts_len += 6;
+
+        // Option 3: Router
+        opts_buf[opts_len] = @intFromEnum(OptionCode.Router);
+        opts_buf[opts_len + 1] = 4;
+        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &router_ip);
+        opts_len += 6;
+
+        // Option 6: DNS Servers (up to 4)
+        if (self.cfg.dns_servers.len > 0) {
+            const count = @min(self.cfg.dns_servers.len, 4);
+            opts_buf[opts_len] = @intFromEnum(OptionCode.DomainNameServer);
+            opts_buf[opts_len + 1] = @intCast(count * 4);
+            opts_len += 2;
+            for (self.cfg.dns_servers[0..count]) |dns_str| {
+                const dns_ip = config_mod.parseIpv4(dns_str) catch continue;
+                @memcpy(opts_buf[opts_len .. opts_len + 4], &dns_ip);
+                opts_len += 4;
+            }
         }
-        pos += 6;
 
-        // Add domain name (option 15)
-        response_data[pos] = 15;
-        response_data[pos + 1] = server.config.domain_name.len;
-        @memcpy(response_data[pos + 2 .. pos + 2 + server.config.domain_name.len].ptr, server.config.domain_name.ptr);
-        pos += 2 + server.config.domain_name.len;
+        // Option 15: Domain Name
+        if (self.cfg.domain_name.len > 0) {
+            const dn_len = @min(self.cfg.domain_name.len, 255);
+            opts_buf[opts_len] = @intFromEnum(OptionCode.DomainName);
+            opts_buf[opts_len + 1] = @intCast(dn_len);
+            @memcpy(opts_buf[opts_len + 2 .. opts_len + 2 + dn_len], self.cfg.domain_name[0..dn_len]);
+            opts_len += 2 + dn_len;
+        }
 
-        // Add message type (option 53) - DHCPOFFER
-        response_data[pos] = 53;
-        response_data[pos + 1] = 1;
-        response_data[pos + 2] = 2;
-        pos += 3;
+        // End
+        opts_buf[opts_len] = @intFromEnum(OptionCode.End);
+        opts_len += 1;
 
-        // End option
-        response_data[pos] = 255;
-        pos += 1;
+        // Allocate response packet
+        const pkt_len = dhcp_min_packet_size + opts_len;
+        const pkt = try self.allocator.alloc(u8, pkt_len);
+        @memset(pkt, 0);
 
-        // Return the response
-        return response_data[0..pos];
+        const resp_header: *DHCPHeader = @alignCast(@ptrCast(pkt.ptr));
+        resp_header.op = 2; // BOOTREPLY
+        resp_header.htype = req_header.htype;
+        resp_header.hlen = req_header.hlen;
+        resp_header.hops = 0;
+        resp_header.xid = req_header.xid;
+        resp_header.secs = 0;
+        resp_header.flags = req_header.flags;
+        resp_header.ciaddr = [_]u8{0} ** 4;
+        resp_header.yiaddr = client_ip;
+        resp_header.siaddr = server_ip;
+        resp_header.giaddr = req_header.giaddr;
+        resp_header.chaddr = req_header.chaddr;
+        resp_header.magic = dhcp_magic_cookie;
+
+        @memcpy(pkt[dhcp_min_packet_size .. dhcp_min_packet_size + opts_len], opts_buf[0..opts_len]);
+
+        return pkt;
     }
 
-    fn allocateLease(server: *Self, request: []const u8) ?[]const u8 {
-        // Implement DHCPACK creation
-        _ = server;
-        _ = request;
-        return null;
+    fn handleRelease(self: *Self, request: []const u8) void {
+        if (request.len < dhcp_min_packet_size) return;
+        const req_header: *const DHCPHeader = @alignCast(@ptrCast(request.ptr));
+        const mac_bytes = req_header.chaddr[0..6];
+        var mac_str_buf: [17]u8 = undefined;
+        const mac_str = std.fmt.bufPrint(&mac_str_buf, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
+            mac_bytes[0], mac_bytes[1], mac_bytes[2],
+            mac_bytes[3], mac_bytes[4], mac_bytes[5],
+        }) catch return;
+        self.store.removeLease(mac_str) catch {};
     }
 
-    fn releaseLease(server: *Self, request: []const u8) ?[]const u8 {
-        // Implement lease release
-        _ = server;
-        _ = request;
+    /// Scan options for option 50 (Requested IP Address).
+    fn getRequestedIp(packet: []const u8) ?[4]u8 {
+        if (packet.len < dhcp_min_packet_size) return null;
+        const opts = packet[dhcp_min_packet_size..];
+        var i: usize = 0;
+        while (i + 1 < opts.len) {
+            const code = opts[i];
+            if (code == @intFromEnum(OptionCode.End)) break;
+            if (code == @intFromEnum(OptionCode.Pad)) {
+                i += 1;
+                continue;
+            }
+            const len = opts[i + 1];
+            if (i + 2 + len > opts.len) break;
+            if (code == @intFromEnum(OptionCode.RequestedIPAddress) and len == 4) {
+                return opts[i + 2 ..][0..4].*;
+            }
+            i += 2 + len;
+        }
         return null;
     }
 };
 
-pub const Config = struct {
-    listen_address: []const u8,
-    subnet: []const u8,
-    subnet_mask: u32,
-    router: []const u8,
-    dns_servers: [][]const u8,
-    domain_name: []const u8,
-    lease_time: u32,
-    dhcp_options: std.StringHashMap(u8),
-};
-
-pub fn create_server(allocator: std.mem.Allocator, config: *const Config, state: *const StateStore) !*DHCPServer {
-    return DHCPServer.create(allocator, config, state);
+pub fn create_server(allocator: std.mem.Allocator, cfg: *const Config, store: *StateStore) !*DHCPServer {
+    return DHCPServer.create(allocator, cfg, store);
 }
 
-pub const StateStore = opaque {
-    // State store implementation
-};
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
-pub fn StateStore_init(allocator: std.mem.Allocator, dir: []const u8) !*StateStore {
-    _ = allocator;
-    _ = dir;
-    return undefined;
+test "getMessageType discover" {
+    var pkt = [_]u8{0} ** (dhcp_min_packet_size + 10);
+    @memcpy(pkt[dhcp_min_packet_size - 4 .. dhcp_min_packet_size], &dhcp_magic_cookie);
+    pkt[dhcp_min_packet_size] = @intFromEnum(OptionCode.MessageType);
+    pkt[dhcp_min_packet_size + 1] = 1;
+    pkt[dhcp_min_packet_size + 2] = @intFromEnum(MessageType.DHCPDISCOVER);
+    pkt[dhcp_min_packet_size + 3] = @intFromEnum(OptionCode.End);
+
+    const mt = DHCPServer.getMessageType(&pkt);
+    try std.testing.expect(mt != null);
+    try std.testing.expectEqual(MessageType.DHCPDISCOVER, mt.?);
+}
+
+test "getRequestedIp present" {
+    var pkt = [_]u8{0} ** (dhcp_min_packet_size + 16);
+    @memcpy(pkt[dhcp_min_packet_size - 4 .. dhcp_min_packet_size], &dhcp_magic_cookie);
+    // Option 50: Requested IP 192.168.1.50
+    pkt[dhcp_min_packet_size] = @intFromEnum(OptionCode.RequestedIPAddress);
+    pkt[dhcp_min_packet_size + 1] = 4;
+    pkt[dhcp_min_packet_size + 2] = 192;
+    pkt[dhcp_min_packet_size + 3] = 168;
+    pkt[dhcp_min_packet_size + 4] = 1;
+    pkt[dhcp_min_packet_size + 5] = 50;
+    pkt[dhcp_min_packet_size + 6] = @intFromEnum(OptionCode.End);
+
+    const ip = DHCPServer.getRequestedIp(&pkt);
+    try std.testing.expect(ip != null);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 192, 168, 1, 50 }, &ip.?);
+}
+
+test "getRequestedIp absent" {
+    var pkt = [_]u8{0} ** (dhcp_min_packet_size + 8);
+    @memcpy(pkt[dhcp_min_packet_size - 4 .. dhcp_min_packet_size], &dhcp_magic_cookie);
+    pkt[dhcp_min_packet_size] = @intFromEnum(OptionCode.End);
+
+    const ip = DHCPServer.getRequestedIp(&pkt);
+    try std.testing.expect(ip == null);
 }

@@ -1,75 +1,73 @@
 const std = @import("std");
-
-fn printErrorAndPanic(writer: anytype, message: []const u8, err: anyerror) noreturn {
-    const err_name = @errorName(err);
-    writer.print("{s}: {s}\n", .{ message, err_name }) catch @panic("Failed to write stdout");
-    @panic(message);
-}
-
-fn printServerError(writer: anytype) noreturn {
-    writer.print("Server error\n", .{}) catch @panic("Failed to write stdout");
-    @panic("Server error");
-}
-
 const dhcp = @import("./src/dhcp.zig");
-const config = @import("./src/config.zig");
-const state = @import("./src/state.zig");
+const config_mod = @import("./src/config.zig");
+const state_mod = @import("./src/state.zig");
 const dns = @import("./src/dns.zig");
 
-pub fn main() noreturn {
-    const allocator = std.heap.page_allocator;
-    const arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
+fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
+    const stderr = std.io.getStdErr().writer();
+    stderr.print("fatal: " ++ fmt ++ "\n", args) catch {};
+    std.process.exit(1);
+}
 
-    const gpa = &arena; // use pointer to arena
-    const stdout = std.fs.File.stdout().deprecatedWriter();
+pub fn main() !void {
+    // Allocator setup: GPA for leak detection in debug, page allocator otherwise
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
 
-    stdout.print("Starting Stardust DHCP Server...\n", .{}) catch @panic("Failed to write stdout");
+    const stdout = std.io.getStdOut().writer();
+
+    try stdout.print("Starting Stardust DHCP Server...\n", .{});
 
     // Load configuration
-    const cfg = config.load(gpa, "config.yaml") catch |err| {
-        printErrorAndPanic(
-            stdout,
-            "Failed to load config",
-            err,
-        );
+    var cfg = config_mod.load(allocator, "config.yaml") catch |err| {
+        fatal("Failed to load config: {s}", .{@errorName(err)});
     };
     defer cfg.deinit();
 
-    stdout.print("Configuration loaded successfully\n", .{}) catch @panic("Failed to write stdout");
+    // Format subnet mask as dotted-decimal for display
+    const mask = cfg.subnet_mask;
+    const mask_a: u8 = @intCast((mask >> 24) & 0xFF);
+    const mask_b: u8 = @intCast((mask >> 16) & 0xFF);
+    const mask_c: u8 = @intCast((mask >> 8) & 0xFF);
+    const mask_d: u8 = @intCast(mask & 0xFF);
+
+    try stdout.print("Configuration loaded successfully\n", .{});
+    try stdout.print("  listen:     {s}\n", .{cfg.listen_address});
+    try stdout.print("  subnet:     {s}/{d}.{d}.{d}.{d}\n", .{
+        cfg.subnet, mask_a, mask_b, mask_c, mask_d,
+    });
+    try stdout.print("  router:     {s}\n", .{cfg.router});
+    try stdout.print("  lease_time: {d}s\n", .{cfg.lease_time});
+    try stdout.print("  state_dir:  {s}\n", .{cfg.state_dir});
 
     // Initialize state store
-    const store = state.init(gpa, cfg.state_dir) catch |err| {
-        printErrorAndPanic(
-            stdout,
-            "Failed to initialize state store",
-            err,
-        );
+    const store = state_mod.StateStore.init(allocator, cfg.state_dir) catch |err| {
+        fatal("Failed to initialize state store: {s}", .{@errorName(err)});
     };
     defer store.deinit();
 
-    stdout.print("State store initialized\n", .{}) catch @panic("Failed to write stdout");
-
-    // Create DHCP server
-    const dhcp_server = dhcp.create_server(gpa, cfg, store) catch |err| {
-        printErrorAndPanic(
-            stdout,
-            "Failed to create DHCP server",
-            err,
-        );
-    };
-    defer dhcp_server.deinit();
+    try stdout.print("State store initialized\n", .{});
 
     // Start DNS updater
-    const dns_updater = dns.create_updater(gpa, &cfg.dns_update, store) catch |err| {
-        printErrorAndPanic(
-            stdout,
-            "Failed to initialize DNS updater",
-            err,
-        );
+    const dns_updater = dns.create_updater(allocator, &cfg.dns_update, store) catch |err| {
+        fatal("Failed to initialize DNS updater: {s}", .{@errorName(err)});
     };
     defer dns_updater.cleanup();
 
-    // Main server loop
-    dhcp_server.run() catch printServerError(stdout);
+    dns_updater.run() catch |err| {
+        try stdout.print("DNS updater warning: {s}\n", .{@errorName(err)});
+    };
+
+    // Create and run DHCP server
+    const dhcp_server = dhcp.create_server(allocator, &cfg, store) catch |err| {
+        fatal("Failed to create DHCP server: {s}", .{@errorName(err)});
+    };
+    defer dhcp_server.deinit();
+
+    try stdout.print("Starting DHCP server...\n", .{});
+    dhcp_server.run() catch |err| {
+        fatal("DHCP server error: {s}", .{@errorName(err)});
+    };
 }
