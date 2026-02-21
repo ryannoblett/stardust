@@ -49,33 +49,60 @@ pub const Config = struct {
     }
 };
 
+// Mirror of Config used for yaml.Yaml.parse(). All fields are optional so
+// that missing keys in the YAML file fall back to the defaults we apply below.
+// Strings are slices into the yaml arena and must be duped before use.
+const RawConfig = struct {
+    listen_address: ?[]const u8 = null,
+    subnet: ?[]const u8 = null,
+    subnet_mask: ?[]const u8 = null, // dotted-decimal string in the YAML
+    router: ?[]const u8 = null,
+    dns_servers: ?[][]const u8 = null,
+    domain_name: ?[]const u8 = null,
+    lease_time: ?u32 = null,
+    state_dir: ?[]const u8 = null,
+    dns_update: ?struct {
+        enable: ?bool = null,
+        server: ?[]const u8 = null,
+        zone: ?[]const u8 = null,
+        key_name: ?[]const u8 = null,
+        key_file: ?[]const u8 = null,
+    } = null,
+};
+
 pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
     const file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
 
     const file_size = (try file.stat()).size;
-    const buf = try allocator.alloc(u8, file_size);
-    defer allocator.free(buf);
-    _ = try file.readAll(buf);
+    const source = try allocator.alloc(u8, file_size);
+    defer allocator.free(source);
+    _ = try file.readAll(source);
 
-    const yaml_doc = try yaml.parseFromSlice(allocator, buf, .{});
-    defer yaml_doc.deinit();
+    // yaml.Yaml owns its own arena internally; we deinit it after we've
+    // duped all the strings we need into our own allocator.
+    var doc = yaml.Yaml{ .source = source };
+    try doc.load(allocator);
+    defer doc.deinit(allocator);
 
-    // Build config with owned copies of all strings. On any error after
-    // partial initialisation, the caller's errdefer should call cfg.deinit()
-    // — but since fields start as empty slices we must be careful to only
-    // free what was actually allocated. We use arena-style: allocate
-    // everything, then hand off ownership in the returned struct.
+    // Use an arena just for the parse call — Yaml.parse allocates into it
+    // and we throw it away once we've duped everything into `allocator`.
+    var parse_arena = std.heap.ArenaAllocator.init(allocator);
+    defer parse_arena.deinit();
+
+    const raw = try doc.parse(parse_arena.allocator(), RawConfig);
+
+    // Build Config with owned copies of every string.
     var cfg = Config{
         .allocator = allocator,
-        .listen_address = try allocator.dupe(u8, "0.0.0.0"),
-        .subnet = try allocator.dupe(u8, "192.168.1.0"),
-        .subnet_mask = 0xFFFFFF00, // 255.255.255.0
-        .router = try allocator.dupe(u8, "192.168.1.1"),
+        .listen_address = try allocator.dupe(u8, raw.listen_address orelse "0.0.0.0"),
+        .subnet = try allocator.dupe(u8, raw.subnet orelse "192.168.1.0"),
+        .subnet_mask = try parseMask(raw.subnet_mask orelse "255.255.255.0"),
+        .router = try allocator.dupe(u8, raw.router orelse "192.168.1.1"),
         .dns_servers = try allocator.alloc([]const u8, 0),
-        .domain_name = try allocator.dupe(u8, ""),
-        .lease_time = 3600,
-        .state_dir = try allocator.dupe(u8, "/var/lib/stardust"),
+        .domain_name = try allocator.dupe(u8, raw.domain_name orelse ""),
+        .lease_time = raw.lease_time orelse 3600,
+        .state_dir = try allocator.dupe(u8, raw.state_dir orelse "/var/lib/stardust"),
         .dns_update = .{
             .enable = false,
             .server = try allocator.dupe(u8, ""),
@@ -86,72 +113,32 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
     };
 
-    if (yaml_doc.root.map.get("listen_address")) |node| {
-        allocator.free(cfg.listen_address);
-        cfg.listen_address = try allocator.dupe(u8, node.value.str);
-    }
-
-    if (yaml_doc.root.map.get("subnet")) |node| {
-        allocator.free(cfg.subnet);
-        cfg.subnet = try allocator.dupe(u8, node.value.str);
-    }
-
-    if (yaml_doc.root.map.get("subnet_mask")) |node| {
-        // config.yaml stores subnet_mask as a dotted-decimal string
-        cfg.subnet_mask = try parseMask(node.value.str);
-    }
-
-    if (yaml_doc.root.map.get("router")) |node| {
-        allocator.free(cfg.router);
-        cfg.router = try allocator.dupe(u8, node.value.str);
-    }
-
-    if (yaml_doc.root.map.get("lease_time")) |node| {
-        cfg.lease_time = @intCast(node.value.int);
-    }
-
-    if (yaml_doc.root.map.get("state_dir")) |node| {
-        allocator.free(cfg.state_dir);
-        cfg.state_dir = try allocator.dupe(u8, node.value.str);
-    }
-
-    if (yaml_doc.root.map.get("dns_servers")) |node| {
-        const items = node.value.list;
+    if (raw.dns_servers) |servers| {
         allocator.free(cfg.dns_servers);
-        cfg.dns_servers = try allocator.alloc([]const u8, items.len);
-        // Zero out so deinit is safe if we error partway through
-        for (cfg.dns_servers) |*s| s.* = "";
-        for (items, 0..) |item, i| {
-            cfg.dns_servers[i] = try allocator.dupe(u8, item.value.str);
+        cfg.dns_servers = try allocator.alloc([]const u8, servers.len);
+        for (cfg.dns_servers) |*s| s.* = ""; // safe deinit if we error partway
+        for (servers, 0..) |s, i| {
+            cfg.dns_servers[i] = try allocator.dupe(u8, s);
         }
     }
 
-    if (yaml_doc.root.map.get("domain_name")) |node| {
-        allocator.free(cfg.domain_name);
-        cfg.domain_name = try allocator.dupe(u8, node.value.str);
-    }
-
-    if (yaml_doc.root.map.get("dns_update")) |dns_node| {
-        const m = dns_node.value.map;
-
-        if (m.get("enable")) |node| {
-            cfg.dns_update.enable = node.value.bool;
-        }
-        if (m.get("server")) |node| {
+    if (raw.dns_update) |du| {
+        if (du.enable) |v| cfg.dns_update.enable = v;
+        if (du.server) |v| {
             allocator.free(cfg.dns_update.server);
-            cfg.dns_update.server = try allocator.dupe(u8, node.value.str);
+            cfg.dns_update.server = try allocator.dupe(u8, v);
         }
-        if (m.get("zone")) |node| {
+        if (du.zone) |v| {
             allocator.free(cfg.dns_update.zone);
-            cfg.dns_update.zone = try allocator.dupe(u8, node.value.str);
+            cfg.dns_update.zone = try allocator.dupe(u8, v);
         }
-        if (m.get("key_name")) |node| {
+        if (du.key_name) |v| {
             allocator.free(cfg.dns_update.key_name);
-            cfg.dns_update.key_name = try allocator.dupe(u8, node.value.str);
+            cfg.dns_update.key_name = try allocator.dupe(u8, v);
         }
-        if (m.get("key_file")) |node| {
+        if (du.key_file) |v| {
             allocator.free(cfg.dns_update.key_file);
-            cfg.dns_update.key_file = try allocator.dupe(u8, node.value.str);
+            cfg.dns_update.key_file = try allocator.dupe(u8, v);
         }
     }
 
