@@ -1,5 +1,6 @@
 const std = @import("std");
 const yaml = @import("yaml");
+const dns_mod = @import("./dns.zig");
 
 pub const Error = error{
     ConfigNotFound,
@@ -17,13 +18,7 @@ pub const Config = struct {
     domain_name: []const u8,
     lease_time: u32,
     state_dir: []const u8,
-    dns_update: struct {
-        enable: bool,
-        server: []const u8,
-        zone: []const u8,
-        key_name: []const u8,
-        key_file: []const u8,
-    },
+    dns_update: dns_mod.Config,
     dhcp_options: std.StringHashMap([]const u8),
 
     /// Free all allocator-owned memory. Must be called when the Config is no

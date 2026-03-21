@@ -16,14 +16,14 @@ pub const Config = struct {
 pub const DNSUpdater = struct {
     allocator: std.mem.Allocator,
     config: *const Config,
-    state_store: *const state.StateStore,
+    state_store: *state.StateStore,
 
     const Self = @This();
 
     pub fn create(
         allocator: std.mem.Allocator,
         config: *const Config,
-        store: *const state.StateStore,
+        store: *state.StateStore,
     ) !*Self {
         const self = try allocator.create(Self);
         self.* = .{
@@ -37,17 +37,13 @@ pub const DNSUpdater = struct {
     pub fn run(self: *Self) !void {
 
         if (!self.config.enable) {
-            try std.fs.File.stdout().writeAll("DNS updater disabled in config\n", .{});
+            std.debug.print("DNS updater disabled in config\n", .{});
             return;
         }
 
-        try std.fs.File.stdout().writeAll("DNS updater running...\n", .{});
-
-        // This would be replaced with actual DNS update logic.
-        // For now, just verify we can access the state.
-        _ = try self.state_store.listLeases();
-
-        try std.fs.File.stdout().writeAll("DNS updater completed initial sync\n", .{});
+        std.debug.print("DNS updater running...\n", .{});
+        // TODO: implement DNS update logic (TSIG/BIND integration).
+        std.debug.print("DNS updater completed initial sync\n", .{});
     }
 
     pub fn cleanup(self: *Self) void {
@@ -58,7 +54,7 @@ pub const DNSUpdater = struct {
 pub fn create_updater(
     allocator: std.mem.Allocator,
     config: *const Config,
-    store: *const state.StateStore,
+    store: *state.StateStore,
 ) !*DNSUpdater {
     return DNSUpdater.create(allocator, config, store);
 }

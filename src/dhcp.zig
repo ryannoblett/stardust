@@ -150,7 +150,7 @@ pub const DHCPServer = struct {
             @sizeOf(std.posix.sockaddr.in),
         );
 
-        try std.fs.File.stdout().writeAll("DHCP server listening on {s}:{d}\n", .{
+        std.debug.print("DHCP server listening on {s}:{d}\n", .{
             self.cfg.listen_address,
             dhcp_server_port,
         });
@@ -167,14 +167,14 @@ pub const DHCPServer = struct {
                 @ptrCast(&src_addr),
                 &src_len,
             ) catch |err| {
-                try std.fs.File.stdout().writeAll("recvfrom error: {s}\n", .{@errorName(err)});
+                std.debug.print("recvfrom error: {s}\n", .{@errorName(err)});
                 continue;
             };
 
             const packet = buf[0..n];
 
             const response = self.processPacket(packet) catch |err| {
-                try std.fs.File.stdout().writeAll("Error processing packet: {s}\n", .{@errorName(err)});
+                std.debug.print("Error processing packet: {s}\n", .{@errorName(err)});
                 continue;
             };
 
@@ -194,12 +194,12 @@ pub const DHCPServer = struct {
                     @ptrCast(&dst_addr),
                     @sizeOf(std.posix.sockaddr.in),
                 ) catch |err| {
-                    try std.fs.File.stdout().writeAll("sendto error: {s}\n", .{@errorName(err)});
+                    std.debug.print("sendto error: {s}\n", .{@errorName(err)});
                 };
             }
         }
 
-        try std.fs.File.stdout().writeAll("DHCP server stopped\n", .{});
+        std.debug.print("DHCP server stopped\n", .{});
     }
 
     fn processPacket(self: *Self, packet: []const u8) !?[]u8 {
@@ -245,6 +245,52 @@ pub const DHCPServer = struct {
         return null;
     }
 
+    /// Scan the subnet for an unallocated host address to offer.
+    ///
+    /// Returns the first host address in the subnet that has no active lease,
+    /// skipping the router and (if specific) the server's own address.
+    /// Returns null when the pool is exhausted.
+    fn allocateIp(self: *Self, mac_bytes: [6]u8) !?[4]u8 {
+        var mac_buf: [17]u8 = undefined;
+        const mac_str = std.fmt.bufPrint(&mac_buf, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
+            mac_bytes[0], mac_bytes[1], mac_bytes[2],
+            mac_bytes[3], mac_bytes[4], mac_bytes[5],
+        }) catch unreachable;
+
+        // Reuse an existing confirmed lease for this client.
+        if (self.store.getLeaseByMac(mac_str)) |lease| {
+            return try config_mod.parseIpv4(lease.ip);
+        }
+
+        const subnet_bytes = try config_mod.parseIpv4(self.cfg.subnet);
+        const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
+        const mask = self.cfg.subnet_mask;
+        const broadcast_int = subnet_int | ~mask;
+
+        const router_bytes = try config_mod.parseIpv4(self.cfg.router);
+        const router_int = std.mem.readInt(u32, &router_bytes, .big);
+
+        const server_bytes = try config_mod.parseIpv4(self.cfg.listen_address);
+        const server_int = std.mem.readInt(u32, &server_bytes, .big);
+
+        var candidate: u32 = subnet_int + 1;
+        while (candidate < broadcast_int) : (candidate += 1) {
+            if (candidate == router_int) continue;
+            if (server_int != 0 and candidate == server_int) continue;
+
+            var ip_bytes: [4]u8 = undefined;
+            std.mem.writeInt(u32, &ip_bytes, candidate, .big);
+            var ip_buf: [15]u8 = undefined;
+            const ip_str = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{
+                ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3],
+            }) catch unreachable;
+
+            if (self.store.getLeaseByIp(ip_str) == null) return ip_bytes;
+        }
+
+        return null; // Pool exhausted.
+    }
+
     /// Build a DHCPOFFER in response to a DHCPDISCOVER.
     ///
     /// Allocates and returns a packet buffer; caller is responsible for freeing.
@@ -252,9 +298,8 @@ pub const DHCPServer = struct {
     fn createOffer(self: *Self, request: []const u8) !?[]u8 {
         const req_header: *const DHCPHeader = @alignCast(@ptrCast(request.ptr));
 
-        // TODO: implement proper IP pool allocation. For now, derive a candidate
-        // address from the subnet + a simple offset so the stub is exercisable.
-        const offered_ip = try config_mod.parseIpv4(self.cfg.router); // placeholder
+        const mac_bytes: [6]u8 = req_header.chaddr[0..6].*;
+        const offered_ip = (try self.allocateIp(mac_bytes)) orelse return null;
 
         const server_ip = try config_mod.parseIpv4(self.cfg.listen_address);
         const subnet_mask = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.subnet_mask));
@@ -391,12 +436,14 @@ pub const DHCPServer = struct {
 
         const now = std.time.timestamp();
         self.store.addLease(.{
-            .mac = try self.allocator.dupe(u8, mac_str),
-            .ip = try self.allocator.dupe(u8, ip_str),
+            .mac = mac_str,
+            .ip = ip_str,
             .hostname = null,
-            .expires = now + self.cfg.lease_time,
+            .expires = now + @as(i64, self.cfg.lease_time),
             .client_id = null,
-        }) catch {};
+        }) catch |err| {
+            std.debug.print("warning: failed to store lease ({s})\n", .{@errorName(err)});
+        };
 
         // Build options
         var opts_buf: [256]u8 = undefined;
@@ -504,7 +551,7 @@ pub const DHCPServer = struct {
             mac_bytes[0], mac_bytes[1], mac_bytes[2],
             mac_bytes[3], mac_bytes[4], mac_bytes[5],
         }) catch return;
-        self.store.removeLease(mac_str) catch {};
+        self.store.removeLease(mac_str);
     }
 
     /// Scan options for option 50 (Requested IP Address).
