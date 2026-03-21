@@ -22,6 +22,7 @@ pub const Config = struct {
     pool_end: []const u8, // "" = use subnet end
     dns_update: dns_mod.Config,
     dhcp_options: std.StringHashMap([]const u8),
+    log_level: std.log.Level,
 
     /// Free all allocator-owned memory. Must be called when the Config is no
     /// longer needed.
@@ -62,6 +63,7 @@ const RawConfig = struct {
     state_dir: ?[]const u8 = null,
     pool_start: ?[]const u8 = null,
     pool_end: ?[]const u8 = null,
+    log_level: ?[]const u8 = null,
     dns_update: ?struct {
         enable: ?bool = null,
         server: ?[]const u8 = null,
@@ -93,6 +95,8 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
 
     const raw = try doc.parse(parse_arena.allocator(), RawConfig);
 
+    const lease_time_val = raw.lease_time orelse 3600;
+
     // Build Config with owned copies of every string.
     var cfg = Config{
         .allocator = allocator,
@@ -102,16 +106,18 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
         .router = try allocator.dupe(u8, raw.router orelse "192.168.1.1"),
         .dns_servers = try allocator.alloc([]const u8, 0),
         .domain_name = try allocator.dupe(u8, raw.domain_name orelse ""),
-        .lease_time = raw.lease_time orelse 3600,
+        .lease_time = lease_time_val,
         .state_dir = try allocator.dupe(u8, raw.state_dir orelse "/var/lib/stardust"),
         .pool_start = try allocator.dupe(u8, raw.pool_start orelse ""),
         .pool_end = try allocator.dupe(u8, raw.pool_end orelse ""),
+        .log_level = parseLogLevel(raw.log_level orelse "info"),
         .dns_update = .{
             .enable = false,
             .server = try allocator.dupe(u8, ""),
             .zone = try allocator.dupe(u8, ""),
             .key_name = try allocator.dupe(u8, ""),
             .key_file = try allocator.dupe(u8, ""),
+            .lease_time = lease_time_val,
         },
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
     };
@@ -145,7 +151,33 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
         }
     }
 
+    // Populate dhcp_options from the untyped YAML map (yaml.parse doesn't support StringHashMap).
+    if (doc.docs.items.len > 0) {
+        if (doc.docs.items[0].asMap()) |root_map| {
+            if (root_map.get("dhcp_options")) |opts_val| {
+                if (opts_val.asMap()) |opts_map| {
+                    var it = opts_map.iterator();
+                    while (it.next()) |entry| {
+                        const key = try allocator.dupe(u8, entry.key_ptr.*);
+                        errdefer allocator.free(key);
+                        const val_str = entry.value_ptr.asScalar() orelse "";
+                        const val = try allocator.dupe(u8, val_str);
+                        errdefer allocator.free(val);
+                        try cfg.dhcp_options.put(key, val);
+                    }
+                }
+            }
+        }
+    }
+
     return cfg;
+}
+
+fn parseLogLevel(s: []const u8) std.log.Level {
+    if (std.mem.eql(u8, s, "debug")) return .debug;
+    if (std.mem.eql(u8, s, "warn") or std.mem.eql(u8, s, "warning")) return .warn;
+    if (std.mem.eql(u8, s, "error") or std.mem.eql(u8, s, "err")) return .err;
+    return .info; // default
 }
 
 /// Parse a dotted-decimal subnet mask string (e.g. "255.255.255.0") into a
@@ -219,4 +251,13 @@ test "parseIpv4 rejects bad input" {
     try std.testing.expectError(error.InvalidConfig, parseIpv4("192.168.1"));
     try std.testing.expectError(error.InvalidConfig, parseIpv4("256.0.0.1"));
     try std.testing.expectError(error.InvalidConfig, parseIpv4("not.an.ip.addr"));
+}
+
+test "parseLogLevel" {
+    try std.testing.expectEqual(std.log.Level.debug, parseLogLevel("debug"));
+    try std.testing.expectEqual(std.log.Level.warn, parseLogLevel("warn"));
+    try std.testing.expectEqual(std.log.Level.warn, parseLogLevel("warning"));
+    try std.testing.expectEqual(std.log.Level.err, parseLogLevel("error"));
+    try std.testing.expectEqual(std.log.Level.info, parseLogLevel("info"));
+    try std.testing.expectEqual(std.log.Level.info, parseLogLevel("unknown"));
 }

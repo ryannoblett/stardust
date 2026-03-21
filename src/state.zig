@@ -31,7 +31,7 @@ pub const StateStore = struct {
 
         self.load() catch |err| switch (err) {
             error.FileNotFound => {},
-            else => std.debug.print("warning: could not load lease state ({s}), starting fresh\n", .{@errorName(err)}),
+            else => std.log.warn("Could not load lease state ({s}), starting fresh", .{@errorName(err)}),
         };
 
         return self;
@@ -77,7 +77,7 @@ pub const StateStore = struct {
         });
 
         store.save() catch |err| {
-            std.debug.print("warning: failed to persist lease state ({s})\n", .{@errorName(err)});
+            std.log.warn("Failed to persist lease state ({s})", .{@errorName(err)});
         };
     }
 
@@ -89,7 +89,7 @@ pub const StateStore = struct {
             if (kv.value.hostname) |h| store.allocator.free(h);
             if (kv.value.client_id) |c| store.allocator.free(c);
             store.save() catch |err| {
-                std.debug.print("warning: failed to persist lease state ({s})\n", .{@errorName(err)});
+                std.log.warn("Failed to persist lease state ({s})", .{@errorName(err)});
             };
         }
     }

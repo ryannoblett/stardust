@@ -1,6 +1,7 @@
 const std = @import("std");
 const config_mod = @import("./config.zig");
 const state_mod = @import("./state.zig");
+const dns_mod = @import("./dns.zig");
 
 pub const Config = config_mod.Config;
 pub const StateStore = state_mod.StateStore;
@@ -109,22 +110,48 @@ fn probeServerIp() ?[4]u8 {
     return ip;
 }
 
+/// Encode an option value string into DHCP wire bytes in dst.
+/// Tries comma-separated IPv4 addresses first; falls back to raw string bytes.
+fn encodeOptionValue(dst: []u8, s: []const u8) []u8 {
+    var len: usize = 0;
+    var it = std.mem.splitScalar(u8, s, ',');
+    while (it.next()) |tok| {
+        const trimmed = std.mem.trim(u8, tok, " ");
+        const ip = config_mod.parseIpv4(trimmed) catch break;
+        if (len + 4 > dst.len) break;
+        @memcpy(dst[len .. len + 4], &ip);
+        len += 4;
+    }
+    if (len > 0 and it.next() == null) return dst[0..len]; // all tokens were IPs
+    // Fall back to raw string bytes
+    const copy_len = @min(s.len, dst.len);
+    @memcpy(dst[0..copy_len], s[0..copy_len]);
+    return dst[0..copy_len];
+}
+
 pub const DHCPServer = struct {
     allocator: std.mem.Allocator,
     cfg: *const Config,
     store: *StateStore,
+    dns_updater: ?*dns_mod.DNSUpdater,
     running: std.atomic.Value(bool),
     last_prune: i64,
     server_ip: [4]u8,
 
     const Self = @This();
 
-    pub fn create(allocator: std.mem.Allocator, cfg: *const Config, store: *StateStore) !*Self {
+    pub fn create(
+        allocator: std.mem.Allocator,
+        cfg: *const Config,
+        store: *StateStore,
+        dns_updater: ?*dns_mod.DNSUpdater,
+    ) !*Self {
         const self = try allocator.create(Self);
         self.* = .{
             .allocator = allocator,
             .cfg = cfg,
             .store = store,
+            .dns_updater = dns_updater,
             .running = std.atomic.Value(bool).init(false),
             .last_prune = 0,
             // Pre-populate from listen_address so callers that don't call run() still
@@ -197,15 +224,15 @@ pub const DHCPServer = struct {
         if (std.mem.eql(u8, &listen_ip, &[4]u8{ 0, 0, 0, 0 })) {
             if (probeServerIp()) |detected| {
                 self.server_ip = detected;
-                std.debug.print("Detected server IP: {d}.{d}.{d}.{d}\n", .{
+                std.log.info("Detected server IP: {d}.{d}.{d}.{d}", .{
                     detected[0], detected[1], detected[2], detected[3],
                 });
             } else {
-                std.debug.print("Warning: could not detect server IP for 0.0.0.0 listener\n", .{});
+                std.log.warn("Could not detect server IP for 0.0.0.0 listener", .{});
             }
         }
 
-        std.debug.print("DHCP server listening on {s}:{d}\n", .{
+        std.log.info("DHCP server listening on {s}:{d}", .{
             self.cfg.listen_address,
             dhcp_server_port,
         });
@@ -222,7 +249,7 @@ pub const DHCPServer = struct {
                 @ptrCast(&src_addr),
                 &src_len,
             ) catch |err| {
-                std.debug.print("recvfrom error: {s}\n", .{@errorName(err)});
+                std.log.err("recvfrom error: {s}", .{@errorName(err)});
                 continue;
             };
 
@@ -235,7 +262,7 @@ pub const DHCPServer = struct {
             }
 
             const response = self.processPacket(packet) catch |err| {
-                std.debug.print("Error processing packet: {s}\n", .{@errorName(err)});
+                std.log.err("Error processing packet: {s}", .{@errorName(err)});
                 continue;
             };
 
@@ -255,12 +282,12 @@ pub const DHCPServer = struct {
                     @ptrCast(&dst_addr),
                     @sizeOf(std.posix.sockaddr.in),
                 ) catch |err| {
-                    std.debug.print("sendto error: {s}\n", .{@errorName(err)});
+                    std.log.err("sendto error: {s}", .{@errorName(err)});
                 };
             }
         }
 
-        std.debug.print("DHCP server stopped\n", .{});
+        std.log.info("DHCP server stopped", .{});
     }
 
     fn processPacket(self: *Self, packet: []const u8) !?[]u8 {
@@ -394,7 +421,7 @@ pub const DHCPServer = struct {
         const rebind_time = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.lease_time * 7 / 8));
 
         // Build options into a temporary buffer
-        var opts_buf: [256]u8 = undefined;
+        var opts_buf: [512]u8 = undefined;
         var opts_len: usize = 0;
 
         // Option 53: DHCPOFFER
@@ -459,6 +486,17 @@ pub const DHCPServer = struct {
             opts_buf[opts_len + 1] = @intCast(dn_len);
             @memcpy(opts_buf[opts_len + 2 .. opts_len + 2 + dn_len], self.cfg.domain_name[0..dn_len]);
             opts_len += 2 + dn_len;
+        }
+
+        // Inject operator-defined options from config
+        var opts_it = self.cfg.dhcp_options.iterator();
+        while (opts_it.next()) |entry| {
+            const code = std.fmt.parseInt(u8, entry.key_ptr.*, 10) catch continue;
+            const encoded = encodeOptionValue(opts_buf[opts_len + 2 ..], entry.value_ptr.*);
+            if (encoded.len > 255 or opts_len + 2 + encoded.len > opts_buf.len - 1) continue;
+            opts_buf[opts_len] = code;
+            opts_buf[opts_len + 1] = @intCast(encoded.len);
+            opts_len += 2 + encoded.len;
         }
 
         // End
@@ -532,18 +570,22 @@ pub const DHCPServer = struct {
 
         // Record the lease (includes hostname from option 12 if present).
         const now = std.time.timestamp();
+        const hostname = getHostname(request);
         self.store.addLease(.{
             .mac = mac_str,
             .ip = ip_str,
-            .hostname = getHostname(request),
+            .hostname = hostname,
             .expires = now + @as(i64, self.cfg.lease_time),
             .client_id = null,
         }) catch |err| {
-            std.debug.print("warning: failed to store lease ({s})\n", .{@errorName(err)});
+            std.log.warn("Failed to store lease ({s})", .{@errorName(err)});
         };
 
+        // Notify DNS updater
+        if (self.dns_updater) |du| du.notifyLeaseAdded(ip_str, hostname);
+
         // Build options
-        var opts_buf: [256]u8 = undefined;
+        var opts_buf: [512]u8 = undefined;
         var opts_len: usize = 0;
 
         // Option 53: DHCPACK
@@ -610,6 +652,17 @@ pub const DHCPServer = struct {
             opts_len += 2 + dn_len;
         }
 
+        // Inject operator-defined options from config
+        var opts_it = self.cfg.dhcp_options.iterator();
+        while (opts_it.next()) |entry| {
+            const code = std.fmt.parseInt(u8, entry.key_ptr.*, 10) catch continue;
+            const encoded = encodeOptionValue(opts_buf[opts_len + 2 ..], entry.value_ptr.*);
+            if (encoded.len > 255 or opts_len + 2 + encoded.len > opts_buf.len - 1) continue;
+            opts_buf[opts_len] = code;
+            opts_buf[opts_len + 1] = @intCast(encoded.len);
+            opts_len += 2 + encoded.len;
+        }
+
         // End
         opts_buf[opts_len] = @intFromEnum(OptionCode.End);
         opts_len += 1;
@@ -648,7 +701,13 @@ pub const DHCPServer = struct {
             mac_bytes[0], mac_bytes[1], mac_bytes[2],
             mac_bytes[3], mac_bytes[4], mac_bytes[5],
         }) catch return;
+
+        // Get IP and hostname from current lease before removing (for DNS cleanup)
+        const old_lease = self.store.getLeaseByMac(mac_str);
         self.store.removeLease(mac_str);
+        if (self.dns_updater) |du| {
+            if (old_lease) |l| du.notifyLeaseRemoved(l.ip, l.hostname);
+        }
     }
 
     fn handleDecline(self: *Self, request: []const u8) void {
@@ -682,10 +741,10 @@ pub const DHCPServer = struct {
             .expires = std.time.timestamp() + @as(i64, self.cfg.lease_time),
             .client_id = null,
         }) catch |err| {
-            std.debug.print("warning: failed to quarantine declined IP {s}: {s}\n", .{ ip_str, @errorName(err) });
+            std.log.warn("Failed to quarantine declined IP {s}: {s}", .{ ip_str, @errorName(err) });
             return;
         };
-        std.debug.print("DHCPDECLINE: quarantined {s} for {d}s\n", .{ ip_str, self.cfg.lease_time });
+        std.log.info("DHCPDECLINE: quarantined {s} for {d}s", .{ ip_str, self.cfg.lease_time });
     }
 
     /// Scan options for option 50 (Requested IP Address).
@@ -776,8 +835,13 @@ pub const DHCPServer = struct {
     }
 };
 
-pub fn create_server(allocator: std.mem.Allocator, cfg: *const Config, store: *StateStore) !*DHCPServer {
-    return DHCPServer.create(allocator, cfg, store);
+pub fn create_server(
+    allocator: std.mem.Allocator,
+    cfg: *const Config,
+    store: *StateStore,
+    dns_updater: ?*dns_mod.DNSUpdater,
+) !*DHCPServer {
+    return DHCPServer.create(allocator, cfg, store, dns_updater);
 }
 
 // ---------------------------------------------------------------------------
@@ -974,12 +1038,14 @@ fn makeTestConfig(allocator: std.mem.Allocator) !config_mod.Config {
         .state_dir = try allocator.dupe(u8, "/tmp"),
         .pool_start = try allocator.dupe(u8, ""),
         .pool_end = try allocator.dupe(u8, ""),
+        .log_level = .info,
         .dns_update = .{
             .enable = false,
             .server = try allocator.dupe(u8, ""),
             .zone = try allocator.dupe(u8, ""),
             .key_name = try allocator.dupe(u8, ""),
             .key_file = try allocator.dupe(u8, ""),
+            .lease_time = 3600,
         },
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
     };
@@ -1002,7 +1068,7 @@ test "createAck returns null when option 54 does not match our IP" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store);
+    const server = try DHCPServer.create(alloc, &cfg, store, null);
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
@@ -1023,7 +1089,7 @@ test "createAck sends DHCPNAK for IP outside subnet" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store);
+    const server = try DHCPServer.create(alloc, &cfg, store, null);
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
@@ -1046,7 +1112,7 @@ test "createAck stores hostname from option 12" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store);
+    const server = try DHCPServer.create(alloc, &cfg, store, null);
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
@@ -1074,7 +1140,7 @@ test "createAck returns DHCPACK for valid request without option 54" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store);
+    const server = try DHCPServer.create(alloc, &cfg, store, null);
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
@@ -1125,7 +1191,7 @@ test "allocateIp skips addresses before pool_start" {
     cfg.pool_start = try alloc.dupe(u8, "192.168.1.100");
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store);
+    const server = try DHCPServer.create(alloc, &cfg, store, null);
     defer server.deinit();
 
     const ip = try server.allocateIp([6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF });
@@ -1145,7 +1211,7 @@ test "isIpValid rejects IP outside pool range" {
     cfg.pool_end = try alloc.dupe(u8, "192.168.1.200");
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store);
+    const server = try DHCPServer.create(alloc, &cfg, store, null);
     defer server.deinit();
 
     // Below pool_start
@@ -1162,7 +1228,7 @@ test "handleDecline quarantines declined IP" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store);
+    const server = try DHCPServer.create(alloc, &cfg, store, null);
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
@@ -1183,7 +1249,7 @@ test "handleDecline removes MAC lease" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store);
+    const server = try DHCPServer.create(alloc, &cfg, store, null);
     defer server.deinit();
 
     // Pre-populate a lease for the MAC.
@@ -1210,7 +1276,7 @@ test "createOffer uses server_ip not listen_address" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store);
+    const server = try DHCPServer.create(alloc, &cfg, store, null);
     defer server.deinit();
 
     // Override server_ip to something different from listen_address
@@ -1250,7 +1316,7 @@ test "createAck checks server_ip for option 54" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, store);
+    const server = try DHCPServer.create(alloc, &cfg, store, null);
     defer server.deinit();
 
     server.server_ip = [4]u8{ 192, 168, 1, 5 };
@@ -1279,4 +1345,62 @@ test "createAck checks server_ip for option 54" {
     try std.testing.expect(resp2 != null);
     defer alloc.free(resp2.?);
     try std.testing.expectEqual(MessageType.DHCPACK, DHCPServer.getMessageType(resp2.?).?);
+}
+
+test "dhcp_options injected into OFFER packet" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+
+    // Add option 42 (NTP server) with value "192.168.1.10"
+    const opt_key = try alloc.dupe(u8, "42");
+    const opt_val = try alloc.dupe(u8, "192.168.1.10");
+    try cfg.dhcp_options.put(opt_key, opt_val);
+
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    defer server.deinit();
+
+    // Send a DISCOVER
+    var buf = [_]u8{0} ** 512;
+    @memset(&buf, 0);
+    const hdr: *DHCPHeader = @alignCast(@ptrCast(buf.ptr));
+    hdr.op = 1;
+    hdr.htype = 1;
+    hdr.hlen = 6;
+    hdr.xid = 0xDEADBEEF;
+    hdr.magic = dhcp_magic_cookie;
+    @memcpy(hdr.chaddr[0..6], &[6]u8{ 0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x01 });
+    var i: usize = dhcp_min_packet_size;
+    buf[i] = @intFromEnum(OptionCode.MessageType);
+    buf[i + 1] = 1;
+    buf[i + 2] = @intFromEnum(MessageType.DHCPDISCOVER);
+    i += 3;
+    buf[i] = @intFromEnum(OptionCode.End);
+    i += 1;
+
+    const resp = try server.processPacket(buf[0..i]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+    try std.testing.expectEqual(MessageType.DHCPOFFER, DHCPServer.getMessageType(resp.?).?);
+
+    // Scan the response options for option code 42
+    const opts = resp.?[dhcp_min_packet_size..];
+    var j: usize = 0;
+    var found_42 = false;
+    while (j + 1 < opts.len) {
+        const code = opts[j];
+        if (code == @intFromEnum(OptionCode.End)) break;
+        if (code == @intFromEnum(OptionCode.Pad)) { j += 1; continue; }
+        const opt_len = opts[j + 1];
+        if (j + 2 + opt_len > opts.len) break;
+        if (code == 42 and opt_len == 4) {
+            // NTP server should be 192.168.1.10
+            try std.testing.expectEqualSlices(u8, &[4]u8{ 192, 168, 1, 10 }, opts[j + 2 .. j + 6]);
+            found_42 = true;
+        }
+        j += 2 + opt_len;
+    }
+    try std.testing.expect(found_42);
 }
