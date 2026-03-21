@@ -129,11 +129,21 @@ fn encodeOptionValue(dst: []u8, s: []const u8) []u8 {
     return dst[0..copy_len];
 }
 
-// Decline rate-limiting: after decline_threshold declines within decline_window_secs,
+// Per-MAC decline rate-limiting: after decline_threshold declines within decline_window_secs,
 // the MAC is refused new allocations for decline_cooldown_secs.
 const decline_threshold: u32 = 3;
 const decline_window_secs: i64 = 60;
 const decline_cooldown_secs: i64 = 300; // 5 minutes
+
+// Global decline rate limit: cap the total number of DHCPDECLINEs processed
+// (across all MACs) within a sliding 5-minute window. An attacker rotating
+// spoofed MACs can quarantine at most this many IPs simultaneously, since the
+// quarantine period is also 5 minutes. Value chosen so a relay server handling
+// many pools never triggers this in normal conditions (real-world decline rates
+// are single digits per day), while capping steady-state quarantine damage to
+// a small fraction of even a modest pool.
+const global_decline_limit: u32 = 20;
+const global_decline_window_secs: i64 = 300; // 5 minutes
 
 const DeclineRecord = struct {
     count: u32,
@@ -151,6 +161,8 @@ pub const DHCPServer = struct {
     server_ip: [4]u8,
     /// Keyed by MAC as a fixed [17]u8 ("xx:xx:xx:xx:xx:xx") — no heap alloc per entry.
     decline_records: std.AutoHashMap([17]u8, DeclineRecord),
+    global_decline_count: u32,
+    global_decline_window_start: i64,
 
     const Self = @This();
 
@@ -172,6 +184,8 @@ pub const DHCPServer = struct {
             // get a useful server_ip. run() will overwrite this with the detected IP.
             .server_ip = config_mod.parseIpv4(cfg.listen_address) catch [4]u8{ 0, 0, 0, 0 },
             .decline_records = std.AutoHashMap([17]u8, DeclineRecord).init(allocator),
+            .global_decline_count = 0,
+            .global_decline_window_start = 0,
         };
         return self;
     }
@@ -776,6 +790,23 @@ pub const DHCPServer = struct {
             mac_bytes[3], mac_bytes[4], mac_bytes[5],
         }) catch return;
         self.store.removeLease(mac_str);
+
+        // Global rate limit: reject excess declines that could exhaust the pool even
+        // when the attacker rotates spoofed MACs to bypass the per-MAC cooldown.
+        {
+            const now_g = std.time.timestamp();
+            if (now_g - self.global_decline_window_start > global_decline_window_secs) {
+                self.global_decline_count = 0;
+                self.global_decline_window_start = now_g;
+            }
+            if (self.global_decline_count >= global_decline_limit) {
+                std.log.warn("DHCPDECLINE: global rate limit reached ({d} in {d}s), ignoring from {s}", .{
+                    global_decline_limit, global_decline_window_secs, mac_str,
+                });
+                return;
+            }
+            self.global_decline_count += 1;
+        }
 
         // Quarantine the declined IP for max(lease_time/10, 5 min) using a sentinel MAC.
         // allocateIp skips IPs where getLeaseByIp != null.
@@ -1561,5 +1592,43 @@ test "quarantine period is max(lease_time/10, 300)" {
         // Should be ~300s (floor), not 60s (600/10)
         try std.testing.expect(remaining <= 300 + 2);
         try std.testing.expect(remaining >= 298);
+    }
+}
+
+test "global decline rate limit drops excess declines" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    defer server.deinit();
+
+    // Force the window to be current so counts don't reset.
+    server.global_decline_window_start = std.time.timestamp();
+
+    // Send global_decline_limit declines from distinct MACs — all should quarantine.
+    var i: u32 = 0;
+    while (i < global_decline_limit) : (i += 1) {
+        var buf = [_]u8{0} ** 512;
+        const mac = [6]u8{ 0xAA, 0xBB, 0xCC, 0x00, 0x00, @intCast(i) };
+        const ip = [4]u8{ 192, 168, 1, @intCast(10 + i) };
+        const len = makeDecline(&buf, mac, ip);
+        _ = try server.processPacket(buf[0..len]);
+    }
+    try std.testing.expectEqual(global_decline_limit, server.global_decline_count);
+
+    // One more decline (new MAC, new IP) should be dropped — no quarantine lease added.
+    {
+        var buf = [_]u8{0} ** 512;
+        const mac = [6]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+        const ip = [4]u8{ 192, 168, 1, @intCast(10 + global_decline_limit) };
+        const len = makeDecline(&buf, mac, ip);
+        _ = try server.processPacket(buf[0..len]);
+
+        // No quarantine lease should exist for the dropped IP.
+        var ip_buf: [15]u8 = undefined;
+        const ip_str = try std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] });
+        try std.testing.expect(store.getLeaseByIp(ip_str) == null);
     }
 }
