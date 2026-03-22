@@ -161,15 +161,19 @@ fn resolveDestination(request: []const u8) std.posix.sockaddr.in {
 /// Tries comma-separated IPv4 addresses first; falls back to raw string bytes.
 fn encodeOptionValue(dst: []u8, s: []const u8) []u8 {
     var len: usize = 0;
+    var all_valid = true;
     var it = std.mem.splitScalar(u8, s, ',');
     while (it.next()) |tok| {
         const trimmed = std.mem.trim(u8, tok, " ");
-        const ip = config_mod.parseIpv4(trimmed) catch break;
-        if (len + 4 > dst.len) break;
+        const ip = config_mod.parseIpv4(trimmed) catch {
+            all_valid = false;
+            break;
+        };
+        if (len + 4 > dst.len) { all_valid = false; break; }
         @memcpy(dst[len .. len + 4], &ip);
         len += 4;
     }
-    if (len > 0 and it.next() == null) return dst[0..len]; // all tokens were IPs
+    if (len > 0 and all_valid) return dst[0..len]; // all tokens were valid IPs
     // Fall back to raw string bytes
     const copy_len = @min(s.len, dst.len);
     @memcpy(dst[0..copy_len], s[0..copy_len]);
@@ -1080,6 +1084,11 @@ pub const DHCPServer = struct {
 
         if ((ip_int & mask) != subnet_int) return false;
         if (ip_int == subnet_int or ip_int == broadcast_int) return false;
+
+        // Reject reserved addresses: router and server's own IP.
+        const router_bytes = config_mod.parseIpv4(self.cfg.router) catch return false;
+        if (ip_int == std.mem.readInt(u32, &router_bytes, .big)) return false;
+        if (std.mem.eql(u8, &ip, &self.server_ip)) return false;
 
         if (self.cfg.pool_start.len > 0) {
             const b = config_mod.parseIpv4(self.cfg.pool_start) catch return false;
@@ -2174,4 +2183,70 @@ test "handleInform returns DHCPACK with yiaddr=0" {
 
     // No lease should have been created
     try std.testing.expectEqual(@as(usize, 0), store.leases.count());
+}
+
+test "encodeOptionValue: single valid IP" {
+    var buf: [16]u8 = undefined;
+    const result = encodeOptionValue(&buf, "192.168.1.1");
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 192, 168, 1, 1 }, result);
+}
+
+test "encodeOptionValue: two valid IPs" {
+    var buf: [16]u8 = undefined;
+    const result = encodeOptionValue(&buf, "192.168.1.1,192.168.1.2");
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 192, 168, 1, 1, 192, 168, 1, 2 }, result);
+}
+
+test "encodeOptionValue: raw string fallback" {
+    var buf: [32]u8 = undefined;
+    const result = encodeOptionValue(&buf, "example.com");
+    try std.testing.expectEqualSlices(u8, "example.com", result);
+}
+
+test "encodeOptionValue: partial parse falls back to raw string" {
+    var buf: [32]u8 = undefined;
+    // First token is valid IP, second is not — must fall back to raw string
+    const result = encodeOptionValue(&buf, "192.168.1.1,bad");
+    try std.testing.expectEqualSlices(u8, "192.168.1.1,bad", result);
+}
+
+test "isIpValid rejects router IP" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    defer server.deinit();
+
+    // makeTestConfig sets router = "192.168.1.1"
+    const router_ip = [4]u8{ 192, 168, 1, 1 };
+    try std.testing.expect(!server.isIpValid(router_ip, "aa:bb:cc:dd:ee:ff", null));
+}
+
+test "DHCPREQUEST for router IP results in DHCPNAK" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    defer server.deinit();
+
+    var buf = [_]u8{0} ** 512;
+    const hdr: *DHCPHeader = @alignCast(@ptrCast(buf.ptr));
+    hdr.op = 1; hdr.htype = 1; hdr.hlen = 6; hdr.xid = 0xDEAD;
+    hdr.magic = dhcp_magic_cookie;
+    @memcpy(hdr.chaddr[0..6], &[6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF });
+    var i: usize = dhcp_min_packet_size;
+    buf[i] = @intFromEnum(OptionCode.MessageType); buf[i+1] = 1; buf[i+2] = @intFromEnum(MessageType.DHCPREQUEST); i += 3;
+    // Request the router's IP address (192.168.1.1)
+    buf[i] = @intFromEnum(OptionCode.RequestedIpAddress); buf[i+1] = 4;
+    buf[i+2] = 192; buf[i+3] = 168; buf[i+4] = 1; buf[i+5] = 1; i += 6;
+    buf[i] = @intFromEnum(OptionCode.End); i += 1;
+
+    const resp = try server.processPacket(buf[0..i]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+    try std.testing.expectEqual(MessageType.DHCPNAK, DHCPServer.getMessageType(resp.?).?);
 }
