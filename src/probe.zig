@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const IFNAMSIZ: usize = 16;
 const SIOCGIFADDR: u32 = 0x8915;
@@ -72,7 +73,7 @@ pub fn findIfaceForIp(server_ip: [4]u8) !IfaceInfo {
         @memset(&req.data, 0);
         rc = std.os.linux.ioctl(tmp_sock, SIOCGIFINDEX, @intFromPtr(&req));
         if (@as(isize, @bitCast(rc)) < 0) continue;
-        const if_index: u32 = @bitCast(std.mem.readInt(i32, req.data[0..4], .native));
+        const if_index: u32 = @bitCast(std.mem.readInt(i32, req.data[0..4], builtin.cpu.arch.endian()));
 
         return .{ .index = if_index, .mac = mac };
     }

@@ -505,7 +505,7 @@ pub const DHCPServer = struct {
         // Client identifier (option 61) takes precedence over chaddr per RFC 2131 §2.
         if (client_id) |cid| {
             var cid_hex_buf: [510]u8 = undefined;
-            const cid_hex = std.fmt.bufPrint(&cid_hex_buf, "{}", .{std.fmt.fmtSliceHexLower(cid)}) catch "";
+            const cid_hex = std.fmt.bufPrint(&cid_hex_buf, "{x}", .{cid}) catch "";
             if (cid_hex.len > 0) {
                 if (self.store.getLeaseByClientId(cid_hex)) |lease| {
                     return try config_mod.parseIpv4(lease.ip);
@@ -519,7 +519,7 @@ pub const DHCPServer = struct {
         // Check for a reservation for this client (ignores expiry).
         if (client_id) |cid| {
             var cid_hex_buf2: [510]u8 = undefined;
-            const cid_hex2 = std.fmt.bufPrint(&cid_hex_buf2, "{}", .{std.fmt.fmtSliceHexLower(cid)}) catch "";
+            const cid_hex2 = std.fmt.bufPrint(&cid_hex_buf2, "{x}", .{cid}) catch "";
             if (cid_hex2.len > 0) {
                 if (self.store.getReservationByClientId(cid_hex2)) |res|
                     return try config_mod.parseIpv4(res.ip);
@@ -789,7 +789,7 @@ pub const DHCPServer = struct {
         const client_id_raw = getClientId(request);
         var cid_hex_buf: [510]u8 = undefined;
         const client_id_hex: ?[]const u8 = if (client_id_raw) |cid|
-            std.fmt.bufPrint(&cid_hex_buf, "{}", .{std.fmt.fmtSliceHexLower(cid)}) catch null
+            std.fmt.bufPrint(&cid_hex_buf, "{x}", .{cid}) catch null
         else
             null;
 
@@ -1106,9 +1106,9 @@ pub const DHCPServer = struct {
             if (i + 2 + sub_len > val.len) break;
             const sub_data = val[i + 2 .. i + 2 + sub_len];
             switch (sub_code) {
-                1 => std.log.debug("Option 82 circuit-id: {}", .{std.fmt.fmtSliceHexLower(sub_data)}),
-                2 => std.log.debug("Option 82 remote-id: {}", .{std.fmt.fmtSliceHexLower(sub_data)}),
-                else => std.log.debug("Option 82 sub-option {d}: {} ({d}B)", .{ sub_code, std.fmt.fmtSliceHexLower(sub_data), sub_len }),
+                1 => std.log.debug("Option 82 circuit-id: {x}", .{sub_data}),
+                2 => std.log.debug("Option 82 remote-id: {x}", .{sub_data}),
+                else => std.log.debug("Option 82 sub-option {d}: {x} ({d}B)", .{ sub_code, sub_data, sub_len }),
             }
             i += 2 + sub_len;
         }
