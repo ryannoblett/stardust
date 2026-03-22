@@ -25,7 +25,7 @@ dns_update:
   server: "127.0.0.1"
   zone: "stardust.lan"
   key_name: "dhcp-update"
-  key_file: "/etc/bind/key.dhcp-update.key"
+  key_file: "dhcp-update.key"
 
 # Static reservations — pin a MAC (or client_id) to a specific IP
 # reservations:
