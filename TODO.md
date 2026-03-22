@@ -2,6 +2,8 @@
 
 ## Pending
 
+None.
+
 ---
 
 ## Completed
@@ -73,6 +75,39 @@ walk (since `yaml.parse` doesn't support StringHashMap). Options are injected
 into OFFER and ACK packets. Values can be comma-separated IPv4 addresses
 (encoded as 4 bytes each) or raw strings. Keys are DHCP option codes as
 decimal strings (e.g. `42: "192.168.1.1"` for NTP server).
+
+**Static IP reservations** ✓
+`reservations:` section in `config.yaml` pins a MAC (or `client_id`) to a
+fixed IP and optional hostname. Reservations are seeded into the state store at
+startup and on SIGHUP. Reserved leases survive `removeLease` (expires zeroed,
+entry kept); `pruneExpired` skips them. `allocateIp` returns the reserved IP
+for its owner and skips it for everyone else.
+
+**SIGHUP config reload** ✓
+`SIGHUP` triggers a live config reload without restarting. The server reopens
+the config file, rebuilds the `Config`, recreates the `DNSUpdater`, re-syncs
+reservations, and updates the log level — all without dropping the UDP socket.
+
+**DHCP options 2, 4, 7, 42, 66, 67** ✓
+Time offset (option 2), RFC 868 time servers (4), log servers (7), NTP servers
+(42), TFTP server name (66), and boot filename (67) are parsed from config and
+included in responses when requested via PRL.
+
+**Domain Search List (option 119, RFC 3397)** ✓
+`domain_search:` list in config is DNS-label-compressed and sent as option 119.
+
+**Static Routes (options 33 and 121)** ✓
+`static_routes:` in config sends classful routes (option 33) and classless
+routes (option 121, RFC 3442). `/0` default routes are rejected (use `router:`
+instead). Routes are sorted and included only when the client's PRL requests them.
+
+**Lease sync — redundant server group** ✓
+`src/sync.zig` implements a UDP lease-synchronisation protocol (port 647) for
+active-active DHCP pairs. AES-256-GCM encryption (key derived via HKDF-SHA-256
+from a BIND TSIG key file), SHA-256 pool hash for peer admission, last-write-wins
+conflict resolution via `Lease.last_modified`, and periodic LEASE_HASH
+anti-entropy checks. Discovery via IPv4 multicast or explicit unicast peer list.
+`pool_allocation_random: true` reduces split-brain IP collisions.
 
 **Logging improvements** ✓
 All output now goes through `std.log` with a custom `logFn` in `main.zig`.
