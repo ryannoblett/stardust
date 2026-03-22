@@ -22,6 +22,19 @@ domain_name: "stardust.lan"
 #   - "stardust.lan"
 #   - "local"
 
+# Time configuration
+# time_offset: 3600     # seconds east of UTC (option 2); e.g. -18000 = UTC-5, 3600 = UTC+1
+# time_servers:         # RFC 868 time servers (option 4); legacy protocol
+#   - "192.168.1.1"
+# ntp_servers:          # NTP servers (option 42); preferred over time_servers for modern clients
+#   - "192.168.1.1"
+# log_servers:          # Log servers / syslog (option 7)
+#   - "192.168.1.1"
+
+# PXE / TFTP network boot (options 66 and 67)
+# tftp_server_name: "192.168.1.1"   # TFTP server hostname or IP
+# boot_filename: "pxelinux.0"       # boot file; use "ipxe.efi" for UEFI PXE
+
 # State storage
 state_dir: "/var/lib/stardust"
 

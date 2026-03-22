@@ -65,10 +65,14 @@ pub const dhcp_client_port: u16 = 68;
 pub const OptionCode = enum(u8) {
     Pad = 0,
     SubnetMask = 1,
+    TimeOffset = 2,
     Router = 3,
+    TimeServer = 4,
     DomainNameServer = 6,
+    LogServer = 7,
     HostName = 12,
     DomainName = 15,
+    NtpServers = 42,
     RequestedIPAddress = 50,
     IPAddressLeaseTime = 51,
     MessageType = 53,
@@ -77,6 +81,8 @@ pub const OptionCode = enum(u8) {
     RenewalTimeValue = 58,
     RebindingTimeValue = 59,
     ClientID = 61,
+    TftpServerName = 66,
+    BootFileName = 67,
     RelayAgentInformation = 82,
     DomainSearch = 119,
     End = 255,
@@ -231,6 +237,52 @@ fn isRequestedCode(prl: ?[]const u8, code: u8) bool {
 
 fn isRequested(prl: ?[]const u8, code: OptionCode) bool {
     return isRequestedCode(prl, @intFromEnum(code));
+}
+
+/// Append a list-of-IPv4 option. Skips the whole option if the list is empty or
+/// none of the IP strings parse, and does nothing if the PRL does not request it.
+fn appendIpListOpt(
+    opts_buf: []u8,
+    opts_len: *usize,
+    prl: ?[]const u8,
+    code: OptionCode,
+    servers: []const []const u8,
+) void {
+    if (!isRequested(prl, code) or servers.len == 0) return;
+    const count = @min(servers.len, 63); // max 252 bytes of data
+    const header = opts_len.*;
+    if (header + 2 + count * 4 > opts_buf.len) return;
+    opts_buf[header] = @intFromEnum(code);
+    opts_len.* += 2;
+    var n: u8 = 0;
+    for (servers[0..count]) |s| {
+        const ip = config_mod.parseIpv4(s) catch continue;
+        @memcpy(opts_buf[opts_len.*..][0..4], &ip);
+        opts_len.* += 4;
+        n += 1;
+    }
+    if (n > 0) {
+        opts_buf[header + 1] = n * 4;
+    } else {
+        opts_len.* = header; // rewind -- no valid IPs
+    }
+}
+
+/// Append a string option. Does nothing if value is empty or PRL does not request it.
+fn appendStringOpt(
+    opts_buf: []u8,
+    opts_len: *usize,
+    prl: ?[]const u8,
+    code: OptionCode,
+    value: []const u8,
+) void {
+    if (!isRequested(prl, code) or value.len == 0) return;
+    const len = @min(value.len, 255);
+    if (opts_len.* + 2 + len > opts_buf.len) return;
+    opts_buf[opts_len.*] = @intFromEnum(code);
+    opts_buf[opts_len.* + 1] = @intCast(len);
+    @memcpy(opts_buf[opts_len.* + 2 ..][0..len], value[0..len]);
+    opts_len.* += 2 + len;
 }
 
 // Per-MAC decline rate-limiting: after decline_threshold declines within decline_window_secs,
@@ -786,7 +838,7 @@ pub const DHCPServer = struct {
         const rebind_time = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.lease_time * 7 / 8));
 
         // Build options into a temporary buffer
-        var opts_buf: [512]u8 = undefined;
+        var opts_buf: [1024]u8 = undefined;
         var opts_len: usize = 0;
 
         // Option 53: DHCPOFFER — always required
@@ -875,6 +927,32 @@ pub const DHCPServer = struct {
             }
         }
 
+
+        // Option 2: Time Offset
+        if (isRequested(prl, .TimeOffset)) {
+            if (self.cfg.time_offset) |offset| {
+                opts_buf[opts_len] = @intFromEnum(OptionCode.TimeOffset);
+                opts_buf[opts_len + 1] = 4;
+                const be = std.mem.nativeToBig(i32, offset);
+                @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &std.mem.toBytes(be));
+                opts_len += 6;
+            }
+        }
+
+        // Option 4: Time Servers (RFC 868)
+        appendIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, self.cfg.time_servers);
+
+        // Option 7: Log Servers
+        appendIpListOpt(&opts_buf, &opts_len, prl, .LogServer, self.cfg.log_servers);
+
+        // Option 42: NTP Servers
+        appendIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, self.cfg.ntp_servers);
+
+        // Option 66: TFTP Server Name
+        appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, self.cfg.tftp_server_name);
+
+        // Option 67: Boot Filename
+        appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, self.cfg.boot_filename);
         // Inject operator-defined options from config (filtered by PRL)
         var opts_it = self.cfg.dhcp_options.iterator();
         while (opts_it.next()) |entry| {
@@ -997,7 +1075,7 @@ pub const DHCPServer = struct {
         const prl = getOption(request, .ParameterRequestList);
 
         // Build options
-        var opts_buf: [512]u8 = undefined;
+        var opts_buf: [1024]u8 = undefined;
         var opts_len: usize = 0;
 
         // Option 53: DHCPACK — always required
@@ -1086,6 +1164,32 @@ pub const DHCPServer = struct {
             }
         }
 
+
+        // Option 2: Time Offset
+        if (isRequested(prl, .TimeOffset)) {
+            if (self.cfg.time_offset) |offset| {
+                opts_buf[opts_len] = @intFromEnum(OptionCode.TimeOffset);
+                opts_buf[opts_len + 1] = 4;
+                const be = std.mem.nativeToBig(i32, offset);
+                @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &std.mem.toBytes(be));
+                opts_len += 6;
+            }
+        }
+
+        // Option 4: Time Servers (RFC 868)
+        appendIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, self.cfg.time_servers);
+
+        // Option 7: Log Servers
+        appendIpListOpt(&opts_buf, &opts_len, prl, .LogServer, self.cfg.log_servers);
+
+        // Option 42: NTP Servers
+        appendIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, self.cfg.ntp_servers);
+
+        // Option 66: TFTP Server Name
+        appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, self.cfg.tftp_server_name);
+
+        // Option 67: Boot Filename
+        appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, self.cfg.boot_filename);
         // Option 12: Hostname override from reservation (so client adopts reservation hostname).
         if (res_hostname) |rh| {
             if (isRequested(prl, .HostName)) {
@@ -1343,7 +1447,7 @@ pub const DHCPServer = struct {
 
         const prl = getOption(request, .ParameterRequestList);
 
-        var opts_buf: [512]u8 = undefined;
+        var opts_buf: [1024]u8 = undefined;
         var opts_len: usize = 0;
 
         // Option 53: DHCPACK — always required
@@ -1410,6 +1514,32 @@ pub const DHCPServer = struct {
             }
         }
 
+
+        // Option 2: Time Offset
+        if (isRequested(prl, .TimeOffset)) {
+            if (self.cfg.time_offset) |offset| {
+                opts_buf[opts_len] = @intFromEnum(OptionCode.TimeOffset);
+                opts_buf[opts_len + 1] = 4;
+                const be = std.mem.nativeToBig(i32, offset);
+                @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &std.mem.toBytes(be));
+                opts_len += 6;
+            }
+        }
+
+        // Option 4: Time Servers (RFC 868)
+        appendIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, self.cfg.time_servers);
+
+        // Option 7: Log Servers
+        appendIpListOpt(&opts_buf, &opts_len, prl, .LogServer, self.cfg.log_servers);
+
+        // Option 42: NTP Servers
+        appendIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, self.cfg.ntp_servers);
+
+        // Option 66: TFTP Server Name
+        appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, self.cfg.tftp_server_name);
+
+        // Option 67: Boot Filename
+        appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, self.cfg.boot_filename);
         // Inject operator-defined options from config (filtered by PRL)
         var opts_it = self.cfg.dhcp_options.iterator();
         while (opts_it.next()) |entry| {
@@ -1736,6 +1866,12 @@ fn makeTestConfig(allocator: std.mem.Allocator) !config_mod.Config {
         .dns_servers = try allocator.alloc([]const u8, 0),
         .domain_name = try allocator.dupe(u8, ""),
         .domain_search = try allocator.alloc([]const u8, 0),
+        .time_offset = null,
+        .time_servers = try allocator.alloc([]const u8, 0),
+        .log_servers = try allocator.alloc([]const u8, 0),
+        .ntp_servers = try allocator.alloc([]const u8, 0),
+        .tftp_server_name = try allocator.dupe(u8, ""),
+        .boot_filename = try allocator.dupe(u8, ""),
         .lease_time = 3600,
         .state_dir = try allocator.dupe(u8, "/tmp"),
         .pool_start = try allocator.dupe(u8, ""),

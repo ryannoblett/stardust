@@ -24,6 +24,12 @@ pub const Config = struct {
     dns_servers: [][]const u8,
     domain_name: []const u8,
     domain_search: [][]const u8,
+    time_offset: ?i32,           // option 2: seconds east of UTC; null = not sent
+    time_servers: [][]const u8,  // option 4: RFC 868 time servers
+    log_servers: [][]const u8,   // option 7: log servers
+    ntp_servers: [][]const u8,   // option 42: NTP servers
+    tftp_server_name: []const u8, // option 66: TFTP server hostname or IP
+    boot_filename: []const u8,   // option 67: PXE boot filename
     lease_time: u32,
     state_dir: []const u8,
     pool_start: []const u8, // "" = use subnet start
@@ -46,6 +52,14 @@ pub const Config = struct {
         self.allocator.free(self.domain_name);
         for (self.domain_search) |s| self.allocator.free(s);
         self.allocator.free(self.domain_search);
+        for (self.time_servers) |s| self.allocator.free(s);
+        self.allocator.free(self.time_servers);
+        for (self.log_servers) |s| self.allocator.free(s);
+        self.allocator.free(self.log_servers);
+        for (self.ntp_servers) |s| self.allocator.free(s);
+        self.allocator.free(self.ntp_servers);
+        self.allocator.free(self.tftp_server_name);
+        self.allocator.free(self.boot_filename);
         self.allocator.free(self.state_dir);
         self.allocator.free(self.dns_update.server);
         self.allocator.free(self.dns_update.zone);
@@ -78,6 +92,12 @@ const RawConfig = struct {
     dns_servers: ?[][]const u8 = null,
     domain_name: ?[]const u8 = null,
     domain_search: ?[][]const u8 = null,
+    time_offset: ?i32 = null,
+    time_servers: ?[][]const u8 = null,
+    log_servers: ?[][]const u8 = null,
+    ntp_servers: ?[][]const u8 = null,
+    tftp_server_name: ?[]const u8 = null,
+    boot_filename: ?[]const u8 = null,
     lease_time: ?u32 = null,
     state_dir: ?[]const u8 = null,
     pool_start: ?[]const u8 = null,
@@ -126,6 +146,12 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
         .dns_servers = try allocator.alloc([]const u8, 0),
         .domain_name = try allocator.dupe(u8, raw.domain_name orelse ""),
         .domain_search = try allocator.alloc([]const u8, 0),
+        .time_offset = null,
+        .time_servers = try allocator.alloc([]const u8, 0),
+        .log_servers = try allocator.alloc([]const u8, 0),
+        .ntp_servers = try allocator.alloc([]const u8, 0),
+        .tftp_server_name = try allocator.dupe(u8, ""),
+        .boot_filename = try allocator.dupe(u8, ""),
         .lease_time = lease_time_val,
         .state_dir = try allocator.dupe(u8, raw.state_dir orelse "/var/lib/stardust"),
         .pool_start = try allocator.dupe(u8, raw.pool_start orelse ""),
@@ -159,6 +185,45 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
         for (domains, 0..) |s, i| {
             cfg.domain_search[i] = try allocator.dupe(u8, s);
         }
+    }
+
+    if (raw.time_offset) |v| cfg.time_offset = v;
+
+    if (raw.time_servers) |servers| {
+        allocator.free(cfg.time_servers);
+        cfg.time_servers = try allocator.alloc([]const u8, servers.len);
+        for (cfg.time_servers) |*s| s.* = "";
+        for (servers, 0..) |s, i| {
+            cfg.time_servers[i] = try allocator.dupe(u8, s);
+        }
+    }
+
+    if (raw.log_servers) |servers| {
+        allocator.free(cfg.log_servers);
+        cfg.log_servers = try allocator.alloc([]const u8, servers.len);
+        for (cfg.log_servers) |*s| s.* = "";
+        for (servers, 0..) |s, i| {
+            cfg.log_servers[i] = try allocator.dupe(u8, s);
+        }
+    }
+
+    if (raw.ntp_servers) |servers| {
+        allocator.free(cfg.ntp_servers);
+        cfg.ntp_servers = try allocator.alloc([]const u8, servers.len);
+        for (cfg.ntp_servers) |*s| s.* = "";
+        for (servers, 0..) |s, i| {
+            cfg.ntp_servers[i] = try allocator.dupe(u8, s);
+        }
+    }
+
+    if (raw.tftp_server_name) |v| {
+        allocator.free(cfg.tftp_server_name);
+        cfg.tftp_server_name = try allocator.dupe(u8, v);
+    }
+
+    if (raw.boot_filename) |v| {
+        allocator.free(cfg.boot_filename);
+        cfg.boot_filename = try allocator.dupe(u8, v);
     }
 
     if (raw.dns_update) |du| {
