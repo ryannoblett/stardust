@@ -83,6 +83,21 @@ pub const StateStore = struct {
         };
     }
 
+    /// Unconditionally delete a lease entry regardless of its reserved flag.
+    /// Used when syncing config reservations: a MAC removed from config must be
+    /// fully purged even if it currently has reserved=true.
+    pub fn forceRemoveLease(store: *StateStore, mac: []const u8) void {
+        if (store.leases.fetchRemove(mac)) |kv| {
+            store.allocator.free(kv.value.mac);
+            store.allocator.free(kv.value.ip);
+            if (kv.value.hostname) |h| store.allocator.free(h);
+            if (kv.value.client_id) |c| store.allocator.free(c);
+            store.save() catch |err| {
+                std.log.warn("Failed to persist lease state ({s})", .{@errorName(err)});
+            };
+        }
+    }
+
     /// Remove the lease for the given MAC. No-op if not found.
     /// For reserved leases, sets expires=0 (inactive) instead of deleting.
     pub fn removeLease(store: *StateStore, mac: []const u8) void {

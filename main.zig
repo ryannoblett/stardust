@@ -95,12 +95,29 @@ pub fn main() !void {
 
     g_journal_stream = std.posix.getenv("JOURNAL_STREAM") != null;
 
+    // Parse command-line arguments.
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    var cfg_path: []const u8 = "config.yaml";
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) {
+            i += 1;
+            if (i >= args.len) fatal("Missing argument for {s}", .{arg});
+            cfg_path = args[i];
+        } else {
+            fatal("Unknown argument: {s}\nUsage: stardust [-c|--config <path>]", .{arg});
+        }
+    }
+
     std.log.info("Starting Stardust DHCP Server...", .{});
 
     // Load configuration into a heap allocation so the DHCP server can reload
     // it in-place on SIGHUP without disturbing the pointer it holds.
     const cfg = try allocator.create(config_mod.Config);
-    cfg.* = config_mod.load(allocator, "config.yaml") catch |err| {
+    cfg.* = config_mod.load(allocator, cfg_path) catch |err| {
         fatal("Failed to load config: {s}", .{@errorName(err)});
     };
     defer {
@@ -150,13 +167,14 @@ pub fn main() !void {
 
     // Create and run DHCP server. The server takes ownership of dns_updater
     // (cleans it up on deinit and recreates it on SIGHUP reload).
-    const dhcp_server = dhcp.create_server(allocator, cfg, store, dns_updater, &g_log_level) catch |err| {
+    const dhcp_server = dhcp.create_server(allocator, cfg, cfg_path, store, dns_updater, &g_log_level) catch |err| {
         fatal("Failed to create DHCP server: {s}", .{@errorName(err)});
     };
     defer dhcp_server.deinit();
 
-    // Seed static reservations. On SIGHUP the server calls seedReservations() again.
-    dhcp_server.seedReservations();
+    // Sync reservations from config into the state store.
+    // On SIGHUP the server calls syncReservations() again after reloading config.
+    dhcp_server.syncReservations();
 
     std.log.info("Starting DHCP server...", .{});
     dhcp_server.run() catch |err| {
