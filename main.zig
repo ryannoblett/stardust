@@ -36,8 +36,7 @@ fn logFn(
     };
     var ts_buf: [20]u8 = undefined;
     const ts = fmtTimestamp(&ts_buf, std.time.timestamp());
-    const stderr = std.io.getStdErr().writer();
-    stderr.print(sd_prefix ++ "{s} [" ++ level_str ++ "] " ++ format ++ "\n", .{ts} ++ args) catch {};
+    std.debug.print(sd_prefix ++ "{s} [" ++ level_str ++ "] " ++ format ++ "\n", .{ts} ++ args) catch {};
 }
 
 fn fmtTimestamp(buf: *[20]u8, ts: i64) []const u8 {
