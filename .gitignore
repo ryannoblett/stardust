@@ -1,3 +1,4 @@
 .zig-cache
 .opencode
 main
+zig-out
