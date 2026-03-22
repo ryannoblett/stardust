@@ -307,6 +307,17 @@ pub const DHCPServer = struct {
             &std.mem.toBytes(@as(c_int, 1)),
         );
 
+        // SO_RCVTIMEO — 1-second timeout so the run loop can check the running
+        // flag after a signal sets it to false (Zig's posix wrapper retries
+        // recvfrom on EINTR, so a signal alone would not unblock the call).
+        const rcv_timeout = std.posix.timeval{ .sec = 1, .usec = 0 };
+        try std.posix.setsockopt(
+            sock_fd,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.RCVTIMEO,
+            &std.mem.toBytes(rcv_timeout),
+        );
+
         const bind_addr = std.posix.sockaddr.in{
             .family = std.posix.AF.INET,
             .port = std.mem.nativeToBig(u16, dhcp_server_port),
@@ -360,7 +371,10 @@ pub const DHCPServer = struct {
                 @ptrCast(&src_addr),
                 &src_len,
             ) catch |err| {
-                std.log.err("recvfrom error: {s}", .{@errorName(err)});
+                switch (err) {
+                    error.WouldBlock => {}, // SO_RCVTIMEO expired — just re-check running flag
+                    else => std.log.err("recvfrom error: {s}", .{@errorName(err)}),
+                }
                 continue;
             };
 
