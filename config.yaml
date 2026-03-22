@@ -27,6 +27,13 @@ dns_update:
   key_name: "dhcp-update"
   key_file: "/etc/bind/key.dhcp-update.key"
 
+# Static reservations — pin a MAC (or client_id) to a specific IP
+# reservations:
+#   - mac: "aa:bb:cc:dd:ee:ff"
+#     ip: "192.168.1.50"
+#     hostname: "printer"           # optional; sent to client via option 12
+#     client_id: "01aabbccddeeff"  # optional; hex string matching option 61
+
 # Additional DHCP options
 dhcp_options:
   # option_name: value
