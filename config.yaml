@@ -14,7 +14,7 @@ dns_servers:
   - "8.8.8.8"
   - "8.8.4.4"
 
-domain_name: "example.com"
+domain_name: "stardust.lan"
 
 # State storage
 state_dir: "/var/lib/stardust"
@@ -23,7 +23,7 @@ state_dir: "/var/lib/stardust"
 dns_update:
   enable: false
   server: "127.0.0.1"
-  zone: "example.com"
+  zone: "stardust.lan"
   key_name: "dhcp-update"
   key_file: "/etc/bind/key.dhcp-update.key"
 
