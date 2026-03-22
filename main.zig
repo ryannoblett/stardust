@@ -122,6 +122,15 @@ pub fn main() !void {
 
     std.log.info("State store initialized", .{});
 
+    // Seed static reservations into the state store.
+    for (cfg.reservations) |r| {
+        if (store.getReservationByMac(r.mac) != null) continue; // already seeded from leases.json
+        store.addReservation(r.mac, r.ip, r.hostname, r.client_id) catch |err| {
+            std.log.warn("Failed to seed reservation for {s}: {s}", .{ r.mac, @errorName(err) });
+        };
+        std.log.info("Seeded reservation: {s} -> {s}", .{ r.mac, r.ip });
+    }
+
     // Initialize DNS updater
     const dns_updater = dns.create_updater(allocator, &cfg.dns_update) catch |err| {
         fatal("Failed to initialize DNS updater: {s}", .{@errorName(err)});

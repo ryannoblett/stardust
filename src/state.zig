@@ -10,6 +10,7 @@ pub const Lease = struct {
     hostname: ?[]const u8,
     expires: i64,
     client_id: ?[]const u8,
+    reserved: bool = false,
 };
 
 pub const StateStore = struct {
@@ -74,6 +75,7 @@ pub const StateStore = struct {
             .hostname = hostname,
             .expires = lease.expires,
             .client_id = client_id,
+            .reserved = lease.reserved,
         });
 
         store.save() catch |err| {
@@ -82,7 +84,17 @@ pub const StateStore = struct {
     }
 
     /// Remove the lease for the given MAC. No-op if not found.
+    /// For reserved leases, sets expires=0 (inactive) instead of deleting.
     pub fn removeLease(store: *StateStore, mac: []const u8) void {
+        if (store.leases.getPtr(mac)) |lease_ptr| {
+            if (lease_ptr.reserved) {
+                lease_ptr.expires = 0;
+                store.save() catch |err| {
+                    std.log.warn("Failed to persist lease state ({s})", .{@errorName(err)});
+                };
+                return;
+            }
+        }
         if (store.leases.fetchRemove(mac)) |kv| {
             store.allocator.free(kv.value.mac);
             store.allocator.free(kv.value.ip);
@@ -133,6 +145,7 @@ pub const StateStore = struct {
         var it = store.leases.keyIterator();
         while (it.next()) |key| {
             const lease = store.leases.get(key.*).?;
+            if (lease.reserved) continue;
             if (lease.expires <= now) {
                 if (count < to_remove.len) {
                     to_remove[count] = key.*;
@@ -155,6 +168,49 @@ pub const StateStore = struct {
             i += 1;
         }
         return list;
+    }
+
+    /// Returns a reservation (reserved=true) for this MAC regardless of expiry.
+    pub fn getReservationByMac(store: *StateStore, mac: []const u8) ?Lease {
+        const lease = store.leases.get(mac) orelse return null;
+        if (!lease.reserved) return null;
+        return lease;
+    }
+
+    /// Returns a reservation matching this hex-encoded client_id regardless of expiry.
+    pub fn getReservationByClientId(store: *StateStore, client_id: []const u8) ?Lease {
+        var it = store.leases.valueIterator();
+        while (it.next()) |lease| {
+            if (!lease.reserved) continue;
+            if (lease.client_id) |cid| {
+                if (std.mem.eql(u8, cid, client_id)) return lease.*;
+            }
+        }
+        return null;
+    }
+
+    /// Returns a reservation holding this IP regardless of expiry.
+    pub fn getReservationByIp(store: *StateStore, ip: []const u8) ?Lease {
+        var it = store.leases.valueIterator();
+        while (it.next()) |lease| {
+            if (!lease.reserved) continue;
+            if (std.mem.eql(u8, lease.ip, ip)) return lease.*;
+        }
+        return null;
+    }
+
+    /// Seed a reservation. Preserves expiry if a lease for this MAC already exists.
+    pub fn addReservation(store: *StateStore, mac: []const u8, ip: []const u8,
+        hostname: ?[]const u8, client_id: ?[]const u8) !void {
+        const existing_expires: i64 = if (store.leases.get(mac)) |existing| existing.expires else 0;
+        try store.addLease(.{
+            .mac = mac,
+            .ip = ip,
+            .hostname = hostname,
+            .expires = existing_expires,
+            .client_id = client_id,
+            .reserved = true,
+        });
     }
 
     fn leasesPath(store: *StateStore) ![]u8 {
@@ -199,7 +255,7 @@ pub const StateStore = struct {
 
         const now = std.time.timestamp();
         for (parsed.value) |lease| {
-            if (lease.expires <= now) continue; // Skip expired leases.
+            if (!lease.reserved and lease.expires <= now) continue; // Skip expired non-reserved leases.
             const mac = try store.allocator.dupe(u8, lease.mac);
             errdefer store.allocator.free(mac);
             const ip = try store.allocator.dupe(u8, lease.ip);
@@ -214,6 +270,7 @@ pub const StateStore = struct {
                 .hostname = hostname,
                 .expires = lease.expires,
                 .client_id = client_id,
+                .reserved = lease.reserved,
             });
         }
     }
@@ -247,6 +304,24 @@ fn putLease(store: *StateStore, mac: []const u8, ip: []const u8, expires: i64) !
         .hostname = null,
         .expires = expires,
         .client_id = null,
+    });
+}
+
+/// Insert a reserved lease directly (bypasses save).
+fn putReservation(store: *StateStore, mac: []const u8, ip: []const u8, expires: i64, client_id: ?[]const u8) !void {
+    const mac_owned = try store.allocator.dupe(u8, mac);
+    errdefer store.allocator.free(mac_owned);
+    const ip_owned = try store.allocator.dupe(u8, ip);
+    errdefer store.allocator.free(ip_owned);
+    const cid_owned: ?[]const u8 = if (client_id) |c| try store.allocator.dupe(u8, c) else null;
+    errdefer if (cid_owned) |c| store.allocator.free(c);
+    try store.leases.put(mac_owned, .{
+        .mac = mac_owned,
+        .ip = ip_owned,
+        .hostname = null,
+        .expires = expires,
+        .client_id = cid_owned,
+        .reserved = true,
     });
 }
 
@@ -302,4 +377,83 @@ test "pruneExpired removes expired and keeps valid" {
     try std.testing.expectEqual(@as(usize, 1), store.leases.count());
     try std.testing.expect(store.leases.get("aa:bb:cc:dd:ee:01") == null);
     try std.testing.expect(store.leases.get("aa:bb:cc:dd:ee:02") != null);
+}
+
+test "getReservationByMac returns inactive reservation (expires=0)" {
+    const store = try makeTestStore(std.testing.allocator);
+    defer store.deinit();
+
+    try putReservation(store, "aa:bb:cc:dd:ee:ff", "192.168.1.50", 0, null);
+
+    const res = store.getReservationByMac("aa:bb:cc:dd:ee:ff");
+    try std.testing.expect(res != null);
+    try std.testing.expectEqualStrings("192.168.1.50", res.?.ip);
+}
+
+test "getReservationByMac returns null for non-reserved lease" {
+    const store = try makeTestStore(std.testing.allocator);
+    defer store.deinit();
+
+    try putLease(store, "aa:bb:cc:dd:ee:ff", "192.168.1.10", std.time.timestamp() + 3600);
+
+    try std.testing.expect(store.getReservationByMac("aa:bb:cc:dd:ee:ff") == null);
+}
+
+test "getReservationByClientId returns reservation by client_id" {
+    const store = try makeTestStore(std.testing.allocator);
+    defer store.deinit();
+
+    try putReservation(store, "aa:bb:cc:dd:ee:ff", "192.168.1.50", 0, "01aabbccddeeff");
+
+    const res = store.getReservationByClientId("01aabbccddeeff");
+    try std.testing.expect(res != null);
+    try std.testing.expectEqualStrings("192.168.1.50", res.?.ip);
+    try std.testing.expect(store.getReservationByClientId("deadbeef") == null);
+}
+
+test "pruneExpired does not remove reserved leases" {
+    const store = try makeTestStore(std.testing.allocator);
+    defer store.deinit();
+
+    try putReservation(store, "aa:bb:cc:dd:ee:01", "192.168.1.50", 0, null); // inactive reservation
+    try putReservation(store, "aa:bb:cc:dd:ee:02", "192.168.1.51", std.time.timestamp() - 1, null); // expired reservation
+    try putLease(store, "aa:bb:cc:dd:ee:03", "192.168.1.10", std.time.timestamp() - 1); // expired regular
+
+    store.pruneExpired();
+
+    try std.testing.expectEqual(@as(usize, 2), store.leases.count());
+    try std.testing.expect(store.leases.get("aa:bb:cc:dd:ee:01") != null);
+    try std.testing.expect(store.leases.get("aa:bb:cc:dd:ee:02") != null);
+    try std.testing.expect(store.leases.get("aa:bb:cc:dd:ee:03") == null);
+}
+
+test "removeLease on reserved lease zeros expiry, keeps entry" {
+    const store = try makeTestStore(std.testing.allocator);
+    defer store.deinit();
+
+    try putReservation(store, "aa:bb:cc:dd:ee:ff", "192.168.1.50", std.time.timestamp() + 3600, null);
+
+    store.removeLease("aa:bb:cc:dd:ee:ff");
+
+    // Entry still present
+    const entry = store.leases.get("aa:bb:cc:dd:ee:ff");
+    try std.testing.expect(entry != null);
+    try std.testing.expectEqual(@as(i64, 0), entry.?.expires);
+    try std.testing.expect(entry.?.reserved);
+}
+
+test "addReservation preserves expiry of existing lease" {
+    const store = try makeTestStore(std.testing.allocator);
+    defer store.deinit();
+
+    const future = std.time.timestamp() + 3600;
+    try putLease(store, "aa:bb:cc:dd:ee:ff", "192.168.1.10", future);
+
+    try store.addReservation("aa:bb:cc:dd:ee:ff", "192.168.1.50", null, null);
+
+    const entry = store.leases.get("aa:bb:cc:dd:ee:ff");
+    try std.testing.expect(entry != null);
+    try std.testing.expectEqual(future, entry.?.expires);
+    try std.testing.expect(entry.?.reserved);
+    try std.testing.expectEqualStrings("192.168.1.50", entry.?.ip);
 }

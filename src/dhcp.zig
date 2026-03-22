@@ -407,6 +407,7 @@ pub const DHCPServer = struct {
         var it = self.store.leases.keyIterator();
         while (it.next()) |key| {
             const lease = self.store.leases.get(key.*).?;
+            if (lease.reserved) continue;
             if (lease.expires <= now and count < to_remove.len) {
                 to_remove[count] = key.*;
                 count += 1;
@@ -423,6 +424,7 @@ pub const DHCPServer = struct {
             self.store.removeLease(mac);
         }
     }
+
 
     fn processPacket(self: *Self, packet: []const u8) !?[]u8 {
         if (packet.len < dhcp_min_packet_size) return null;
@@ -514,6 +516,18 @@ pub const DHCPServer = struct {
             return try config_mod.parseIpv4(lease.ip);
         }
 
+        // Check for a reservation for this client (ignores expiry).
+        if (client_id) |cid| {
+            var cid_hex_buf2: [510]u8 = undefined;
+            const cid_hex2 = std.fmt.bufPrint(&cid_hex_buf2, "{}", .{std.fmt.fmtSliceHexLower(cid)}) catch "";
+            if (cid_hex2.len > 0) {
+                if (self.store.getReservationByClientId(cid_hex2)) |res|
+                    return try config_mod.parseIpv4(res.ip);
+            }
+        }
+        if (self.store.getReservationByMac(mac_str)) |res|
+            return try config_mod.parseIpv4(res.ip);
+
         const subnet_bytes = try config_mod.parseIpv4(self.cfg.subnet);
         const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
         const mask = self.cfg.subnet_mask;
@@ -551,6 +565,9 @@ pub const DHCPServer = struct {
             const ip_str = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{
                 ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3],
             }) catch unreachable;
+
+            // Skip IPs reserved for a different client.
+            if (self.store.getReservationByIp(ip_str) != null) continue;
 
             if (self.store.getLeaseByIp(ip_str) == null) return ip_bytes;
         }
@@ -791,21 +808,34 @@ pub const DHCPServer = struct {
             client_ip[0], client_ip[1], client_ip[2], client_ip[3],
         }) catch unreachable;
 
+        // Check for a reservation matching this client (by MAC, then by IP).
+        const reservation: ?state_mod.Lease = self.store.getReservationByMac(mac_str) orelse
+            self.store.getReservationByIp(ip_str);
+
+        // Dupe the reservation hostname before addLease may free the old lease entry.
+        var res_hostname: ?[]u8 = null;
+        defer if (res_hostname) |h| self.allocator.free(h);
+        if (reservation) |res| {
+            if (res.hostname) |rh| res_hostname = try self.allocator.dupe(u8, rh);
+        }
+
         // Record the lease (includes hostname from option 12 and client_id from option 61).
         const now = std.time.timestamp();
         const hostname = getHostname(request);
+        const effective_hostname: ?[]const u8 = res_hostname orelse hostname;
         self.store.addLease(.{
             .mac = mac_str,
             .ip = ip_str,
-            .hostname = hostname,
+            .hostname = effective_hostname,
             .expires = now + @as(i64, self.cfg.lease_time),
             .client_id = client_id_hex,
+            .reserved = reservation != null,
         }) catch |err| {
             std.log.warn("Failed to store lease ({s})", .{@errorName(err)});
         };
 
         // Notify DNS updater
-        if (self.dns_updater) |du| du.notifyLeaseAdded(ip_str, hostname);
+        if (self.dns_updater) |du| du.notifyLeaseAdded(ip_str, effective_hostname);
 
         logRelayAgentInfo(request);
 
@@ -887,6 +917,17 @@ pub const DHCPServer = struct {
             opts_buf[opts_len + 1] = @intCast(dn_len);
             @memcpy(opts_buf[opts_len + 2 .. opts_len + 2 + dn_len], self.cfg.domain_name[0..dn_len]);
             opts_len += 2 + dn_len;
+        }
+
+        // Option 12: Hostname override from reservation (so client adopts reservation hostname).
+        if (res_hostname) |rh| {
+            if (isRequested(prl, .HostName)) {
+                const hn_len = @min(rh.len, 255);
+                opts_buf[opts_len] = @intFromEnum(OptionCode.HostName);
+                opts_buf[opts_len + 1] = @intCast(hn_len);
+                @memcpy(opts_buf[opts_len + 2 .. opts_len + 2 + hn_len], rh[0..hn_len]);
+                opts_len += 2 + hn_len;
+            }
         }
 
         // Inject operator-defined options from config (filtered by PRL)
@@ -1101,6 +1142,16 @@ pub const DHCPServer = struct {
 
         var ip_buf: [15]u8 = undefined;
         const ip_str = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] }) catch return false;
+
+        // Reject a reserved IP for a client that doesn't own the reservation.
+        if (self.store.getReservationByIp(ip_str)) |res| {
+            const mac_ok = std.mem.eql(u8, res.mac, mac_str);
+            const cid_ok = if (client_id_hex) |cid|
+                if (res.client_id) |rcid| std.mem.eql(u8, cid, rcid) else false
+            else false;
+            if (!mac_ok and !cid_ok) return false;
+        }
+
         if (self.store.getLeaseByIp(ip_str)) |lease| {
             if (!std.mem.eql(u8, lease.mac, mac_str)) {
                 // Accept if the stored client_id matches (client may have changed MAC).
@@ -1515,6 +1566,7 @@ fn makeTestConfig(allocator: std.mem.Allocator) !config_mod.Config {
             .lease_time = 3600,
         },
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
+        .reservations = try allocator.alloc(config_mod.Reservation, 0),
     };
 }
 
@@ -2249,4 +2301,187 @@ test "DHCPREQUEST for router IP results in DHCPNAK" {
     try std.testing.expect(resp != null);
     defer alloc.free(resp.?);
     try std.testing.expectEqual(MessageType.DHCPNAK, DHCPServer.getMessageType(resp.?).?);
+}
+
+// ---------------------------------------------------------------------------
+// Reservation tests
+// ---------------------------------------------------------------------------
+
+/// Helper: insert a reserved lease directly into the store (bypasses save).
+fn putReservationInStore(store: *StateStore, mac: []const u8, ip: []const u8, hostname: ?[]const u8) !void {
+    const mac_owned = try store.allocator.dupe(u8, mac);
+    errdefer store.allocator.free(mac_owned);
+    const ip_owned = try store.allocator.dupe(u8, ip);
+    errdefer store.allocator.free(ip_owned);
+    const hn_owned: ?[]const u8 = if (hostname) |h| try store.allocator.dupe(u8, h) else null;
+    errdefer if (hn_owned) |h| store.allocator.free(h);
+    try store.leases.put(mac_owned, .{
+        .mac = mac_owned,
+        .ip = ip_owned,
+        .hostname = hn_owned,
+        .expires = 0,
+        .client_id = null,
+        .reserved = true,
+    });
+}
+
+test "allocateIp returns reserved IP for matching MAC" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    defer server.deinit();
+
+    try putReservationInStore(store, "aa:bb:cc:dd:ee:ff", "192.168.1.50", null);
+
+    const ip = try server.allocateIp([6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF }, null);
+    try std.testing.expect(ip != null);
+    try std.testing.expectEqualSlices(u8, &[4]u8{ 192, 168, 1, 50 }, &ip.?);
+}
+
+test "allocateIp skips reserved IP for non-matching client" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    // Set tight pool so only .50 is available; if skipped, nothing else exists.
+    alloc.free(cfg.pool_start);
+    alloc.free(cfg.pool_end);
+    cfg.pool_start = try alloc.dupe(u8, "192.168.1.50");
+    cfg.pool_end = try alloc.dupe(u8, "192.168.1.50");
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    defer server.deinit();
+
+    // Reserve .50 for a specific MAC.
+    try putReservationInStore(store, "aa:bb:cc:dd:ee:ff", "192.168.1.50", null);
+
+    // A different MAC should get null (pool only has .50, which is reserved).
+    const ip = try server.allocateIp([6]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 }, null);
+    try std.testing.expect(ip == null);
+}
+
+test "isIpValid rejects reserved IP for non-matching MAC" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    defer server.deinit();
+
+    try putReservationInStore(store, "aa:bb:cc:dd:ee:ff", "192.168.1.50", null);
+
+    // Non-matching MAC requesting the reserved IP — should be rejected.
+    try std.testing.expect(!server.isIpValid([4]u8{ 192, 168, 1, 50 }, "11:22:33:44:55:66", null));
+    // Matching MAC — should be accepted.
+    try std.testing.expect(server.isIpValid([4]u8{ 192, 168, 1, 50 }, "aa:bb:cc:dd:ee:ff", null));
+}
+
+test "createAck: reserved client gets reserved IP and option 12 hostname" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    defer server.deinit();
+
+    try putReservationInStore(store, "aa:bb:cc:dd:ee:ff", "192.168.1.50", "printer");
+
+    // Build REQUEST with PRL requesting hostname (12).
+    var buf = [_]u8{0} ** 512;
+    @memset(&buf, 0);
+    const hdr: *DHCPHeader = @alignCast(@ptrCast(buf.ptr));
+    hdr.op = 1; hdr.htype = 1; hdr.hlen = 6; hdr.xid = 0xAABBCCDD;
+    hdr.magic = dhcp_magic_cookie;
+    @memcpy(hdr.chaddr[0..6], &[6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF });
+    var i: usize = dhcp_min_packet_size;
+    buf[i] = @intFromEnum(OptionCode.MessageType); buf[i+1] = 1; buf[i+2] = @intFromEnum(MessageType.DHCPREQUEST); i += 3;
+    buf[i] = @intFromEnum(OptionCode.RequestedIPAddress); buf[i+1] = 4;
+    buf[i+2] = 192; buf[i+3] = 168; buf[i+4] = 1; buf[i+5] = 50; i += 6;
+    buf[i] = @intFromEnum(OptionCode.ServerIdentifier); buf[i+1] = 4;
+    buf[i+2] = 192; buf[i+3] = 168; buf[i+4] = 1; buf[i+5] = 1; i += 6;
+    buf[i] = @intFromEnum(OptionCode.ParameterRequestList); buf[i+1] = 1; buf[i+2] = 12; i += 3; // request hostname
+    buf[i] = @intFromEnum(OptionCode.End); i += 1;
+
+    const resp = try server.processPacket(buf[0..i]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+
+    try std.testing.expectEqual(MessageType.DHCPACK, DHCPServer.getMessageType(resp.?).?);
+
+    // Option 12 should contain "printer".
+    const hn_opt = DHCPServer.getOption(resp.?, .HostName);
+    try std.testing.expect(hn_opt != null);
+    try std.testing.expectEqualStrings("printer", hn_opt.?);
+
+    // Stored lease should be reserved and have the hostname.
+    const lease = store.getLeaseByMac("aa:bb:cc:dd:ee:ff");
+    try std.testing.expect(lease != null);
+    try std.testing.expect(lease.?.reserved);
+    try std.testing.expect(lease.?.hostname != null);
+    try std.testing.expectEqualStrings("printer", lease.?.hostname.?);
+}
+
+test "DHCPNAK: non-matching client denied reserved IP" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    defer server.deinit();
+
+    try putReservationInStore(store, "aa:bb:cc:dd:ee:ff", "192.168.1.50", null);
+
+    var buf = [_]u8{0} ** 512;
+    const len = makeRequest(
+        &buf,
+        [6]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 }, // different MAC
+        [4]u8{ 192, 168, 1, 50 }, // reserved IP
+        [4]u8{ 192, 168, 1, 1 },
+        null,
+    );
+    const resp = try server.processPacket(buf[0..len]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+    try std.testing.expectEqual(MessageType.DHCPNAK, DHCPServer.getMessageType(resp.?).?);
+}
+
+test "removeLease on reserved lease keeps entry with expires=0 (RELEASE)" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, store, null);
+    defer server.deinit();
+
+    // Seed an active reservation.
+    try store.addReservation("aa:bb:cc:dd:ee:ff", "192.168.1.50", "printer", null);
+    // Set expiry to simulate an active lease.
+    store.leases.getPtr("aa:bb:cc:dd:ee:ff").?.expires = std.time.timestamp() + 3600;
+
+    // Build a RELEASE.
+    var buf = [_]u8{0} ** 512;
+    @memset(&buf, 0);
+    const hdr: *DHCPHeader = @alignCast(@ptrCast(buf.ptr));
+    hdr.op = 1; hdr.htype = 1; hdr.hlen = 6; hdr.xid = 0x11223344;
+    hdr.magic = dhcp_magic_cookie;
+    @memcpy(hdr.chaddr[0..6], &[6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF });
+    var i: usize = dhcp_min_packet_size;
+    buf[i] = @intFromEnum(OptionCode.MessageType); buf[i+1] = 1; buf[i+2] = @intFromEnum(MessageType.DHCPRELEASE); i += 3;
+    buf[i] = @intFromEnum(OptionCode.End); i += 1;
+
+    const resp = try server.processPacket(buf[0..i]);
+    try std.testing.expect(resp == null); // RELEASE has no response
+
+    // Entry must still exist with expires=0.
+    const entry = store.leases.get("aa:bb:cc:dd:ee:ff");
+    try std.testing.expect(entry != null);
+    try std.testing.expectEqual(@as(i64, 0), entry.?.expires);
+    try std.testing.expect(entry.?.reserved);
 }

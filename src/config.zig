@@ -8,6 +8,13 @@ pub const Error = error{
     IoError,
 };
 
+pub const Reservation = struct {
+    mac: []const u8,
+    ip: []const u8,
+    hostname: ?[]const u8,
+    client_id: ?[]const u8,
+};
+
 pub const Config = struct {
     allocator: std.mem.Allocator,
     listen_address: []const u8,
@@ -23,6 +30,7 @@ pub const Config = struct {
     dns_update: dns_mod.Config,
     dhcp_options: std.StringHashMap([]const u8),
     log_level: std.log.Level,
+    reservations: []Reservation,
 
     /// Free all allocator-owned memory. Must be called when the Config is no
     /// longer needed.
@@ -46,6 +54,13 @@ pub const Config = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.dhcp_options.deinit();
+        for (self.reservations) |r| {
+            self.allocator.free(r.mac);
+            self.allocator.free(r.ip);
+            if (r.hostname) |h| self.allocator.free(h);
+            if (r.client_id) |c| self.allocator.free(c);
+        }
+        self.allocator.free(self.reservations);
     }
 };
 
@@ -120,6 +135,7 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
             .lease_time = lease_time_val,
         },
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
+        .reservations = try allocator.alloc(Reservation, 0),
     };
 
     if (raw.dns_servers) |servers| {
@@ -151,7 +167,7 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
         }
     }
 
-    // Populate dhcp_options from the untyped YAML map (yaml.parse doesn't support StringHashMap).
+    // Populate dhcp_options and reservations from the untyped YAML map.
     if (doc.docs.items.len > 0) {
         if (doc.docs.items[0].asMap()) |root_map| {
             if (root_map.get("dhcp_options")) |opts_val| {
@@ -167,12 +183,99 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
                     }
                 }
             }
+
+            if (root_map.get("reservations")) |res_val| {
+                if (res_val.asList()) |res_list| {
+                    try parseReservations(allocator, &cfg, res_list);
+                }
+            }
         }
     }
 
     validatePoolRange(&cfg);
 
     return cfg;
+}
+
+/// Parse the reservations list from the untyped YAML walk and append valid entries to cfg.
+fn parseReservations(allocator: std.mem.Allocator, cfg: *Config, list: anytype) !void {
+
+    // Count valid entries first to allocate the right amount.
+    var valid_count: usize = 0;
+    for (list) |item| {
+        const m = item.asMap() orelse continue;
+        if (m.get("mac") == null or m.get("ip") == null) continue;
+        valid_count += 1;
+    }
+
+    if (valid_count == 0) return;
+
+    const old_len = cfg.reservations.len;
+    const new_slice = try allocator.realloc(cfg.reservations, old_len + valid_count);
+    cfg.reservations = new_slice;
+
+    var idx: usize = old_len;
+    for (list) |item| {
+        const m = item.asMap() orelse {
+            std.log.warn("config: reservation entry is not a map, skipping", .{});
+            continue;
+        };
+
+        const mac_val = m.get("mac") orelse {
+            std.log.warn("config: reservation missing 'mac', skipping", .{});
+            continue;
+        };
+        const ip_val = m.get("ip") orelse {
+            std.log.warn("config: reservation missing 'ip', skipping", .{});
+            continue;
+        };
+
+        const mac_str = mac_val.asScalar() orelse {
+            std.log.warn("config: reservation 'mac' is not a scalar, skipping", .{});
+            continue;
+        };
+        const ip_str = ip_val.asScalar() orelse {
+            std.log.warn("config: reservation 'ip' is not a scalar, skipping", .{});
+            continue;
+        };
+
+        // Validate that the reservation IP is in the subnet.
+        const ip_bytes = parseIpv4(ip_str) catch {
+            std.log.warn("config: reservation ip '{s}' is invalid, skipping", .{ip_str});
+            continue;
+        };
+        const ip_int = std.mem.readInt(u32, &ip_bytes, .big);
+        const subnet_bytes = parseIpv4(cfg.subnet) catch [4]u8{ 0, 0, 0, 0 };
+        const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
+        const broadcast_int = subnet_int | ~cfg.subnet_mask;
+        if ((ip_int & cfg.subnet_mask) != subnet_int or ip_int == subnet_int or ip_int == broadcast_int) {
+            std.log.warn("config: reservation ip '{s}' is outside subnet {s}, skipping", .{ ip_str, cfg.subnet });
+            continue;
+        }
+
+        const hostname_str: ?[]const u8 = if (m.get("hostname")) |hv| hv.asScalar() else null;
+        const client_id_str: ?[]const u8 = if (m.get("client_id")) |cv| cv.asScalar() else null;
+
+        const mac_owned = try allocator.dupe(u8, mac_str);
+        errdefer allocator.free(mac_owned);
+        const ip_owned = try allocator.dupe(u8, ip_str);
+        errdefer allocator.free(ip_owned);
+        const hostname_owned: ?[]const u8 = if (hostname_str) |h| try allocator.dupe(u8, h) else null;
+        errdefer if (hostname_owned) |h| allocator.free(h);
+        const client_id_owned: ?[]const u8 = if (client_id_str) |c| try allocator.dupe(u8, c) else null;
+        errdefer if (client_id_owned) |c| allocator.free(c);
+
+        cfg.reservations[idx] = .{
+            .mac = mac_owned,
+            .ip = ip_owned,
+            .hostname = hostname_owned,
+            .client_id = client_id_owned,
+        };
+        idx += 1;
+    }
+
+    // Trim to actual count (in case some entries were skipped).
+    cfg.reservations = allocator.realloc(cfg.reservations, idx) catch cfg.reservations;
 }
 
 /// Log warnings when pool_start/pool_end are misconfigured. Does not fail load().
