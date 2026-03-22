@@ -750,21 +750,26 @@ pub const DHCPServer = struct {
         }
 
         var candidate: u32 = pool_start_int;
-        while (candidate <= pool_end_int) : (candidate += 1) {
-            if (candidate == router_int) continue;
-            if (server_int != 0 and candidate == server_int) continue;
+        while (candidate <= pool_end_int) {
+            blk: {
+                if (candidate == router_int) break :blk;
+                if (server_int != 0 and candidate == server_int) break :blk;
 
-            var ip_bytes: [4]u8 = undefined;
-            std.mem.writeInt(u32, &ip_bytes, candidate, .big);
-            var ip_buf: [15]u8 = undefined;
-            const ip_str = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{
-                ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3],
-            }) catch unreachable;
+                var ip_bytes: [4]u8 = undefined;
+                std.mem.writeInt(u32, &ip_bytes, candidate, .big);
+                var ip_buf: [15]u8 = undefined;
+                const ip_str = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{
+                    ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3],
+                }) catch unreachable;
 
-            // Skip IPs reserved for a different client.
-            if (self.store.getReservationByIp(ip_str) != null) continue;
+                // Skip IPs reserved for a different client.
+                if (self.store.getReservationByIp(ip_str) != null) break :blk;
 
-            if (self.store.getLeaseByIp(ip_str) == null) return ip_bytes;
+                if (self.store.getLeaseByIp(ip_str) == null) return ip_bytes;
+            }
+            // Guard against overflow when pool_end is 0xFFFFFFFF.
+            if (candidate == std.math.maxInt(u32)) break;
+            candidate += 1;
         }
 
         return null; // Pool exhausted.
@@ -2829,4 +2834,101 @@ test "encodeDnsSearchList: single and multiple domains" {
     try std.testing.expectEqual(@as(usize, 22), n3);
     try std.testing.expectEqualSlices(u8, &.{ 8, 's', 't', 'a', 'r', 'd', 'u', 's', 't', 3, 'l', 'a', 'n', 0 }, buf[0..14]);
     try std.testing.expectEqualSlices(u8, &.{ 5, 'l', 'o', 'c', 'a', 'l', 0 }, buf[14..21]);
+}
+
+test "getOption: zero-length option value" {
+    // Option code present with len=0 should return a valid but empty slice.
+    var pkt = [_]u8{0} ** (dhcp_min_packet_size + 4);
+    @memcpy(pkt[dhcp_min_packet_size - 4 .. dhcp_min_packet_size], &dhcp_magic_cookie);
+    pkt[dhcp_min_packet_size + 0] = @intFromEnum(OptionCode.MessageType);
+    pkt[dhcp_min_packet_size + 1] = 0; // len = 0, no value bytes
+    pkt[dhcp_min_packet_size + 2] = @intFromEnum(OptionCode.End);
+
+    const val = DHCPServer.getOption(&pkt, .MessageType);
+    try std.testing.expect(val != null);
+    try std.testing.expectEqual(@as(usize, 0), val.?.len);
+}
+
+test "getOption: End marker stops parsing before target" {
+    // End option (255) appears before the target; target should not be found.
+    var pkt = [_]u8{0} ** (dhcp_min_packet_size + 8);
+    @memcpy(pkt[dhcp_min_packet_size - 4 .. dhcp_min_packet_size], &dhcp_magic_cookie);
+    pkt[dhcp_min_packet_size + 0] = @intFromEnum(OptionCode.End);
+    // These bytes come after End and must not be parsed:
+    pkt[dhcp_min_packet_size + 1] = @intFromEnum(OptionCode.MessageType);
+    pkt[dhcp_min_packet_size + 2] = 1;
+    pkt[dhcp_min_packet_size + 3] = @intFromEnum(MessageType.DHCPDISCOVER);
+
+    try std.testing.expect(DHCPServer.getOption(&pkt, .MessageType) == null);
+}
+
+test "allocateIp: single-IP pool allocates the one IP" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    alloc.free(cfg.pool_start);
+    alloc.free(cfg.pool_end);
+    cfg.pool_start = try alloc.dupe(u8, "192.168.1.42");
+    cfg.pool_end = try alloc.dupe(u8, "192.168.1.42");
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level);
+    defer server.deinit();
+
+    const ip = try server.allocateIp([6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF }, null);
+    try std.testing.expectEqual([4]u8{ 192, 168, 1, 42 }, ip.?);
+}
+
+test "allocateIp: pool exhausted returns null" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    alloc.free(cfg.pool_start);
+    alloc.free(cfg.pool_end);
+    cfg.pool_start = try alloc.dupe(u8, "192.168.1.10");
+    cfg.pool_end = try alloc.dupe(u8, "192.168.1.11");
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level);
+    defer server.deinit();
+
+    // Lease every IP in the two-address pool.
+    try store.addLease(.{ .mac = "aa:bb:cc:00:00:01", .ip = "192.168.1.10", .hostname = null, .expires = std.time.timestamp() + 3600, .client_id = null });
+    try store.addLease(.{ .mac = "aa:bb:cc:00:00:02", .ip = "192.168.1.11", .hostname = null, .expires = std.time.timestamp() + 3600, .client_id = null });
+
+    const ip = try server.allocateIp([6]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 }, null);
+    try std.testing.expect(ip == null);
+}
+
+test "allocateIp: pool_end at u32 max terminates cleanly" {
+    // Regression test for the u32 overflow bug: if pool_end == 0xFFFFFFFF and
+    // all IPs are leased, the loop must not wrap and must return null.
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    alloc.free(cfg.pool_start);
+    alloc.free(cfg.pool_end);
+    cfg.pool_start = try alloc.dupe(u8, "255.255.255.255");
+    cfg.pool_end = try alloc.dupe(u8, "255.255.255.255");
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level);
+    defer server.deinit();
+
+    // First call: pool not exhausted, returns the single available IP.
+    const ip1 = try server.allocateIp([6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF }, null);
+    try std.testing.expectEqual([4]u8{ 255, 255, 255, 255 }, ip1.?);
+
+    // Lease that IP; pool is now exhausted.
+    try store.addLease(.{
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "255.255.255.255",
+        .hostname = null,
+        .expires = std.time.timestamp() + 3600,
+        .client_id = null,
+    });
+
+    // Second call must return null without u32 wrapping to 0.
+    const ip2 = try server.allocateIp([6]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 }, null);
+    try std.testing.expect(ip2 == null);
 }

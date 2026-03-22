@@ -89,8 +89,8 @@ pub const DNSUpdater = struct {
         };
 
         var msg_buf: [1024]u8 = undefined;
-        var msg_len = buildUpdate(&msg_buf, self.config.zone, hostname, ip, self.config.lease_time, add);
-        msg_len = signTsig(&msg_buf, msg_len, &key, self.config.key_name);
+        var msg_len = try buildUpdate(&msg_buf, self.config.zone, hostname, ip, self.config.lease_time, add);
+        msg_len = try signTsig(&msg_buf, msg_len, &key, self.config.key_name);
         try sendUpdate(self.config.server, msg_buf[0..msg_len]);
     }
 };
@@ -116,23 +116,26 @@ fn writeU32(buf: []u8, v: u32) void {
 }
 
 /// Encode a dotted domain name into DNS wire format. Returns bytes written.
-fn encodeDnsName(buf: []u8, name: []const u8) usize {
+/// Returns error.NameTooLong if any label does not fit in buf (including the
+/// root terminator), so the caller can skip the update rather than send a
+/// silently-truncated name.
+fn encodeDnsName(buf: []u8, name: []const u8) error{NameTooLong}!usize {
     var pos: usize = 0;
     // Strip trailing dot (root indicator) if present.
     const n = if (name.len > 0 and name[name.len - 1] == '.') name[0 .. name.len - 1] else name;
     var it = std.mem.splitScalar(u8, n, '.');
     while (it.next()) |label| {
         if (label.len == 0) continue;
-        if (pos + 1 + label.len >= buf.len) break; // safety guard
+        // Need 1 (length byte) + label.len + 1 (root terminator) bytes.
+        if (pos + 1 + label.len + 1 > buf.len) return error.NameTooLong;
         buf[pos] = @intCast(label.len);
         pos += 1;
         @memcpy(buf[pos .. pos + label.len], label);
         pos += label.len;
     }
-    if (pos < buf.len) {
-        buf[pos] = 0; // root label terminator
-        pos += 1;
-    }
+    if (pos >= buf.len) return error.NameTooLong;
+    buf[pos] = 0; // root label terminator
+    pos += 1;
     return pos;
 }
 
@@ -149,7 +152,7 @@ fn buildUpdate(
     ip: [4]u8,
     lease_time: u32,
     add: bool,
-) usize {
+) error{NameTooLong}!usize {
     var pos: usize = 0;
 
     // Random message ID
@@ -178,7 +181,7 @@ fn buildUpdate(
     pos += 2;
 
     // Zone section: zone name, type SOA (6), class IN (1)
-    pos += encodeDnsName(buf[pos..], zone);
+    pos += try encodeDnsName(buf[pos..], zone);
     writeU16(buf[pos..], 6); // SOA
     pos += 2;
     writeU16(buf[pos..], 1); // IN
@@ -190,7 +193,7 @@ fn buildUpdate(
     // Strip trailing dot if zone already ended with one
     const fqdn = if (fqdn_raw.len > 0 and fqdn_raw[fqdn_raw.len - 1] == '.') fqdn_raw[0 .. fqdn_raw.len - 1] else fqdn_raw;
     var fwd_wire: [256]u8 = undefined;
-    const fwd_wire_len = encodeDnsName(&fwd_wire, fqdn);
+    const fwd_wire_len = try encodeDnsName(&fwd_wire, fqdn);
 
     // Build reverse PTR name: d.c.b.a.in-addr.arpa
     var ptr_str_buf: [40]u8 = undefined;
@@ -198,7 +201,7 @@ fn buildUpdate(
         ip[3], ip[2], ip[1], ip[0],
     }) catch unreachable;
     var ptr_wire: [64]u8 = undefined;
-    const ptr_wire_len = encodeDnsName(&ptr_wire, ptr_str);
+    const ptr_wire_len = try encodeDnsName(&ptr_wire, ptr_str);
 
     if (add) {
         // A record: hostname.zone, A, IN, TTL, 4, ip
@@ -263,7 +266,7 @@ fn buildUpdate(
 
 /// Append a TSIG additional record to the message and update ADCOUNT.
 /// Returns the new message length.
-fn signTsig(msg_buf: []u8, msg_len: usize, key: *const TsigKey, key_name: []const u8) usize {
+fn signTsig(msg_buf: []u8, msg_len: usize, key: *const TsigKey, key_name: []const u8) error{NameTooLong}!usize {
     const algo_name = switch (key.algorithm) {
         .hmac_sha256 => "hmac-sha256",
         .hmac_md5 => "hmac-md5.sig-alg.reg.int",
@@ -274,10 +277,10 @@ fn signTsig(msg_buf: []u8, msg_len: usize, key: *const TsigKey, key_name: []cons
     var tv_pos: usize = 0;
 
     // wire(key_name)
-    tv_pos += encodeDnsName(tsig_vars[tv_pos..], key_name);
+    tv_pos += try encodeDnsName(tsig_vars[tv_pos..], key_name);
 
     // wire(algorithm_name)
-    tv_pos += encodeDnsName(tsig_vars[tv_pos..], algo_name);
+    tv_pos += try encodeDnsName(tsig_vars[tv_pos..], algo_name);
 
     // time_signed[6] — big-endian 48-bit Unix seconds
     const now_signed: i64 = std.time.timestamp();
@@ -333,7 +336,7 @@ fn signTsig(msg_buf: []u8, msg_len: usize, key: *const TsigKey, key_name: []cons
     var pos = msg_len;
 
     // Name: wire(key_name)
-    pos += encodeDnsName(msg_buf[pos..], key_name);
+    pos += try encodeDnsName(msg_buf[pos..], key_name);
 
     // Type: TSIG (250)
     writeU16(msg_buf[pos..], 250);
@@ -351,7 +354,7 @@ fn signTsig(msg_buf: []u8, msg_len: usize, key: *const TsigKey, key_name: []cons
     var rdata: [256]u8 = undefined;
     var rd: usize = 0;
 
-    rd += encodeDnsName(rdata[rd..], algo_name);
+    rd += try encodeDnsName(rdata[rd..], algo_name);
 
     // time[6] — same timestamp used for signing
     rdata[rd + 0] = @intCast((now >> 40) & 0xFF);
@@ -523,4 +526,107 @@ fn parseIpv4Local(s: []const u8) ![4]u8 {
     if (idx != 3) return error.InvalidConfig;
     result[idx] = @intCast(octet);
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+test "encodeDnsName: normal domain encoding" {
+    var buf: [64]u8 = undefined;
+    const n = try encodeDnsName(&buf, "example.com");
+    // \x07example\x03com\x00 = 13 bytes
+    try std.testing.expectEqual(@as(usize, 13), n);
+    try std.testing.expectEqualSlices(u8, &.{ 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 }, buf[0..n]);
+}
+
+test "encodeDnsName: trailing dot stripped" {
+    var buf: [64]u8 = undefined;
+    const n = try encodeDnsName(&buf, "example.com.");
+    try std.testing.expectEqual(@as(usize, 13), n);
+    try std.testing.expectEqualSlices(u8, &.{ 7, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 3, 'c', 'o', 'm', 0 }, buf[0..n]);
+}
+
+test "encodeDnsName: name too long for buffer returns error" {
+    // 8-byte buffer cannot hold "example.com" (needs 13 bytes).
+    var buf: [8]u8 = undefined;
+    try std.testing.expectError(error.NameTooLong, encodeDnsName(&buf, "example.com"));
+}
+
+test "buildUpdate: add=true has correct header fields and record class" {
+    var buf: [1024]u8 = undefined;
+    const n = try buildUpdate(&buf, "example.com", "host1", .{ 192, 168, 1, 50 }, 3600, true);
+    // Header is 12 bytes; zone="example.com" encodes to 13 bytes; fqdn="host1.example.com"
+    // encodes to 19 bytes; PTR name encodes to 27 bytes; with record overhead → 118 bytes.
+    try std.testing.expectEqual(@as(usize, 118), n);
+    // FLAGS = 0x2800 (QR=0, OPCODE=UPDATE=5)
+    try std.testing.expectEqual(@as(u8, 0x28), buf[2]);
+    try std.testing.expectEqual(@as(u8, 0x00), buf[3]);
+    // ZOCOUNT = 1
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x01 }, buf[4..6]);
+    // PRCOUNT = 0
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00 }, buf[6..8]);
+    // UPCOUNT = 2
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x02 }, buf[8..10]);
+    // ADCOUNT = 0 (TSIG not yet appended)
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00 }, buf[10..12]);
+    // First UPDATE record (A): type=A(1), class=IN(1) at bytes 48..52
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x01 }, buf[48..50]); // A type
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x01 }, buf[50..52]); // IN class
+}
+
+test "buildUpdate: add=false uses CLASS=ANY and TTL=0" {
+    var buf: [1024]u8 = undefined;
+    const n = try buildUpdate(&buf, "example.com", "host1", .{ 192, 168, 1, 50 }, 3600, false);
+    // Same names as above but no RDATA → 95 bytes.
+    try std.testing.expectEqual(@as(usize, 95), n);
+    // UPCOUNT = 2
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x02 }, buf[8..10]);
+    // First UPDATE record (A delete): type=A(1), class=ANY(255) at bytes 48..52
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x01 }, buf[48..50]); // A type
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0xFF }, buf[50..52]); // ANY class
+    // TTL = 0 at bytes 52..56
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00, 0x00, 0x00 }, buf[52..56]);
+    // RDLENGTH = 0 at bytes 56..58
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00 }, buf[56..58]);
+}
+
+test "parseTsigKey: missing algorithm returns InvalidKey" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/stardust-tsig-test-noalgo.conf";
+    {
+        const f = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("key test {\n    secret \"dGVzdA==\";\n};\n");
+    }
+    defer std.fs.cwd().deleteFile(path) catch {};
+    try std.testing.expectError(error.InvalidKey, parseTsigKey(alloc, path));
+}
+
+test "parseTsigKey: missing secret returns InvalidKey" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/stardust-tsig-test-nosecret.conf";
+    {
+        const f = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("key test {\n    algorithm hmac-sha256;\n};\n");
+    }
+    defer std.fs.cwd().deleteFile(path) catch {};
+    try std.testing.expectError(error.InvalidKey, parseTsigKey(alloc, path));
+}
+
+test "parseTsigKey: valid hmac-sha256 key file" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/stardust-tsig-test-valid.conf";
+    {
+        const f = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        defer f.close();
+        // "test" (0x74 0x65 0x73 0x74) base64-encodes to "dGVzdA=="
+        try f.writeAll("key ddns-key {\n    algorithm hmac-sha256;\n    secret \"dGVzdA==\";\n};\n");
+    }
+    defer std.fs.cwd().deleteFile(path) catch {};
+    var key = try parseTsigKey(alloc, path);
+    defer key.deinit();
+    try std.testing.expectEqual(Algorithm.hmac_sha256, key.algorithm);
+    try std.testing.expectEqualSlices(u8, "test", key.secret);
 }

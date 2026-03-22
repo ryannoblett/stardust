@@ -472,3 +472,24 @@ test "addReservation preserves expiry of existing lease" {
     try std.testing.expect(entry.?.reserved);
     try std.testing.expectEqualStrings("192.168.1.50", entry.?.ip);
 }
+
+test "getLeaseByMac returns null when expires equals current time" {
+    // expires <= now is the expiry condition, so expires == now must be treated as expired.
+    const store = try makeTestStore(std.testing.allocator);
+    defer store.deinit();
+
+    const now = std.time.timestamp();
+    try putLease(store, "aa:bb:cc:dd:ee:ff", "192.168.1.10", now);
+
+    try std.testing.expect(store.getLeaseByMac("aa:bb:cc:dd:ee:ff") == null);
+}
+
+test "getLeaseByIp returns null when expires equals current time" {
+    const store = try makeTestStore(std.testing.allocator);
+    defer store.deinit();
+
+    const now = std.time.timestamp();
+    try putLease(store, "aa:bb:cc:dd:ee:ff", "192.168.1.10", now);
+
+    try std.testing.expect(store.getLeaseByIp("192.168.1.10") == null);
+}
