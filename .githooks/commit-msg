@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+FAIL='\033[0;31m✗\033[0m'
+
+MSG_FILE="$1"
+
+# Strip comment lines and leading/trailing whitespace
+MSG=$(sed '/^#/d' "$MSG_FILE" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -s '\n')
+
+if [[ -z "$MSG" ]]; then
+    echo -e "  $FAIL Commit message is empty."
+    exit 1
+fi
+
+FIRST_LINE=$(echo "$MSG" | head -1)
+LENGTH=${#FIRST_LINE}
+
+if (( LENGTH < 10 )); then
+    echo -e "  $FAIL Commit message too short ($LENGTH chars). Write a meaningful summary (min 10)."
+    exit 1
+fi
+
+if (( LENGTH > 72 )); then
+    echo -e "  $FAIL First line too long ($LENGTH chars, max 72). Move detail to the body."
+    exit 1
+fi

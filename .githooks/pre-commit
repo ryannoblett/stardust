@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PASS='\033[0;32m✓\033[0m'
+FAIL='\033[0;31m✗\033[0m'
+
+# --- Format check ---
+echo "  Checking format..."
+if ! zig fmt --check . 2>&1; then
+    echo -e "  $FAIL Format check failed. Run: zig fmt ."
+    exit 1
+fi
+echo -e "  $PASS Format OK"
+
+# --- Compile check ---
+echo "  Building..."
+if ! zig build install 2>&1; then
+    echo -e "  $FAIL Build failed."
+    exit 1
+fi
+echo -e "  $PASS Build OK"
+
+# --- Secret scan ---
+echo "  Scanning for secrets..."
+
+# Patterns that suggest secrets in staged files (excluding binary files and the hooks themselves)
+STAGED=$(git diff --cached --name-only --diff-filter=ACM | grep -v '^hooks/' || true)
+
+if [[ -n "$STAGED" ]]; then
+    SECRETS=$(echo "$STAGED" | xargs grep -InE \
+        '-----BEGIN (RSA|EC|DSA|OPENSSH|PGP) PRIVATE KEY|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|glpat-[A-Za-z0-9\-]{20}|(?i)(secret|password|passwd|api_key|auth_token)\s*[:=]\s*["\047][^"\047]{8,}' \
+        2>/dev/null || true)
+
+    if [[ -n "$SECRETS" ]]; then
+        echo -e "  $FAIL Possible secrets found in staged files:"
+        echo "$SECRETS" | sed 's/^/    /'
+        echo "  Review and remove before committing, or use: git commit --no-verify"
+        exit 1
+    fi
+fi
+echo -e "  $PASS No secrets found"
