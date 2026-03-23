@@ -1,88 +1,101 @@
-# DHCP Server Configuration
+# Stardust DHCP Server Configuration
+
+# Global settings
 listen_address: "0.0.0.0"
-
-# Network configuration
-subnet: "192.168.1.0"
-router: "192.168.1.1"
-subnet_mask: 255.255.255.0
-
-# DHCP settings
-lease_time: 3600
-
-# DNS settings
-dns_servers:
-  - "8.8.8.8"
-  - "8.8.4.4"
-
-domain_name: "stardust.lan"
-
-# Domain search list (option 119, RFC 3397) — sent to clients so short
-# hostnames are resolved against these domains in order.
-# domain_search:
-#   - "stardust.lan"
-#   - "local"
-
-# Time configuration
-# time_offset: 3600     # seconds east of UTC (option 2); e.g. -18000 = UTC-5, 3600 = UTC+1
-# time_servers:         # RFC 868 time servers (option 4); legacy protocol
-#   - "192.168.1.1"
-# ntp_servers:          # NTP servers (option 42); preferred over time_servers for modern clients
-#   - "192.168.1.1"
-# log_servers:          # Log servers / syslog (option 7)
-#   - "192.168.1.1"
-
-# PXE / TFTP network boot (options 66 and 67)
-# tftp_server_name: "192.168.1.1"   # TFTP server hostname or IP
-# boot_filename: "pxelinux.0"       # boot file; use "ipxe.efi" for UEFI PXE
-
-# State storage
 state_dir: "/var/lib/stardust"
+log_level: "info"   # debug | info | warn | error
 
-# DNS updates configuration
-dns_update:
-  enable: false
-  server: "127.0.0.1"
-  zone: "stardust.lan"
-  key_name: "dhcp-update"
-  key_file: "dhcp-update.key"
+# Pool definitions — each pool is one subnet served by this daemon.
+# Multiple pools may be defined for multi-subnet deployments.
+# Use CIDR notation for subnet: (host bits are automatically zeroed).
+pools:
+  - subnet: "192.168.1.0/24"     # CIDR notation; must match the actual network prefix
+    router: "192.168.1.1"
+    pool_start: "192.168.1.100"  # first address available for dynamic allocation
+    pool_end: "192.168.1.200"    # last address available for dynamic allocation
 
-# Static routes (options 33 and 121) — sent per client PRL request.
-# Use the top-level 'router' option for the default gateway (0.0.0.0/0 is not allowed here).
-# static_routes:
-#   - destination: "10.10.10.0/24"
-#     router: "192.168.1.1"
-#   - destination: "172.16.0.0/12"
-#     router: "192.168.1.254"
+    # DHCP lease time in seconds
+    lease_time: 3600
 
-# Static reservations — pin a MAC (or client_id) to a specific IP
-# reservations:
-#   - mac: "aa:bb:cc:dd:ee:ff"
-#     ip: "192.168.1.50"
-#     hostname: "printer"           # optional; sent to client via option 12
-#     client_id: "01aabbccddeeff"  # optional; hex string matching option 61
+    # DNS settings (option 6 and 15)
+    dns_servers:
+      - "8.8.8.8"
+      - "8.8.4.4"
+    domain_name: "stardust.lan"
 
-# Additional DHCP options (use numeric option codes as keys)
-# dhcp_options:
-#   "42": "192.168.1.1"  # NTP server
-dhcp_options: {}
+    # Domain search list (option 119, RFC 3397)
+    # domain_search:
+    #   - "stardust.lan"
+    #   - "local"
 
-# Lease sync (redundant server group) — share lease state between multiple DHCP servers.
-# Requires a BIND TSIG key file (same format as dns_update.key_file).
-# All group members must have identical subnet/pool/reservation configuration.
+    # Time configuration
+    # time_offset: 3600     # seconds east of UTC (option 2); e.g. -18000=UTC-5, 3600=UTC+1
+    # time_servers:         # RFC 868 time servers (option 4)
+    #   - "192.168.1.1"
+    # ntp_servers:          # NTP servers (option 42)
+    #   - "192.168.1.1"
+    # log_servers:          # syslog servers (option 7)
+    #   - "192.168.1.1"
+
+    # PXE / TFTP network boot (options 66 and 67)
+    # tftp_server_name: "192.168.1.1"
+    # boot_filename: "pxelinux.0"
+
+    # Static routes (options 33 and 121) — use router: for the default gateway
+    # static_routes:
+    #   - destination: "10.10.10.0/24"
+    #     router: "192.168.1.1"
+
+    # Static reservations — pin a MAC or client_id to a fixed IP
+    # reservations:
+    #   - mac: "aa:bb:cc:dd:ee:ff"
+    #     ip: "192.168.1.50"
+    #     hostname: "printer"           # optional; sent via option 12
+    #     client_id: "01aabbccddeeff"  # optional; hex string matching option 61
+
+    # Additional DHCP options (numeric option codes as keys)
+    # dhcp_options:
+    #   "42": "192.168.1.1"   # NTP server (duplicates ntp_servers, but allows any option)
+
+    # Per-pool DNS dynamic update configuration (RFC 2136)
+    dns_update:
+      enable: false
+      server: "127.0.0.1"
+      zone: "stardust.lan"
+      key_name: "dhcp-update"
+      key_file: "dhcp-update.key"
+
+# Example second pool (uncomment to add another subnet):
+# pools:  <-- this would be a second entry in the list above, not a new key
+#   - subnet: "10.0.0.0/24"
+#     router: "10.0.0.1"
+#     pool_start: "10.0.0.100"
+#     pool_end: "10.0.0.200"
+#     lease_time: 7200
+#     dns_servers:
+#       - "8.8.8.8"
+#     domain_name: "office.lan"
+#     dns_update:
+#       enable: false
+#       server: "127.0.0.1"
+#       zone: "office.lan"
+#       key_name: "dhcp-update"
+#       key_file: "dhcp-update.key"
+
+# Randomize IP allocation order (reduces split-brain collision risk with sync enabled).
+# false (default) = sequential from pool_start; true = random starting offset.
+# pool_allocation_random: false
+
+# Lease sync (redundant active-active server group).
+# All group members must have identical pool/subnet/reservation configuration.
 # sync:
 #   enable: true
 #   group_name: "dhcp-cluster-1"
-#   key_file: "dhcp-sync.key"    # BIND TSIG key file
+#   key_file: "dhcp-sync.key"    # BIND TSIG key file (same format as dns_update key)
 #   port: 647                    # optional, default 647
-#   full_sync_interval: 300      # optional, seconds between full lease-hash checks (default 300)
+#   full_sync_interval: 300      # optional, seconds between full lease-hash checks
 #   # Discovery — choose exactly one:
 #   multicast: "239.255.0.67"    # site-local multicast (TTL=1, link-local only)
-#   # peers:                     # unicast mode (use for peers across routers)
+#   # peers:                     # unicast mode (for peers across routers)
 #   #   - "192.168.1.2"
 #   #   - "192.168.1.3"
-
-# Randomize IP allocation order within the pool (reduces split-brain collision risk
-# when running multiple active-active DHCP servers with sync enabled).
-# false (default) = sequential from pool_start, preserving existing behavior.
-# true = random starting offset, then sequential wrap-around.
-# pool_allocation_random: false

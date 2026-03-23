@@ -129,21 +129,15 @@ pub fn main() !void {
     // Apply log level from config (updated in-place via &g_log_level on SIGHUP reload).
     g_log_level = cfg.log_level;
 
-    // Format subnet mask as dotted-decimal for display
-    const mask = cfg.subnet_mask;
-    const mask_a: u8 = @intCast((mask >> 24) & 0xFF);
-    const mask_b: u8 = @intCast((mask >> 16) & 0xFF);
-    const mask_c: u8 = @intCast((mask >> 8) & 0xFF);
-    const mask_d: u8 = @intCast(mask & 0xFF);
-
     std.log.info("Configuration loaded", .{});
-    std.log.info("  listen:     {s}", .{cfg.listen_address});
-    std.log.info("  subnet:     {s}/{d}.{d}.{d}.{d}", .{
-        cfg.subnet, mask_a, mask_b, mask_c, mask_d,
-    });
-    std.log.info("  router:     {s}", .{cfg.router});
-    std.log.info("  lease_time: {d}s", .{cfg.lease_time});
-    std.log.info("  state_dir:  {s}", .{cfg.state_dir});
+    std.log.info("  listen:    {s}", .{cfg.listen_address});
+    std.log.info("  state_dir: {s}", .{cfg.state_dir});
+    std.log.info("  pools:     {d}", .{cfg.pools.len});
+    for (cfg.pools, 0..) |pool, idx| {
+        std.log.info("  pool[{d}]: {s}/{d}, router={s}, lease={d}s", .{
+            idx, pool.subnet, pool.prefix_len, pool.router, pool.lease_time,
+        });
+    }
 
     // Initialize state store
     const store = state_mod.StateStore.init(allocator, cfg.state_dir) catch |err| {
@@ -152,19 +146,6 @@ pub fn main() !void {
     defer store.deinit();
 
     std.log.info("State store initialized", .{});
-
-    // Initialize DNS updater (ownership transferred to dhcp_server below).
-    const dns_updater = dns.create_updater(allocator, &cfg.dns_update) catch |err| {
-        fatal("Failed to initialize DNS updater: {s}", .{@errorName(err)});
-    };
-
-    if (cfg.dns_update.enable) {
-        std.log.info("DNS updater enabled (server: {s}, zone: {s})", .{
-            cfg.dns_update.server, cfg.dns_update.zone,
-        });
-    } else {
-        std.log.info("DNS updater disabled", .{});
-    }
 
     // Initialize sync manager if enabled.
     const pool_hash = config_mod.computePoolHash(cfg);
@@ -183,9 +164,8 @@ pub fn main() !void {
         std.log.info("Sync manager enabled", .{});
     }
 
-    // Create and run DHCP server. The server takes ownership of dns_updater
-    // (cleans it up on deinit and recreates it on SIGHUP reload).
-    const dhcp_server = dhcp.create_server(allocator, cfg, cfg_path, store, dns_updater, &g_log_level, sync_mgr) catch |err| {
+    // Create and run DHCP server. The server creates and owns per-pool DNS updaters.
+    const dhcp_server = dhcp.create_server(allocator, cfg, cfg_path, store, &g_log_level, sync_mgr) catch |err| {
         fatal("Failed to create DHCP server: {s}", .{@errorName(err)});
     };
     defer dhcp_server.deinit();

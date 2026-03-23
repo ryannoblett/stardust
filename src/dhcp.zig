@@ -355,7 +355,8 @@ pub const DHCPServer = struct {
     cfg: *Config,
     cfg_path: []const u8,
     store: *StateStore,
-    dns_updater: ?*dns_mod.DNSUpdater,
+    /// One DNS updater per pool (indexed parallel to cfg.pools). Null if pool has DNS disabled.
+    dns_updaters: []?*dns_mod.DNSUpdater,
     log_level: *std.log.Level,
     running: std.atomic.Value(bool),
     last_prune: i64,
@@ -376,18 +377,23 @@ pub const DHCPServer = struct {
         cfg: *Config,
         cfg_path: []const u8,
         store: *StateStore,
-        dns_updater: ?*dns_mod.DNSUpdater,
         log_level: *std.log.Level,
         sync_mgr: ?*sync_mod.SyncManager,
     ) !*Self {
+        const dns_updaters = try createDnsUpdaters(allocator, cfg);
+        errdefer freeDnsUpdaters(allocator, dns_updaters);
+
         const self = try allocator.create(Self);
+        errdefer allocator.destroy(self);
         const cfg_path_owned = try allocator.dupe(u8, cfg_path);
+        errdefer allocator.free(cfg_path_owned);
+
         self.* = .{
             .allocator = allocator,
             .cfg = cfg,
             .cfg_path = cfg_path_owned,
             .store = store,
-            .dns_updater = dns_updater,
+            .dns_updaters = dns_updaters,
             .log_level = log_level,
             .running = std.atomic.Value(bool).init(false),
             .last_prune = 0,
@@ -404,10 +410,88 @@ pub const DHCPServer = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        if (self.dns_updater) |u| u.cleanup();
+        freeDnsUpdaters(self.allocator, self.dns_updaters);
         self.decline_records.deinit();
         self.allocator.free(self.cfg_path);
         self.allocator.destroy(self);
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-pool helpers
+    // -----------------------------------------------------------------------
+
+    fn createDnsUpdaters(allocator: std.mem.Allocator, cfg: *Config) ![]?*dns_mod.DNSUpdater {
+        const updaters = try allocator.alloc(?*dns_mod.DNSUpdater, cfg.pools.len);
+        errdefer allocator.free(updaters);
+        for (cfg.pools, 0..) |*pool, i| {
+            updaters[i] = dns_mod.create_updater(allocator, &pool.dns_update) catch |err| blk: {
+                std.log.err("DNS updater for pool {d} ({s}) failed ({s}); disabled for that pool", .{ i, pool.subnet, @errorName(err) });
+                break :blk null;
+            };
+        }
+        return updaters;
+    }
+
+    fn freeDnsUpdaters(allocator: std.mem.Allocator, updaters: []?*dns_mod.DNSUpdater) void {
+        for (updaters) |u| if (u) |du| du.cleanup();
+        allocator.free(updaters);
+    }
+
+    /// Select the pool that should handle a request, given the relay gateway address
+    /// and the client's current IP (ciaddr). Priority:
+    ///   1. giaddr != 0 → pool whose subnet contains giaddr (relay agent identifies the subnet)
+    ///   2. ciaddr != 0 → pool whose subnet contains ciaddr (client renewal)
+    ///   3. server_ip   → pool whose subnet contains the server's own IP (direct clients)
+    ///   4. fallback    → first pool
+    fn selectPool(self: *Self, giaddr: [4]u8, ciaddr: [4]u8) *const config_mod.PoolConfig {
+        const zero = [4]u8{ 0, 0, 0, 0 };
+
+        if (!std.mem.eql(u8, &giaddr, &zero)) {
+            const g_int = std.mem.readInt(u32, &giaddr, .big);
+            for (self.cfg.pools) |*pool| {
+                const s = config_mod.parseIpv4(pool.subnet) catch continue;
+                if ((g_int & pool.subnet_mask) == std.mem.readInt(u32, &s, .big)) return pool;
+            }
+        }
+
+        if (!std.mem.eql(u8, &ciaddr, &zero)) {
+            const ci_int = std.mem.readInt(u32, &ciaddr, .big);
+            for (self.cfg.pools) |*pool| {
+                const s = config_mod.parseIpv4(pool.subnet) catch continue;
+                if ((ci_int & pool.subnet_mask) == std.mem.readInt(u32, &s, .big)) return pool;
+            }
+        }
+
+        const sv_int = std.mem.readInt(u32, &self.server_ip, .big);
+        for (self.cfg.pools) |*pool| {
+            const s = config_mod.parseIpv4(pool.subnet) catch continue;
+            if ((sv_int & pool.subnet_mask) == std.mem.readInt(u32, &s, .big)) return pool;
+        }
+
+        return &self.cfg.pools[0]; // fallback
+    }
+
+    /// Return the index of `pool` in cfg.pools (pointer arithmetic).
+    fn poolIndex(self: *Self, pool: *const config_mod.PoolConfig) usize {
+        return (@intFromPtr(pool) - @intFromPtr(self.cfg.pools.ptr)) / @sizeOf(config_mod.PoolConfig);
+    }
+
+    /// Return the DNS updater for the given pool, or null if disabled.
+    fn dnsUpdaterForPool(self: *Self, pool: *const config_mod.PoolConfig) ?*dns_mod.DNSUpdater {
+        const idx = self.poolIndex(pool);
+        if (idx < self.dns_updaters.len) return self.dns_updaters[idx];
+        return null;
+    }
+
+    /// Find the pool whose subnet contains `ip_str`. Returns null if no pool matches.
+    fn poolForIp(self: *Self, ip_str: []const u8) ?*const config_mod.PoolConfig {
+        const ip_bytes = config_mod.parseIpv4(ip_str) catch return null;
+        const ip_int = std.mem.readInt(u32, &ip_bytes, .big);
+        for (self.cfg.pools) |*pool| {
+            const s = config_mod.parseIpv4(pool.subnet) catch continue;
+            if ((ip_int & pool.subnet_mask) == std.mem.readInt(u32, &s, .big)) return pool;
+        }
+        return null;
     }
 
     /// Seed static reservations from config into the state store.
@@ -432,10 +516,15 @@ pub const DHCPServer = struct {
         var it = self.store.leases.valueIterator();
         while (it.next()) |lease| {
             if (!lease.reserved) continue;
-            const still_valid = for (self.cfg.reservations) |r| {
-                if (std.mem.eql(u8, r.mac, lease.mac) and std.mem.eql(u8, r.ip, lease.ip))
-                    break true;
-            } else false;
+            const still_valid = blk: {
+                for (self.cfg.pools) |pool| {
+                    for (pool.reservations) |r| {
+                        if (std.mem.eql(u8, r.mac, lease.mac) and std.mem.eql(u8, r.ip, lease.ip))
+                            break :blk true;
+                    }
+                }
+                break :blk false;
+            };
             if (!still_valid) {
                 const mac_copy = self.allocator.dupe(u8, lease.mac) catch continue;
                 to_remove.append(self.allocator, mac_copy) catch {
@@ -450,36 +539,42 @@ pub const DHCPServer = struct {
         }
 
         // Add entries from config that are new or had their IP changed.
-        for (self.cfg.reservations) |r| {
-            if (self.store.getReservationByMac(r.mac)) |existing| {
-                if (std.mem.eql(u8, existing.ip, r.ip)) continue; // unchanged
+        for (self.cfg.pools) |pool| {
+            for (pool.reservations) |r| {
+                if (self.store.getReservationByMac(r.mac)) |existing| {
+                    if (std.mem.eql(u8, existing.ip, r.ip)) continue; // unchanged
+                }
+                self.store.addReservation(r.mac, r.ip, r.hostname, r.client_id) catch |err| {
+                    std.log.warn("Failed to seed reservation for {s}: {s}", .{ r.mac, @errorName(err) });
+                    continue;
+                };
+                std.log.info("Seeded reservation: {s} -> {s}", .{ r.mac, r.ip });
             }
-            self.store.addReservation(r.mac, r.ip, r.hostname, r.client_id) catch |err| {
-                std.log.warn("Failed to seed reservation for {s}: {s}", .{ r.mac, @errorName(err) });
-                continue;
-            };
-            std.log.info("Seeded reservation: {s} -> {s}", .{ r.mac, r.ip });
         }
     }
 
     /// Reload config.yaml in-place. Called from the run loop on SIGHUP.
     fn reloadConfig(self: *Self) void {
         std.log.info("Reloading configuration from {s}...", .{self.cfg_path});
-        const new_cfg = config_mod.load(self.allocator, self.cfg_path) catch |err| {
+        var new_cfg = config_mod.load(self.allocator, self.cfg_path) catch |err| {
             std.log.err("Config reload failed ({s}), keeping existing config", .{@errorName(err)});
             return;
         };
-        // Replace the config in-place so the dns_updater pointer remains valid.
+
+        // Recreate DNS updaters for the new pool configuration.
+        const new_updaters = createDnsUpdaters(self.allocator, &new_cfg) catch |err| blk: {
+            std.log.err("Failed to recreate DNS updaters on reload ({s}); DNS updates disabled", .{@errorName(err)});
+            // Allocating zero bytes is effectively infallible; unreachable if it fails.
+            break :blk self.allocator.alloc(?*dns_mod.DNSUpdater, 0) catch unreachable;
+        };
+
+        // Replace the config in-place.
         self.cfg.deinit();
         self.cfg.* = new_cfg;
         self.log_level.* = self.cfg.log_level;
 
-        // Recreate the DNS updater to pick up any key_file / server changes.
-        if (self.dns_updater) |old| old.cleanup();
-        self.dns_updater = dns_mod.create_updater(self.allocator, &self.cfg.dns_update) catch |err| blk: {
-            std.log.err("Failed to recreate DNS updater on reload ({s}); DNS updates disabled", .{@errorName(err)});
-            break :blk null;
-        };
+        freeDnsUpdaters(self.allocator, self.dns_updaters);
+        self.dns_updaters = new_updaters;
 
         self.syncReservations();
         std.log.info("Configuration reloaded successfully", .{});
@@ -676,8 +771,10 @@ pub const DHCPServer = struct {
         // Notify DNS before removing so the lease strings are still valid.
         for (to_remove[0..count]) |mac| {
             if (self.store.leases.get(mac)) |lease| {
-                if (self.dns_updater) |du| {
-                    du.notifyLeaseRemoved(lease.ip, lease.hostname);
+                if (self.poolForIp(lease.ip)) |pool| {
+                    if (self.dnsUpdaterForPool(pool)) |du| {
+                        du.notifyLeaseRemoved(lease.ip, lease.hostname);
+                    }
                 }
             }
             self.store.removeLease(mac);
@@ -737,12 +834,12 @@ pub const DHCPServer = struct {
         return @enumFromInt(val[0]);
     }
 
-    /// Scan the subnet for an unallocated host address to offer.
+    /// Scan the pool's subnet for an unallocated host address to offer.
     ///
     /// Returns the first host address in the subnet that has no active lease,
     /// skipping the router and (if specific) the server's own address.
     /// Returns null when the pool is exhausted.
-    fn allocateIp(self: *Self, mac_bytes: [6]u8, client_id: ?[]const u8) !?[4]u8 {
+    fn allocateIp(self: *Self, pool: *const config_mod.PoolConfig, mac_bytes: [6]u8, client_id: ?[]const u8) !?[4]u8 {
         var mac_buf: [17]u8 = undefined;
         const mac_str = std.fmt.bufPrint(&mac_buf, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
             mac_bytes[0], mac_bytes[1], mac_bytes[2],
@@ -786,12 +883,12 @@ pub const DHCPServer = struct {
         if (self.store.getReservationByMac(mac_str)) |res|
             return try config_mod.parseIpv4(res.ip);
 
-        const subnet_bytes = try config_mod.parseIpv4(self.cfg.subnet);
+        const subnet_bytes = try config_mod.parseIpv4(pool.subnet);
         const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
-        const mask = self.cfg.subnet_mask;
+        const mask = pool.subnet_mask;
         const broadcast_int = subnet_int | ~mask;
 
-        const router_bytes = try config_mod.parseIpv4(self.cfg.router);
+        const router_bytes = try config_mod.parseIpv4(pool.router);
         const router_int = std.mem.readInt(u32, &router_bytes, .big);
 
         const server_bytes = try config_mod.parseIpv4(self.cfg.listen_address);
@@ -799,14 +896,14 @@ pub const DHCPServer = struct {
 
         var pool_start_int: u32 = subnet_int + 1;
         var pool_end_int: u32 = broadcast_int - 1;
-        if (self.cfg.pool_start.len > 0) {
-            const b = config_mod.parseIpv4(self.cfg.pool_start) catch blk: {
+        if (pool.pool_start.len > 0) {
+            const b = config_mod.parseIpv4(pool.pool_start) catch blk: {
                 break :blk subnet_bytes;
             };
             pool_start_int = std.mem.readInt(u32, &b, .big);
         }
-        if (self.cfg.pool_end.len > 0) {
-            const b = config_mod.parseIpv4(self.cfg.pool_end) catch blk: {
+        if (pool.pool_end.len > 0) {
+            const b = config_mod.parseIpv4(pool.pool_end) catch blk: {
                 break :blk subnet_bytes;
             };
             pool_end_int = std.mem.readInt(u32, &b, .big);
@@ -888,6 +985,7 @@ pub const DHCPServer = struct {
 
     fn createOffer(self: *Self, request: []const u8) !?[]u8 {
         const req_header: *const DHCPHeader = @ptrCast(@alignCast(request.ptr));
+        const pool = self.selectPool(req_header.giaddr, req_header.ciaddr);
 
         const mac_bytes: [6]u8 = req_header.chaddr[0..6].*;
         const client_id_raw = getClientId(request);
@@ -899,7 +997,7 @@ pub const DHCPServer = struct {
         // (so allocateIp skips it next iteration) and try again.
         const offered_ip = blk: {
             for (0..probe_mod.probe_max_tries) |_| {
-                const candidate = (try self.allocateIp(mac_bytes, client_id_raw)) orelse break :blk null;
+                const candidate = (try self.allocateIp(pool, mac_bytes, client_id_raw)) orelse break :blk null;
                 if (!self.probeConflict(candidate, is_relayed)) break :blk candidate;
                 self.quarantineProbeConflict(candidate);
             }
@@ -910,11 +1008,11 @@ pub const DHCPServer = struct {
 
         const prl = getOption(request, .ParameterRequestList);
         const server_ip = self.server_ip;
-        const subnet_mask = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.subnet_mask));
-        const router_ip = try config_mod.parseIpv4(self.cfg.router);
-        const lease_time = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.lease_time));
-        const renewal_time = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.lease_time / 2));
-        const rebind_time = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.lease_time * 7 / 8));
+        const subnet_mask = std.mem.toBytes(std.mem.nativeToBig(u32, pool.subnet_mask));
+        const router_ip = try config_mod.parseIpv4(pool.router);
+        const lease_time = std.mem.toBytes(std.mem.nativeToBig(u32, pool.lease_time));
+        const renewal_time = std.mem.toBytes(std.mem.nativeToBig(u32, pool.lease_time / 2));
+        const rebind_time = std.mem.toBytes(std.mem.nativeToBig(u32, pool.lease_time * 7 / 8));
 
         // Build options into a temporary buffer
         var opts_buf: [1024]u8 = undefined;
@@ -973,12 +1071,12 @@ pub const DHCPServer = struct {
         }
 
         // Option 6: DNS Servers (up to 4)
-        if (isRequested(prl, .DomainNameServer) and self.cfg.dns_servers.len > 0) {
-            const count = @min(self.cfg.dns_servers.len, 4);
+        if (isRequested(prl, .DomainNameServer) and pool.dns_servers.len > 0) {
+            const count = @min(pool.dns_servers.len, 4);
             opts_buf[opts_len] = @intFromEnum(OptionCode.DomainNameServer);
             opts_buf[opts_len + 1] = @intCast(count * 4);
             opts_len += 2;
-            for (self.cfg.dns_servers[0..count]) |dns_str| {
+            for (pool.dns_servers[0..count]) |dns_str| {
                 const dns_ip = config_mod.parseIpv4(dns_str) catch continue;
                 @memcpy(opts_buf[opts_len .. opts_len + 4], &dns_ip);
                 opts_len += 4;
@@ -986,18 +1084,18 @@ pub const DHCPServer = struct {
         }
 
         // Option 15: Domain Name
-        if (isRequested(prl, .DomainName) and self.cfg.domain_name.len > 0) {
-            const dn_len = @min(self.cfg.domain_name.len, 255);
+        if (isRequested(prl, .DomainName) and pool.domain_name.len > 0) {
+            const dn_len = @min(pool.domain_name.len, 255);
             opts_buf[opts_len] = @intFromEnum(OptionCode.DomainName);
             opts_buf[opts_len + 1] = @intCast(dn_len);
-            @memcpy(opts_buf[opts_len + 2 .. opts_len + 2 + dn_len], self.cfg.domain_name[0..dn_len]);
+            @memcpy(opts_buf[opts_len + 2 .. opts_len + 2 + dn_len], pool.domain_name[0..dn_len]);
             opts_len += 2 + dn_len;
         }
 
         // Option 119: Domain Search List (RFC 3397)
-        if (isRequested(prl, .DomainSearch) and self.cfg.domain_search.len > 0) {
+        if (isRequested(prl, .DomainSearch) and pool.domain_search.len > 0) {
             if (opts_len + 2 < opts_buf.len) {
-                const data_len = encodeDnsSearchList(opts_buf[opts_len + 2 ..], self.cfg.domain_search);
+                const data_len = encodeDnsSearchList(opts_buf[opts_len + 2 ..], pool.domain_search);
                 if (data_len > 0 and data_len <= 255) {
                     opts_buf[opts_len] = @intFromEnum(OptionCode.DomainSearch);
                     opts_buf[opts_len + 1] = @intCast(data_len);
@@ -1008,7 +1106,7 @@ pub const DHCPServer = struct {
 
         // Option 2: Time Offset
         if (isRequested(prl, .TimeOffset)) {
-            if (self.cfg.time_offset) |offset| {
+            if (pool.time_offset) |offset| {
                 opts_buf[opts_len] = @intFromEnum(OptionCode.TimeOffset);
                 opts_buf[opts_len + 1] = 4;
                 const be = std.mem.nativeToBig(i32, offset);
@@ -1018,24 +1116,24 @@ pub const DHCPServer = struct {
         }
 
         // Option 4: Time Servers (RFC 868)
-        appendIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, self.cfg.time_servers);
+        appendIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, pool.time_servers);
 
         // Option 7: Log Servers
-        appendIpListOpt(&opts_buf, &opts_len, prl, .LogServer, self.cfg.log_servers);
+        appendIpListOpt(&opts_buf, &opts_len, prl, .LogServer, pool.log_servers);
 
         // Option 42: NTP Servers
-        appendIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, self.cfg.ntp_servers);
+        appendIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, pool.ntp_servers);
 
         // Option 66: TFTP Server Name
-        appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, self.cfg.tftp_server_name);
+        appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, pool.tftp_server_name);
 
         // Option 67: Boot Filename
-        appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, self.cfg.boot_filename);
+        appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, pool.boot_filename);
 
         // Option 33: Static Routes (RFC 2132)
-        if (isRequested(prl, .StaticRoutes) and self.cfg.static_routes.len > 0) {
+        if (isRequested(prl, .StaticRoutes) and pool.static_routes.len > 0) {
             if (opts_len + 2 < opts_buf.len) {
-                const data_len = encodeStaticRoutes(opts_buf[opts_len + 2 ..], self.cfg.static_routes);
+                const data_len = encodeStaticRoutes(opts_buf[opts_len + 2 ..], pool.static_routes);
                 if (data_len > 0 and data_len <= 255) {
                     opts_buf[opts_len] = @intFromEnum(OptionCode.StaticRoutes);
                     opts_buf[opts_len + 1] = @intCast(data_len);
@@ -1045,9 +1143,9 @@ pub const DHCPServer = struct {
         }
 
         // Option 121: Classless Static Routes (RFC 3442)
-        if (isRequested(prl, .ClasslessStaticRoutes) and self.cfg.static_routes.len > 0) {
+        if (isRequested(prl, .ClasslessStaticRoutes) and pool.static_routes.len > 0) {
             if (opts_len + 2 < opts_buf.len) {
-                const data_len = encodeClasslessStaticRoutes(opts_buf[opts_len + 2 ..], self.cfg.static_routes);
+                const data_len = encodeClasslessStaticRoutes(opts_buf[opts_len + 2 ..], pool.static_routes);
                 if (data_len > 0 and data_len <= 255) {
                     opts_buf[opts_len] = @intFromEnum(OptionCode.ClasslessStaticRoutes);
                     opts_buf[opts_len + 1] = @intCast(data_len);
@@ -1057,7 +1155,7 @@ pub const DHCPServer = struct {
         }
 
         // Inject operator-defined options from config (filtered by PRL)
-        var opts_it = self.cfg.dhcp_options.iterator();
+        var opts_it = pool.dhcp_options.iterator();
         while (opts_it.next()) |entry| {
             const code = std.fmt.parseInt(u8, entry.key_ptr.*, 10) catch continue;
             if (!isRequestedCode(prl, code)) continue;
@@ -1105,6 +1203,7 @@ pub const DHCPServer = struct {
     /// Returns a DHCPNAK packet if the requested IP is invalid.
     fn createAck(self: *Self, request: []const u8) !?[]u8 {
         const req_header: *const DHCPHeader = @ptrCast(@alignCast(request.ptr));
+        const pool = self.selectPool(req_header.giaddr, req_header.ciaddr);
 
         // Option 54: ignore requests directed at a different server.
         if (getServerIdentifier(request)) |sid| {
@@ -1129,15 +1228,15 @@ pub const DHCPServer = struct {
         else
             null;
 
-        // Send DHCPNAK if the requested IP is not valid for our subnet.
-        if (!self.isIpValid(client_ip, mac_str, client_id_hex)) return self.createNak(request);
+        // Send DHCPNAK if the requested IP is not valid for this pool's subnet.
+        if (!self.isIpValid(pool, client_ip, mac_str, client_id_hex)) return self.createNak(request);
 
         const server_ip = self.server_ip;
-        const subnet_mask = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.subnet_mask));
-        const router_ip = try config_mod.parseIpv4(self.cfg.router);
-        const lease_time = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.lease_time));
-        const renewal_time = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.lease_time / 2));
-        const rebind_time = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.lease_time * 7 / 8));
+        const subnet_mask = std.mem.toBytes(std.mem.nativeToBig(u32, pool.subnet_mask));
+        const router_ip = try config_mod.parseIpv4(pool.router);
+        const lease_time = std.mem.toBytes(std.mem.nativeToBig(u32, pool.lease_time));
+        const renewal_time = std.mem.toBytes(std.mem.nativeToBig(u32, pool.lease_time / 2));
+        const rebind_time = std.mem.toBytes(std.mem.nativeToBig(u32, pool.lease_time * 7 / 8));
 
         var ip_str_buf: [15]u8 = undefined;
         const ip_str = std.fmt.bufPrint(&ip_str_buf, "{d}.{d}.{d}.{d}", .{
@@ -1163,7 +1262,7 @@ pub const DHCPServer = struct {
             .mac = mac_str,
             .ip = ip_str,
             .hostname = effective_hostname,
-            .expires = now + @as(i64, self.cfg.lease_time),
+            .expires = now + @as(i64, pool.lease_time),
             .client_id = client_id_hex,
             .reserved = reservation != null,
         };
@@ -1178,8 +1277,8 @@ pub const DHCPServer = struct {
             }
         }
 
-        // Notify DNS updater
-        if (self.dns_updater) |du| du.notifyLeaseAdded(ip_str, effective_hostname);
+        // Notify DNS updater for this pool
+        if (self.dnsUpdaterForPool(pool)) |du| du.notifyLeaseAdded(ip_str, effective_hostname);
 
         logRelayAgentInfo(request);
 
@@ -1242,12 +1341,12 @@ pub const DHCPServer = struct {
         }
 
         // Option 6: DNS Servers (up to 4)
-        if (isRequested(prl, .DomainNameServer) and self.cfg.dns_servers.len > 0) {
-            const count = @min(self.cfg.dns_servers.len, 4);
+        if (isRequested(prl, .DomainNameServer) and pool.dns_servers.len > 0) {
+            const count = @min(pool.dns_servers.len, 4);
             opts_buf[opts_len] = @intFromEnum(OptionCode.DomainNameServer);
             opts_buf[opts_len + 1] = @intCast(count * 4);
             opts_len += 2;
-            for (self.cfg.dns_servers[0..count]) |dns_str| {
+            for (pool.dns_servers[0..count]) |dns_str| {
                 const dns_ip = config_mod.parseIpv4(dns_str) catch continue;
                 @memcpy(opts_buf[opts_len .. opts_len + 4], &dns_ip);
                 opts_len += 4;
@@ -1255,18 +1354,18 @@ pub const DHCPServer = struct {
         }
 
         // Option 15: Domain Name
-        if (isRequested(prl, .DomainName) and self.cfg.domain_name.len > 0) {
-            const dn_len = @min(self.cfg.domain_name.len, 255);
+        if (isRequested(prl, .DomainName) and pool.domain_name.len > 0) {
+            const dn_len = @min(pool.domain_name.len, 255);
             opts_buf[opts_len] = @intFromEnum(OptionCode.DomainName);
             opts_buf[opts_len + 1] = @intCast(dn_len);
-            @memcpy(opts_buf[opts_len + 2 .. opts_len + 2 + dn_len], self.cfg.domain_name[0..dn_len]);
+            @memcpy(opts_buf[opts_len + 2 .. opts_len + 2 + dn_len], pool.domain_name[0..dn_len]);
             opts_len += 2 + dn_len;
         }
 
         // Option 119: Domain Search List (RFC 3397)
-        if (isRequested(prl, .DomainSearch) and self.cfg.domain_search.len > 0) {
+        if (isRequested(prl, .DomainSearch) and pool.domain_search.len > 0) {
             if (opts_len + 2 < opts_buf.len) {
-                const data_len = encodeDnsSearchList(opts_buf[opts_len + 2 ..], self.cfg.domain_search);
+                const data_len = encodeDnsSearchList(opts_buf[opts_len + 2 ..], pool.domain_search);
                 if (data_len > 0 and data_len <= 255) {
                     opts_buf[opts_len] = @intFromEnum(OptionCode.DomainSearch);
                     opts_buf[opts_len + 1] = @intCast(data_len);
@@ -1277,7 +1376,7 @@ pub const DHCPServer = struct {
 
         // Option 2: Time Offset
         if (isRequested(prl, .TimeOffset)) {
-            if (self.cfg.time_offset) |offset| {
+            if (pool.time_offset) |offset| {
                 opts_buf[opts_len] = @intFromEnum(OptionCode.TimeOffset);
                 opts_buf[opts_len + 1] = 4;
                 const be = std.mem.nativeToBig(i32, offset);
@@ -1287,24 +1386,24 @@ pub const DHCPServer = struct {
         }
 
         // Option 4: Time Servers (RFC 868)
-        appendIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, self.cfg.time_servers);
+        appendIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, pool.time_servers);
 
         // Option 7: Log Servers
-        appendIpListOpt(&opts_buf, &opts_len, prl, .LogServer, self.cfg.log_servers);
+        appendIpListOpt(&opts_buf, &opts_len, prl, .LogServer, pool.log_servers);
 
         // Option 42: NTP Servers
-        appendIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, self.cfg.ntp_servers);
+        appendIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, pool.ntp_servers);
 
         // Option 66: TFTP Server Name
-        appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, self.cfg.tftp_server_name);
+        appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, pool.tftp_server_name);
 
         // Option 67: Boot Filename
-        appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, self.cfg.boot_filename);
+        appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, pool.boot_filename);
 
         // Option 33: Static Routes (RFC 2132)
-        if (isRequested(prl, .StaticRoutes) and self.cfg.static_routes.len > 0) {
+        if (isRequested(prl, .StaticRoutes) and pool.static_routes.len > 0) {
             if (opts_len + 2 < opts_buf.len) {
-                const data_len = encodeStaticRoutes(opts_buf[opts_len + 2 ..], self.cfg.static_routes);
+                const data_len = encodeStaticRoutes(opts_buf[opts_len + 2 ..], pool.static_routes);
                 if (data_len > 0 and data_len <= 255) {
                     opts_buf[opts_len] = @intFromEnum(OptionCode.StaticRoutes);
                     opts_buf[opts_len + 1] = @intCast(data_len);
@@ -1314,9 +1413,9 @@ pub const DHCPServer = struct {
         }
 
         // Option 121: Classless Static Routes (RFC 3442)
-        if (isRequested(prl, .ClasslessStaticRoutes) and self.cfg.static_routes.len > 0) {
+        if (isRequested(prl, .ClasslessStaticRoutes) and pool.static_routes.len > 0) {
             if (opts_len + 2 < opts_buf.len) {
-                const data_len = encodeClasslessStaticRoutes(opts_buf[opts_len + 2 ..], self.cfg.static_routes);
+                const data_len = encodeClasslessStaticRoutes(opts_buf[opts_len + 2 ..], pool.static_routes);
                 if (data_len > 0 and data_len <= 255) {
                     opts_buf[opts_len] = @intFromEnum(OptionCode.ClasslessStaticRoutes);
                     opts_buf[opts_len + 1] = @intCast(data_len);
@@ -1337,7 +1436,7 @@ pub const DHCPServer = struct {
         }
 
         // Inject operator-defined options from config (filtered by PRL)
-        var opts_it = self.cfg.dhcp_options.iterator();
+        var opts_it = pool.dhcp_options.iterator();
         while (opts_it.next()) |entry| {
             const code = std.fmt.parseInt(u8, entry.key_ptr.*, 10) catch continue;
             if (!isRequestedCode(prl, code)) continue;
@@ -1392,8 +1491,10 @@ pub const DHCPServer = struct {
         // Check if reserved before removal (reserved leases get expires=0, not deleted)
         const is_reserved = if (self.store.leases.get(mac_str)) |l| l.reserved else false;
         self.store.removeLease(mac_str);
-        if (self.dns_updater) |du| {
-            if (old_lease) |l| du.notifyLeaseRemoved(l.ip, l.hostname);
+        if (old_lease) |l| {
+            if (self.poolForIp(l.ip)) |pool| {
+                if (self.dnsUpdaterForPool(pool)) |du| du.notifyLeaseRemoved(l.ip, l.hostname);
+            }
         }
         // Notify sync peers: reserved leases are LEASE_UPDATE (expires=0), regular are LEASE_DELETE
         if (self.sync_mgr) |s| {
@@ -1408,6 +1509,7 @@ pub const DHCPServer = struct {
     fn handleDecline(self: *Self, request: []const u8) void {
         if (request.len < dhcp_min_packet_size) return;
         const req_header: *const DHCPHeader = @ptrCast(@alignCast(request.ptr));
+        const pool = self.selectPool(req_header.giaddr, req_header.ciaddr);
 
         // Remove any existing offer-lease for this MAC.
         const mac_bytes = req_header.chaddr[0..6];
@@ -1439,7 +1541,7 @@ pub const DHCPServer = struct {
         // allocateIp skips IPs where getLeaseByIp != null.
         // isIpValid rejects IPs whose stored MAC != client MAC ("conflict:..." never matches).
         // pruneExpiredWithDns removes the quarantine after the quarantine period.
-        const quarantine_secs: u32 = @max(self.cfg.lease_time / 10, 300);
+        const quarantine_secs: u32 = @max(pool.lease_time / 10, 300);
         const declined_ip = getRequestedIp(request) orelse return;
         var ip_buf: [15]u8 = undefined;
         const ip_str = std.fmt.bufPrint(&ip_buf, "{d}.{d}.{d}.{d}", .{
@@ -1530,29 +1632,29 @@ pub const DHCPServer = struct {
         }
     }
 
-    /// Returns true if `ip` is a valid host address in our subnet that is either
+    /// Returns true if `ip` is a valid host address in the pool's subnet that is either
     /// unleased or already leased to this client (matched by mac_str or client_id_hex).
-    fn isIpValid(self: *Self, ip: [4]u8, mac_str: []const u8, client_id_hex: ?[]const u8) bool {
+    fn isIpValid(self: *Self, pool: *const config_mod.PoolConfig, ip: [4]u8, mac_str: []const u8, client_id_hex: ?[]const u8) bool {
         const ip_int = std.mem.readInt(u32, &ip, .big);
-        const subnet_bytes = config_mod.parseIpv4(self.cfg.subnet) catch return false;
+        const subnet_bytes = config_mod.parseIpv4(pool.subnet) catch return false;
         const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
-        const mask = self.cfg.subnet_mask;
+        const mask = pool.subnet_mask;
         const broadcast_int = subnet_int | ~mask;
 
         if ((ip_int & mask) != subnet_int) return false;
         if (ip_int == subnet_int or ip_int == broadcast_int) return false;
 
         // Reject reserved addresses: router and server's own IP.
-        const router_bytes = config_mod.parseIpv4(self.cfg.router) catch return false;
+        const router_bytes = config_mod.parseIpv4(pool.router) catch return false;
         if (ip_int == std.mem.readInt(u32, &router_bytes, .big)) return false;
         if (std.mem.eql(u8, &ip, &self.server_ip)) return false;
 
-        if (self.cfg.pool_start.len > 0) {
-            const b = config_mod.parseIpv4(self.cfg.pool_start) catch return false;
+        if (pool.pool_start.len > 0) {
+            const b = config_mod.parseIpv4(pool.pool_start) catch return false;
             if (ip_int < std.mem.readInt(u32, &b, .big)) return false;
         }
-        if (self.cfg.pool_end.len > 0) {
-            const b = config_mod.parseIpv4(self.cfg.pool_end) catch return false;
+        if (pool.pool_end.len > 0) {
+            const b = config_mod.parseIpv4(pool.pool_end) catch return false;
             if (ip_int > std.mem.readInt(u32, &b, .big)) return false;
         }
 
@@ -1587,6 +1689,7 @@ pub const DHCPServer = struct {
     /// yiaddr is 0 — no address is assigned. Returns configuration options only.
     fn handleInform(self: *Self, request: []const u8) !?[]u8 {
         const req_header: *const DHCPHeader = @ptrCast(@alignCast(request.ptr));
+        const pool = self.selectPool(req_header.giaddr, req_header.ciaddr);
         const server_ip = self.server_ip;
 
         logRelayAgentInfo(request);
@@ -1610,7 +1713,7 @@ pub const DHCPServer = struct {
 
         // Option 1: Subnet Mask
         if (isRequested(prl, .SubnetMask)) {
-            const subnet_mask = std.mem.toBytes(std.mem.nativeToBig(u32, self.cfg.subnet_mask));
+            const subnet_mask = std.mem.toBytes(std.mem.nativeToBig(u32, pool.subnet_mask));
             opts_buf[opts_len] = @intFromEnum(OptionCode.SubnetMask);
             opts_buf[opts_len + 1] = 4;
             @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &subnet_mask);
@@ -1619,7 +1722,7 @@ pub const DHCPServer = struct {
 
         // Option 3: Router
         if (isRequested(prl, .Router)) {
-            const router_ip = try config_mod.parseIpv4(self.cfg.router);
+            const router_ip = try config_mod.parseIpv4(pool.router);
             opts_buf[opts_len] = @intFromEnum(OptionCode.Router);
             opts_buf[opts_len + 1] = 4;
             @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &router_ip);
@@ -1627,12 +1730,12 @@ pub const DHCPServer = struct {
         }
 
         // Option 6: DNS Servers (up to 4)
-        if (isRequested(prl, .DomainNameServer) and self.cfg.dns_servers.len > 0) {
-            const count = @min(self.cfg.dns_servers.len, 4);
+        if (isRequested(prl, .DomainNameServer) and pool.dns_servers.len > 0) {
+            const count = @min(pool.dns_servers.len, 4);
             opts_buf[opts_len] = @intFromEnum(OptionCode.DomainNameServer);
             opts_buf[opts_len + 1] = @intCast(count * 4);
             opts_len += 2;
-            for (self.cfg.dns_servers[0..count]) |dns_str| {
+            for (pool.dns_servers[0..count]) |dns_str| {
                 const dns_ip = config_mod.parseIpv4(dns_str) catch continue;
                 @memcpy(opts_buf[opts_len .. opts_len + 4], &dns_ip);
                 opts_len += 4;
@@ -1640,18 +1743,18 @@ pub const DHCPServer = struct {
         }
 
         // Option 15: Domain Name
-        if (isRequested(prl, .DomainName) and self.cfg.domain_name.len > 0) {
-            const dn_len = @min(self.cfg.domain_name.len, 255);
+        if (isRequested(prl, .DomainName) and pool.domain_name.len > 0) {
+            const dn_len = @min(pool.domain_name.len, 255);
             opts_buf[opts_len] = @intFromEnum(OptionCode.DomainName);
             opts_buf[opts_len + 1] = @intCast(dn_len);
-            @memcpy(opts_buf[opts_len + 2 .. opts_len + 2 + dn_len], self.cfg.domain_name[0..dn_len]);
+            @memcpy(opts_buf[opts_len + 2 .. opts_len + 2 + dn_len], pool.domain_name[0..dn_len]);
             opts_len += 2 + dn_len;
         }
 
         // Option 119: Domain Search List (RFC 3397)
-        if (isRequested(prl, .DomainSearch) and self.cfg.domain_search.len > 0) {
+        if (isRequested(prl, .DomainSearch) and pool.domain_search.len > 0) {
             if (opts_len + 2 < opts_buf.len) {
-                const data_len = encodeDnsSearchList(opts_buf[opts_len + 2 ..], self.cfg.domain_search);
+                const data_len = encodeDnsSearchList(opts_buf[opts_len + 2 ..], pool.domain_search);
                 if (data_len > 0 and data_len <= 255) {
                     opts_buf[opts_len] = @intFromEnum(OptionCode.DomainSearch);
                     opts_buf[opts_len + 1] = @intCast(data_len);
@@ -1662,7 +1765,7 @@ pub const DHCPServer = struct {
 
         // Option 2: Time Offset
         if (isRequested(prl, .TimeOffset)) {
-            if (self.cfg.time_offset) |offset| {
+            if (pool.time_offset) |offset| {
                 opts_buf[opts_len] = @intFromEnum(OptionCode.TimeOffset);
                 opts_buf[opts_len + 1] = 4;
                 const be = std.mem.nativeToBig(i32, offset);
@@ -1672,24 +1775,24 @@ pub const DHCPServer = struct {
         }
 
         // Option 4: Time Servers (RFC 868)
-        appendIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, self.cfg.time_servers);
+        appendIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, pool.time_servers);
 
         // Option 7: Log Servers
-        appendIpListOpt(&opts_buf, &opts_len, prl, .LogServer, self.cfg.log_servers);
+        appendIpListOpt(&opts_buf, &opts_len, prl, .LogServer, pool.log_servers);
 
         // Option 42: NTP Servers
-        appendIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, self.cfg.ntp_servers);
+        appendIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, pool.ntp_servers);
 
         // Option 66: TFTP Server Name
-        appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, self.cfg.tftp_server_name);
+        appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, pool.tftp_server_name);
 
         // Option 67: Boot Filename
-        appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, self.cfg.boot_filename);
+        appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, pool.boot_filename);
 
         // Option 33: Static Routes (RFC 2132)
-        if (isRequested(prl, .StaticRoutes) and self.cfg.static_routes.len > 0) {
+        if (isRequested(prl, .StaticRoutes) and pool.static_routes.len > 0) {
             if (opts_len + 2 < opts_buf.len) {
-                const data_len = encodeStaticRoutes(opts_buf[opts_len + 2 ..], self.cfg.static_routes);
+                const data_len = encodeStaticRoutes(opts_buf[opts_len + 2 ..], pool.static_routes);
                 if (data_len > 0 and data_len <= 255) {
                     opts_buf[opts_len] = @intFromEnum(OptionCode.StaticRoutes);
                     opts_buf[opts_len + 1] = @intCast(data_len);
@@ -1699,9 +1802,9 @@ pub const DHCPServer = struct {
         }
 
         // Option 121: Classless Static Routes (RFC 3442)
-        if (isRequested(prl, .ClasslessStaticRoutes) and self.cfg.static_routes.len > 0) {
+        if (isRequested(prl, .ClasslessStaticRoutes) and pool.static_routes.len > 0) {
             if (opts_len + 2 < opts_buf.len) {
-                const data_len = encodeClasslessStaticRoutes(opts_buf[opts_len + 2 ..], self.cfg.static_routes);
+                const data_len = encodeClasslessStaticRoutes(opts_buf[opts_len + 2 ..], pool.static_routes);
                 if (data_len > 0 and data_len <= 255) {
                     opts_buf[opts_len] = @intFromEnum(OptionCode.ClasslessStaticRoutes);
                     opts_buf[opts_len + 1] = @intCast(data_len);
@@ -1711,7 +1814,7 @@ pub const DHCPServer = struct {
         }
 
         // Inject operator-defined options from config (filtered by PRL)
-        var opts_it = self.cfg.dhcp_options.iterator();
+        var opts_it = pool.dhcp_options.iterator();
         while (opts_it.next()) |entry| {
             const code = std.fmt.parseInt(u8, entry.key_ptr.*, 10) catch continue;
             if (!isRequestedCode(prl, code)) continue;
@@ -1792,11 +1895,10 @@ pub fn create_server(
     cfg: *Config,
     cfg_path: []const u8,
     store: *StateStore,
-    dns_updater: ?*dns_mod.DNSUpdater,
     log_level: *std.log.Level,
     sync_mgr: ?*sync_mod.SyncManager,
 ) !*DHCPServer {
-    return DHCPServer.create(allocator, cfg, cfg_path, store, dns_updater, log_level, sync_mgr);
+    return DHCPServer.create(allocator, cfg, cfg_path, store, log_level, sync_mgr);
 }
 
 // ---------------------------------------------------------------------------
@@ -2026,28 +2128,26 @@ fn makeRequest(
     return i;
 }
 
-/// Create a fully initialized test Config. Caller must call cfg.deinit().
+/// Create a fully initialized test Config with a single pool. Caller must call cfg.deinit().
 fn makeTestConfig(allocator: std.mem.Allocator) !config_mod.Config {
-    return config_mod.Config{
-        .allocator = allocator,
-        .listen_address = try allocator.dupe(u8, "192.168.1.1"),
+    const pools = try allocator.alloc(config_mod.PoolConfig, 1);
+    pools[0] = config_mod.PoolConfig{
         .subnet = try allocator.dupe(u8, "192.168.1.0"),
         .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
         .router = try allocator.dupe(u8, "192.168.1.1"),
+        .pool_start = try allocator.dupe(u8, ""),
+        .pool_end = try allocator.dupe(u8, ""),
         .dns_servers = try allocator.alloc([]const u8, 0),
         .domain_name = try allocator.dupe(u8, ""),
         .domain_search = try allocator.alloc([]const u8, 0),
+        .lease_time = 3600,
         .time_offset = null,
         .time_servers = try allocator.alloc([]const u8, 0),
         .log_servers = try allocator.alloc([]const u8, 0),
         .ntp_servers = try allocator.alloc([]const u8, 0),
         .tftp_server_name = try allocator.dupe(u8, ""),
         .boot_filename = try allocator.dupe(u8, ""),
-        .lease_time = 3600,
-        .state_dir = try allocator.dupe(u8, "/tmp"),
-        .pool_start = try allocator.dupe(u8, ""),
-        .pool_end = try allocator.dupe(u8, ""),
-        .log_level = .info,
         .dns_update = .{
             .enable = false,
             .server = try allocator.dupe(u8, ""),
@@ -2059,8 +2159,15 @@ fn makeTestConfig(allocator: std.mem.Allocator) !config_mod.Config {
         .dhcp_options = std.StringHashMap([]const u8).init(allocator),
         .reservations = try allocator.alloc(config_mod.Reservation, 0),
         .static_routes = try allocator.alloc(config_mod.StaticRoute, 0),
+    };
+    return config_mod.Config{
+        .allocator = allocator,
+        .listen_address = try allocator.dupe(u8, "192.168.1.1"),
+        .state_dir = try allocator.dupe(u8, "/tmp"),
+        .log_level = .info,
         .pool_allocation_random = false,
         .sync = null,
+        .pools = pools,
     };
 }
 
@@ -2081,7 +2188,7 @@ test "createAck returns null when option 54 does not match our IP" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
@@ -2102,7 +2209,7 @@ test "createAck sends DHCPNAK for IP outside subnet" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
@@ -2125,7 +2232,7 @@ test "createAck stores hostname from option 12" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
@@ -2153,7 +2260,7 @@ test "createAck returns DHCPACK for valid request without option 54" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
@@ -2200,14 +2307,14 @@ test "allocateIp skips addresses before pool_start" {
     var cfg = try makeTestConfig(alloc);
     defer cfg.deinit();
     // Override pool_start to 192.168.1.100
-    alloc.free(cfg.pool_start);
-    cfg.pool_start = try alloc.dupe(u8, "192.168.1.100");
+    alloc.free(cfg.pools[0].pool_start);
+    cfg.pools[0].pool_start = try alloc.dupe(u8, "192.168.1.100");
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
-    const ip = try server.allocateIp([6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF }, null);
+    const ip = try server.allocateIp(&server.cfg.pools[0], [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF }, null);
     try std.testing.expect(ip != null);
     const ip_int = std.mem.readInt(u32, &ip.?, .big);
     const start_int = std.mem.readInt(u32, &[4]u8{ 192, 168, 1, 100 }, .big);
@@ -2218,21 +2325,21 @@ test "isIpValid rejects IP outside pool range" {
     const alloc = std.testing.allocator;
     var cfg = try makeTestConfig(alloc);
     defer cfg.deinit();
-    alloc.free(cfg.pool_start);
-    alloc.free(cfg.pool_end);
-    cfg.pool_start = try alloc.dupe(u8, "192.168.1.100");
-    cfg.pool_end = try alloc.dupe(u8, "192.168.1.200");
+    alloc.free(cfg.pools[0].pool_start);
+    alloc.free(cfg.pools[0].pool_end);
+    cfg.pools[0].pool_start = try alloc.dupe(u8, "192.168.1.100");
+    cfg.pools[0].pool_end = try alloc.dupe(u8, "192.168.1.200");
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     // Below pool_start
-    try std.testing.expect(!server.isIpValid([4]u8{ 192, 168, 1, 50 }, "aa:bb:cc:dd:ee:ff", null));
+    try std.testing.expect(!server.isIpValid(&server.cfg.pools[0], [4]u8{ 192, 168, 1, 50 }, "aa:bb:cc:dd:ee:ff", null));
     // Above pool_end
-    try std.testing.expect(!server.isIpValid([4]u8{ 192, 168, 1, 210 }, "aa:bb:cc:dd:ee:ff", null));
+    try std.testing.expect(!server.isIpValid(&server.cfg.pools[0], [4]u8{ 192, 168, 1, 210 }, "aa:bb:cc:dd:ee:ff", null));
     // Inside pool
-    try std.testing.expect(server.isIpValid([4]u8{ 192, 168, 1, 150 }, "aa:bb:cc:dd:ee:ff", null));
+    try std.testing.expect(server.isIpValid(&server.cfg.pools[0], [4]u8{ 192, 168, 1, 150 }, "aa:bb:cc:dd:ee:ff", null));
 }
 
 test "handleDecline quarantines declined IP" {
@@ -2241,7 +2348,7 @@ test "handleDecline quarantines declined IP" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
@@ -2262,7 +2369,7 @@ test "handleDecline removes MAC lease" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     // Pre-populate a lease for the MAC.
@@ -2289,7 +2396,7 @@ test "createOffer uses server_ip not listen_address" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     // Override server_ip to something different from listen_address
@@ -2329,7 +2436,7 @@ test "createAck checks server_ip for option 54" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     server.server_ip = [4]u8{ 192, 168, 1, 5 };
@@ -2368,11 +2475,11 @@ test "dhcp_options injected into OFFER packet" {
     // Add option 42 (NTP server) with value "192.168.1.10"
     const opt_key = try alloc.dupe(u8, "42");
     const opt_val = try alloc.dupe(u8, "192.168.1.10");
-    try cfg.dhcp_options.put(opt_key, opt_val);
+    try cfg.pools[0].dhcp_options.put(opt_key, opt_val);
 
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     // Send a DISCOVER
@@ -2427,7 +2534,7 @@ test "handleDecline rate-limits MAC after threshold declines" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     const mac = [6]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01 };
@@ -2450,7 +2557,7 @@ test "handleDecline rate-limits MAC after threshold declines" {
     }
 
     // After threshold declines, allocateIp should return null for this MAC.
-    const ip = try server.allocateIp(mac, null);
+    const ip = try server.allocateIp(&server.cfg.pools[0], mac, null);
     try std.testing.expect(ip == null);
 }
 
@@ -2461,10 +2568,10 @@ test "quarantine period is max(lease_time/10, 300)" {
     {
         var cfg = try makeTestConfig(alloc);
         defer cfg.deinit();
-        cfg.lease_time = 3600;
+        cfg.pools[0].lease_time = 3600;
         const store = try makeTestStore(alloc);
         defer store.deinit();
-        const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+        const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
         defer server.deinit();
 
         var buf = [_]u8{0} ** 512;
@@ -2483,10 +2590,10 @@ test "quarantine period is max(lease_time/10, 300)" {
     {
         var cfg = try makeTestConfig(alloc);
         defer cfg.deinit();
-        cfg.lease_time = 600;
+        cfg.pools[0].lease_time = 600;
         const store = try makeTestStore(alloc);
         defer store.deinit();
-        const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+        const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
         defer server.deinit();
 
         var buf = [_]u8{0} ** 512;
@@ -2508,7 +2615,7 @@ test "global decline rate limit drops excess declines" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     // Force the window to be current so counts don't reset.
@@ -2546,7 +2653,7 @@ test "hops is echoed in OFFER and ACK responses" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     // Build a DISCOVER with hops=3
@@ -2594,7 +2701,7 @@ test "createAck stores client_id from option 61" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     const mac = [6]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 };
@@ -2635,7 +2742,7 @@ test "allocateIp reuses lease when client_id matches different MAC" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     // Pre-populate a lease with a client_id for one MAC.
@@ -2650,7 +2757,7 @@ test "allocateIp reuses lease when client_id matches different MAC" {
     // Allocate with a different MAC but same client_id raw bytes.
     const client_id_bytes = [_]u8{ 0x01, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
     const different_mac = [6]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 };
-    const ip = try server.allocateIp(different_mac, &client_id_bytes);
+    const ip = try server.allocateIp(&server.cfg.pools[0], different_mac, &client_id_bytes);
     try std.testing.expect(ip != null);
     // Should reuse the existing lease IP, not allocate a new one.
     try std.testing.expectEqualSlices(u8, &[4]u8{ 192, 168, 1, 42 }, &ip.?);
@@ -2675,7 +2782,7 @@ test "createOffer omits options not in PRL" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
@@ -2722,7 +2829,7 @@ test "handleInform returns DHCPACK with yiaddr=0" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
@@ -2795,12 +2902,12 @@ test "isIpValid rejects router IP" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     // makeTestConfig sets router = "192.168.1.1"
     const router_ip = [4]u8{ 192, 168, 1, 1 };
-    try std.testing.expect(!server.isIpValid(router_ip, "aa:bb:cc:dd:ee:ff", null));
+    try std.testing.expect(!server.isIpValid(&server.cfg.pools[0], router_ip, "aa:bb:cc:dd:ee:ff", null));
 }
 
 test "DHCPREQUEST for router IP results in DHCPNAK" {
@@ -2809,7 +2916,7 @@ test "DHCPREQUEST for router IP results in DHCPNAK" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
@@ -2870,12 +2977,12 @@ test "allocateIp returns reserved IP for matching MAC" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     try putReservationInStore(store, "aa:bb:cc:dd:ee:ff", "192.168.1.50", null);
 
-    const ip = try server.allocateIp([6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF }, null);
+    const ip = try server.allocateIp(&server.cfg.pools[0], [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF }, null);
     try std.testing.expect(ip != null);
     try std.testing.expectEqualSlices(u8, &[4]u8{ 192, 168, 1, 50 }, &ip.?);
 }
@@ -2885,20 +2992,20 @@ test "allocateIp skips reserved IP for non-matching client" {
     var cfg = try makeTestConfig(alloc);
     defer cfg.deinit();
     // Set tight pool so only .50 is available; if skipped, nothing else exists.
-    alloc.free(cfg.pool_start);
-    alloc.free(cfg.pool_end);
-    cfg.pool_start = try alloc.dupe(u8, "192.168.1.50");
-    cfg.pool_end = try alloc.dupe(u8, "192.168.1.50");
+    alloc.free(cfg.pools[0].pool_start);
+    alloc.free(cfg.pools[0].pool_end);
+    cfg.pools[0].pool_start = try alloc.dupe(u8, "192.168.1.50");
+    cfg.pools[0].pool_end = try alloc.dupe(u8, "192.168.1.50");
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     // Reserve .50 for a specific MAC.
     try putReservationInStore(store, "aa:bb:cc:dd:ee:ff", "192.168.1.50", null);
 
     // A different MAC should get null (pool only has .50, which is reserved).
-    const ip = try server.allocateIp([6]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 }, null);
+    const ip = try server.allocateIp(&server.cfg.pools[0], [6]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 }, null);
     try std.testing.expect(ip == null);
 }
 
@@ -2908,15 +3015,15 @@ test "isIpValid rejects reserved IP for non-matching MAC" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     try putReservationInStore(store, "aa:bb:cc:dd:ee:ff", "192.168.1.50", null);
 
     // Non-matching MAC requesting the reserved IP — should be rejected.
-    try std.testing.expect(!server.isIpValid([4]u8{ 192, 168, 1, 50 }, "11:22:33:44:55:66", null));
+    try std.testing.expect(!server.isIpValid(&server.cfg.pools[0], [4]u8{ 192, 168, 1, 50 }, "11:22:33:44:55:66", null));
     // Matching MAC — should be accepted.
-    try std.testing.expect(server.isIpValid([4]u8{ 192, 168, 1, 50 }, "aa:bb:cc:dd:ee:ff", null));
+    try std.testing.expect(server.isIpValid(&server.cfg.pools[0], [4]u8{ 192, 168, 1, 50 }, "aa:bb:cc:dd:ee:ff", null));
 }
 
 test "createAck: reserved client gets reserved IP and option 12 hostname" {
@@ -2925,7 +3032,7 @@ test "createAck: reserved client gets reserved IP and option 12 hostname" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     try putReservationInStore(store, "aa:bb:cc:dd:ee:ff", "192.168.1.50", "printer");
@@ -2991,7 +3098,7 @@ test "DHCPNAK: non-matching client denied reserved IP" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     try putReservationInStore(store, "aa:bb:cc:dd:ee:ff", "192.168.1.50", null);
@@ -3016,7 +3123,7 @@ test "removeLease on reserved lease keeps entry with expires=0 (RELEASE)" {
     defer cfg.deinit();
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     // Seed an active reservation.
@@ -3151,13 +3258,13 @@ test "OFFER includes option 33 when PRL requests it" {
     var cfg = try makeTestConfig(alloc);
     defer cfg.deinit();
     // Add a static route to the config.
-    alloc.free(cfg.static_routes);
-    cfg.static_routes = try alloc.dupe(config_mod.StaticRoute, &[_]config_mod.StaticRoute{
+    alloc.free(cfg.pools[0].static_routes);
+    cfg.pools[0].static_routes = try alloc.dupe(config_mod.StaticRoute, &[_]config_mod.StaticRoute{
         .{ .destination = [4]u8{ 10, 10, 10, 0 }, .prefix_len = 24, .router = [4]u8{ 192, 168, 1, 1 } },
     });
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
@@ -3194,13 +3301,13 @@ test "OFFER includes option 121 when PRL requests it" {
     const alloc = std.testing.allocator;
     var cfg = try makeTestConfig(alloc);
     defer cfg.deinit();
-    alloc.free(cfg.static_routes);
-    cfg.static_routes = try alloc.dupe(config_mod.StaticRoute, &[_]config_mod.StaticRoute{
+    alloc.free(cfg.pools[0].static_routes);
+    cfg.pools[0].static_routes = try alloc.dupe(config_mod.StaticRoute, &[_]config_mod.StaticRoute{
         .{ .destination = [4]u8{ 10, 10, 10, 0 }, .prefix_len = 24, .router = [4]u8{ 192, 168, 1, 1 } },
     });
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
@@ -3238,13 +3345,13 @@ test "OFFER omits static route options when not in PRL" {
     const alloc = std.testing.allocator;
     var cfg = try makeTestConfig(alloc);
     defer cfg.deinit();
-    alloc.free(cfg.static_routes);
-    cfg.static_routes = try alloc.dupe(config_mod.StaticRoute, &[_]config_mod.StaticRoute{
+    alloc.free(cfg.pools[0].static_routes);
+    cfg.pools[0].static_routes = try alloc.dupe(config_mod.StaticRoute, &[_]config_mod.StaticRoute{
         .{ .destination = [4]u8{ 10, 10, 10, 0 }, .prefix_len = 24, .router = [4]u8{ 192, 168, 1, 1 } },
     });
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     var buf = [_]u8{0} ** 512;
@@ -3307,16 +3414,16 @@ test "allocateIp: single-IP pool allocates the one IP" {
     const alloc = std.testing.allocator;
     var cfg = try makeTestConfig(alloc);
     defer cfg.deinit();
-    alloc.free(cfg.pool_start);
-    alloc.free(cfg.pool_end);
-    cfg.pool_start = try alloc.dupe(u8, "192.168.1.42");
-    cfg.pool_end = try alloc.dupe(u8, "192.168.1.42");
+    alloc.free(cfg.pools[0].pool_start);
+    alloc.free(cfg.pools[0].pool_end);
+    cfg.pools[0].pool_start = try alloc.dupe(u8, "192.168.1.42");
+    cfg.pools[0].pool_end = try alloc.dupe(u8, "192.168.1.42");
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
-    const ip = try server.allocateIp([6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF }, null);
+    const ip = try server.allocateIp(&server.cfg.pools[0], [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF }, null);
     try std.testing.expectEqual([4]u8{ 192, 168, 1, 42 }, ip.?);
 }
 
@@ -3324,20 +3431,20 @@ test "allocateIp: pool exhausted returns null" {
     const alloc = std.testing.allocator;
     var cfg = try makeTestConfig(alloc);
     defer cfg.deinit();
-    alloc.free(cfg.pool_start);
-    alloc.free(cfg.pool_end);
-    cfg.pool_start = try alloc.dupe(u8, "192.168.1.10");
-    cfg.pool_end = try alloc.dupe(u8, "192.168.1.11");
+    alloc.free(cfg.pools[0].pool_start);
+    alloc.free(cfg.pools[0].pool_end);
+    cfg.pools[0].pool_start = try alloc.dupe(u8, "192.168.1.10");
+    cfg.pools[0].pool_end = try alloc.dupe(u8, "192.168.1.11");
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     // Lease every IP in the two-address pool.
     try store.addLease(.{ .mac = "aa:bb:cc:00:00:01", .ip = "192.168.1.10", .hostname = null, .expires = std.time.timestamp() + 3600, .client_id = null });
     try store.addLease(.{ .mac = "aa:bb:cc:00:00:02", .ip = "192.168.1.11", .hostname = null, .expires = std.time.timestamp() + 3600, .client_id = null });
 
-    const ip = try server.allocateIp([6]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 }, null);
+    const ip = try server.allocateIp(&server.cfg.pools[0], [6]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 }, null);
     try std.testing.expect(ip == null);
 }
 
@@ -3347,17 +3454,17 @@ test "allocateIp: pool_end at u32 max terminates cleanly" {
     const alloc = std.testing.allocator;
     var cfg = try makeTestConfig(alloc);
     defer cfg.deinit();
-    alloc.free(cfg.pool_start);
-    alloc.free(cfg.pool_end);
-    cfg.pool_start = try alloc.dupe(u8, "255.255.255.255");
-    cfg.pool_end = try alloc.dupe(u8, "255.255.255.255");
+    alloc.free(cfg.pools[0].pool_start);
+    alloc.free(cfg.pools[0].pool_end);
+    cfg.pools[0].pool_start = try alloc.dupe(u8, "255.255.255.255");
+    cfg.pools[0].pool_end = try alloc.dupe(u8, "255.255.255.255");
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     // First call: pool not exhausted, returns the single available IP.
-    const ip1 = try server.allocateIp([6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF }, null);
+    const ip1 = try server.allocateIp(&server.cfg.pools[0], [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF }, null);
     try std.testing.expectEqual([4]u8{ 255, 255, 255, 255 }, ip1.?);
 
     // Lease that IP; pool is now exhausted.
@@ -3370,7 +3477,7 @@ test "allocateIp: pool_end at u32 max terminates cleanly" {
     });
 
     // Second call must return null without u32 wrapping to 0.
-    const ip2 = try server.allocateIp([6]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 }, null);
+    const ip2 = try server.allocateIp(&server.cfg.pools[0], [6]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 }, null);
     try std.testing.expect(ip2 == null);
 }
 
@@ -3378,17 +3485,17 @@ test "allocateIp: random mode returns an IP within pool range" {
     const alloc = std.testing.allocator;
     var cfg = try makeTestConfig(alloc);
     defer cfg.deinit();
-    alloc.free(cfg.pool_start);
-    alloc.free(cfg.pool_end);
-    cfg.pool_start = try alloc.dupe(u8, "192.168.1.10");
-    cfg.pool_end = try alloc.dupe(u8, "192.168.1.20");
+    alloc.free(cfg.pools[0].pool_start);
+    alloc.free(cfg.pools[0].pool_end);
+    cfg.pools[0].pool_start = try alloc.dupe(u8, "192.168.1.10");
+    cfg.pools[0].pool_end = try alloc.dupe(u8, "192.168.1.20");
     cfg.pool_allocation_random = true;
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
-    const ip = try server.allocateIp([6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF }, null);
+    const ip = try server.allocateIp(&server.cfg.pools[0], [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF }, null);
     try std.testing.expect(ip != null);
     const ip_int = std.mem.readInt(u32, &ip.?, .big);
     const start_int = std.mem.readInt(u32, &[4]u8{ 192, 168, 1, 10 }, .big);
@@ -3401,14 +3508,14 @@ test "allocateIp: random mode returns null when pool exhausted" {
     const alloc = std.testing.allocator;
     var cfg = try makeTestConfig(alloc);
     defer cfg.deinit();
-    alloc.free(cfg.pool_start);
-    alloc.free(cfg.pool_end);
-    cfg.pool_start = try alloc.dupe(u8, "192.168.1.10");
-    cfg.pool_end = try alloc.dupe(u8, "192.168.1.12");
+    alloc.free(cfg.pools[0].pool_start);
+    alloc.free(cfg.pools[0].pool_end);
+    cfg.pools[0].pool_start = try alloc.dupe(u8, "192.168.1.10");
+    cfg.pools[0].pool_end = try alloc.dupe(u8, "192.168.1.12");
     cfg.pool_allocation_random = true;
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     // Fill all 3 IPs (192.168.1.10, .11, .12) — router is .1 so none are skipped
@@ -3416,7 +3523,7 @@ test "allocateIp: random mode returns null when pool exhausted" {
     try store.addLease(.{ .mac = "aa:bb:cc:dd:ee:02", .ip = "192.168.1.11", .hostname = null, .expires = std.time.timestamp() + 3600, .client_id = null });
     try store.addLease(.{ .mac = "aa:bb:cc:dd:ee:03", .ip = "192.168.1.12", .hostname = null, .expires = std.time.timestamp() + 3600, .client_id = null });
 
-    const ip = try server.allocateIp([6]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }, null);
+    const ip = try server.allocateIp(&server.cfg.pools[0], [6]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }, null);
     try std.testing.expect(ip == null);
 }
 
@@ -3425,14 +3532,14 @@ test "allocateIp: random mode wraps at pool_end" {
     const alloc = std.testing.allocator;
     var cfg = try makeTestConfig(alloc);
     defer cfg.deinit();
-    alloc.free(cfg.pool_start);
-    alloc.free(cfg.pool_end);
-    cfg.pool_start = try alloc.dupe(u8, "192.168.1.50");
-    cfg.pool_end = try alloc.dupe(u8, "192.168.1.52");
+    alloc.free(cfg.pools[0].pool_start);
+    alloc.free(cfg.pools[0].pool_end);
+    cfg.pools[0].pool_start = try alloc.dupe(u8, "192.168.1.50");
+    cfg.pools[0].pool_end = try alloc.dupe(u8, "192.168.1.52");
     cfg.pool_allocation_random = true;
     const store = try makeTestStore(alloc);
     defer store.deinit();
-    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, null, &test_log_level, null);
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
     defer server.deinit();
 
     // Lease .51 and .52; the only free IP is .50
@@ -3440,7 +3547,7 @@ test "allocateIp: random mode wraps at pool_end" {
     try store.addLease(.{ .mac = "aa:bb:cc:dd:ee:52", .ip = "192.168.1.52", .hostname = null, .expires = std.time.timestamp() + 3600, .client_id = null });
 
     // Regardless of starting offset, wrapping scan must find 192.168.1.50
-    const ip = try server.allocateIp([6]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }, null);
+    const ip = try server.allocateIp(&server.cfg.pools[0], [6]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF }, null);
     try std.testing.expect(ip != null);
     try std.testing.expectEqualSlices(u8, &[4]u8{ 192, 168, 1, 50 }, &ip.?);
 }
