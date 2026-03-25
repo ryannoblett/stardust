@@ -1049,13 +1049,11 @@ pub const DHCPServer = struct {
         @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &server_ip);
         opts_len += 6;
 
-        // Option 51: IP Address Lease Time
-        if (isRequested(prl, .IPAddressLeaseTime)) {
-            opts_buf[opts_len] = @intFromEnum(OptionCode.IPAddressLeaseTime);
-            opts_buf[opts_len + 1] = 4;
-            @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &lease_time);
-            opts_len += 6;
-        }
+        // Option 51: IP Address Lease Time — MUST be included per RFC 2131 §4.3.1
+        opts_buf[opts_len] = @intFromEnum(OptionCode.IPAddressLeaseTime);
+        opts_buf[opts_len + 1] = 4;
+        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &lease_time);
+        opts_len += 6;
 
         // Option 58: Renewal Time
         if (isRequested(prl, .RenewalTimeValue)) {
@@ -1319,13 +1317,11 @@ pub const DHCPServer = struct {
         @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &server_ip);
         opts_len += 6;
 
-        // Option 51: IP Address Lease Time
-        if (isRequested(prl, .IPAddressLeaseTime)) {
-            opts_buf[opts_len] = @intFromEnum(OptionCode.IPAddressLeaseTime);
-            opts_buf[opts_len + 1] = 4;
-            @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &lease_time);
-            opts_len += 6;
-        }
+        // Option 51: IP Address Lease Time — MUST be included per RFC 2131 §4.3.1
+        opts_buf[opts_len] = @intFromEnum(OptionCode.IPAddressLeaseTime);
+        opts_buf[opts_len + 1] = 4;
+        @memcpy(opts_buf[opts_len + 2 .. opts_len + 6], &lease_time);
+        opts_len += 6;
 
         // Option 58: Renewal Time
         if (isRequested(prl, .RenewalTimeValue)) {
