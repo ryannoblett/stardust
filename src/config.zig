@@ -702,7 +702,9 @@ fn hashPoolIntoSha256(h: *std.crypto.hash.sha2.Sha256, pool: *const PoolConfig) 
     else blk: {
         const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
         var b: [4]u8 = undefined;
-        std.mem.writeInt(u32, &b, subnet_int + 1, .big);
+        // Degenerate /32 of 255.255.255.255 has no usable range; use subnet itself.
+        const start = if (subnet_int == std.math.maxInt(u32)) subnet_int else subnet_int + 1;
+        std.mem.writeInt(u32, &b, start, .big);
         break :blk b;
     };
     h.update(&pool_start_bytes);
@@ -713,7 +715,9 @@ fn hashPoolIntoSha256(h: *std.crypto.hash.sha2.Sha256, pool: *const PoolConfig) 
         const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
         const broadcast_int = subnet_int | ~pool.subnet_mask;
         var b: [4]u8 = undefined;
-        std.mem.writeInt(u32, &b, broadcast_int - 1, .big);
+        // Degenerate /32 of 0.0.0.0 has no usable range; use broadcast itself.
+        const end = if (broadcast_int == 0) broadcast_int else broadcast_int - 1;
+        std.mem.writeInt(u32, &b, end, .big);
         break :blk b;
     };
     h.update(&pool_end_bytes);
@@ -788,6 +792,9 @@ fn validatePoolRange(pool: *const PoolConfig) void {
     const subnet_bytes = parseIpv4(pool.subnet) catch return;
     const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
     const broadcast_int = subnet_int | ~pool.subnet_mask;
+    // Degenerate subnets (/32 of max address or /32 of 0.0.0.0) have no usable
+    // host range. Skip further validation rather than panicking on overflow.
+    if (subnet_int == std.math.maxInt(u32) or broadcast_int == 0) return;
     const valid_start = subnet_int + 1;
     const valid_end = broadcast_int - 1;
 
