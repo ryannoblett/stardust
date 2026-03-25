@@ -78,7 +78,9 @@ pub const StateStore = struct {
             .expires = lease.expires,
             .client_id = client_id,
             .reserved = lease.reserved,
-            .last_modified = std.time.timestamp(),
+            // Preserve the caller's last_modified if set; otherwise stamp now.
+            // Sync peers supply the original timestamp so lease hashes stay in sync.
+            .last_modified = if (lease.last_modified != 0) lease.last_modified else std.time.timestamp(),
         });
 
         store.save() catch |err| {

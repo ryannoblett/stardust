@@ -519,6 +519,7 @@ pub const SyncManager = struct {
         // Admit or update peer
         const now = std.time.timestamp();
         const peer = self.findOrAddPeer(src) catch return;
+        const was_authenticated = peer.authenticated;
         peer.authenticated = true;
         peer.last_seen = now;
 
@@ -531,9 +532,11 @@ pub const SyncManager = struct {
         // Exchange lease hashes immediately
         var lh: [32]u8 = self.computeLeaseHash();
         self.sendMsg(src, .lease_hash, &lh);
-        std.log.info("sync: peer {d}.{d}.{d}.{d} authenticated", .{
-            peerIpOctets(peer)[0], peerIpOctets(peer)[1], peerIpOctets(peer)[2], peerIpOctets(peer)[3],
-        });
+        if (!was_authenticated) {
+            std.log.info("sync: peer {d}.{d}.{d}.{d} authenticated", .{
+                peerIpOctets(peer)[0], peerIpOctets(peer)[1], peerIpOctets(peer)[2], peerIpOctets(peer)[3],
+            });
+        }
     }
 
     fn processHelloNak(self: *Self, src: std.posix.sockaddr.in, plaintext: []const u8) void {
