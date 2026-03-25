@@ -11,6 +11,9 @@ const sync_mod = @import("./src/sync.zig");
 
 pub const std_options: std.Options = .{
     .logFn = logFn,
+    // Override the compile-time filter so std.log.debug calls are compiled in
+    // across all build modes; runtime filtering is handled by g_log_level.
+    .log_level = .debug,
 };
 
 var g_log_level: std.log.Level = .info;
@@ -148,7 +151,9 @@ pub fn main() !void {
     std.log.info("State store initialized", .{});
 
     // Initialize sync manager if enabled.
+    std.log.debug("Computing pool hash...", .{});
     const pool_hash = config_mod.computePoolHash(cfg);
+    std.log.debug("Pool hash computed", .{});
     var sync_mgr: ?*sync_mod.SyncManager = null;
     if (cfg.sync) |*sync_cfg| {
         if (sync_cfg.enable) {
