@@ -1,6 +1,9 @@
 const std = @import("std");
 const state_mod = @import("./state.zig");
 const config_mod = @import("./config.zig");
+const util = @import("./util.zig");
+
+const log_v = std.log.scoped(.verbose);
 
 pub const Error = error{
     InvalidConfig,
@@ -94,6 +97,12 @@ pub const DNSUpdater = struct {
         var msg_len = try buildUpdate(&msg_buf, self.config.zone, hostname, ip, self.config.lease_time, add);
         msg_len = try signTsig(&msg_buf, msg_len, &key, self.config.key_name);
         try sendUpdate(self.config.server, msg_buf[0..msg_len]);
+        log_v.debug("DNS: {s} A+PTR {s} {f} → {s}", .{
+            if (add) "added" else "removed",
+            ip_str,
+            util.escapedStr(hostname),
+            self.config.server,
+        });
     }
 };
 
