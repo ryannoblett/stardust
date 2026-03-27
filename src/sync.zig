@@ -15,6 +15,7 @@ const std = @import("std");
 const config_mod = @import("./config.zig");
 const state_mod = @import("./state.zig");
 const dns_mod = @import("./dns.zig");
+const util = @import("./util.zig");
 
 const log_v = std.log.scoped(.verbose);
 
@@ -519,7 +520,7 @@ pub const SyncManager = struct {
 
         // Validate group name
         if (!std.mem.eql(u8, group_name, self.cfg.group_name)) {
-            std.log.warn("sync: HELLO from wrong group '{s}', sending NAK", .{group_name});
+            std.log.warn("sync: HELLO from wrong group '{f}', sending NAK", .{util.escapedStr(group_name)});
             var nak: [1]u8 = .{@intFromEnum(NakReason.wrong_group)};
             self.sendMsg(src, .hello_nak, &nak);
             return;

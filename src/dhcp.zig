@@ -4,6 +4,7 @@ const state_mod = @import("./state.zig");
 const dns_mod = @import("./dns.zig");
 const probe_mod = @import("./probe.zig");
 const sync_mod = @import("./sync.zig");
+const util = @import("./util.zig");
 
 pub const Config = config_mod.Config;
 pub const StateStore = state_mod.StateStore;
@@ -1298,9 +1299,9 @@ pub const DHCPServer = struct {
             std.log.warn("Failed to store lease ({s})", .{@errorName(err)});
         };
 
-        log_v.debug("DHCPACK {s} to {s}{s}{s} lease={d}s", .{
+        log_v.debug("DHCPACK {s} to {s}{s}{f} lease={d}s", .{
             ip_str,                                           mac_str,
-            if (effective_hostname != null) " host=" else "", effective_hostname orelse "",
+            if (effective_hostname != null) " host=" else "", util.escapedStr(effective_hostname orelse ""),
             pool.lease_time,
         });
 
