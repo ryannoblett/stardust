@@ -7,14 +7,23 @@ on:
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.zig_target }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        target:
-          - x86_64-linux-musl
-          - aarch64-linux-musl
-          - riscv64-linux-musl
+        include:
+          - zig_target: x86_64-linux-musl
+            arch_tag: x86_64
+            deb_arch: amd64
+            rpm_arch: x86_64
+          - zig_target: aarch64-linux-musl
+            arch_tag: aarch64
+            deb_arch: arm64
+            rpm_arch: aarch64
+          - zig_target: riscv64-linux-musl
+            arch_tag: riscv64
+            deb_arch: riscv64
+            rpm_arch: riscv64
 
     steps:
       - uses: actions/checkout@v4
@@ -23,24 +32,82 @@ jobs:
         with:
           version: "0.15.2"
 
-      - name: Build release binary
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
-
-      - name: Package
+      - name: Install packaging tools
         run: |
-          ARCH=$(echo "${{ matrix.target }}" | cut -d- -f1)
-          TARBALL="stardust-${ARCH}-linux.tar.gz"
-          tar -czf "$TARBALL" \
-            --transform "s|zig-out/bin/||" \
-            zig-out/bin/stardust \
-            config.yaml
+          sudo apt-get update -qq
+          sudo apt-get install -y ruby rpm
+          sudo gem install fpm --no-document
+
+      - name: Build release binary
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.zig_target }}
+
+      - name: Stage files
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+          mkdir -p stage/usr/local/bin
+          mkdir -p stage/etc/stardust
+          mkdir -p stage/lib/systemd/system
+
+          cp zig-out/bin/stardust    stage/usr/local/bin/stardust
+          cp config.yaml             stage/etc/stardust/config.yaml
+          cp packaging/stardust.service stage/lib/systemd/system/stardust.service
+
+      - name: Build tarball
+        run: |
+          TARBALL="stardust-${{ matrix.arch_tag }}-linux.tar.gz"
+          mkdir -p dist pkg
+          cp stage/usr/local/bin/stardust pkg/
+          cp stage/etc/stardust/config.yaml pkg/
+          cp packaging/stardust.service pkg/
+          tar -czf "dist/$TARBALL" -C pkg stardust config.yaml stardust.service
           echo "TARBALL=$TARBALL" >> "$GITHUB_ENV"
 
-      - name: Upload artifact
+      - name: Build .deb package
+        run: |
+          # Sanitize version: hyphens become tildes for deb pre-release ordering
+          DEB_VERSION="${VERSION//-/\~}"
+          fpm \
+            --input-type dir \
+            --output-type deb \
+            --name stardust \
+            --version "$DEB_VERSION" \
+            --architecture ${{ matrix.deb_arch }} \
+            --description "Lightweight DHCP server (RFC 2131/2132)" \
+            --url "https://github.com/${{ github.repository }}" \
+            --maintainer "Stardust contributors" \
+            --license "MIT" \
+            --package "dist/stardust_${DEB_VERSION}_${{ matrix.deb_arch }}.deb" \
+            stage/usr/local/bin/stardust=/usr/local/bin/stardust \
+            "stage/etc/stardust/config.yaml=/etc/stardust/config.yaml" \
+            "stage/lib/systemd/system/stardust.service=/lib/systemd/system/stardust.service"
+
+      - name: Build .rpm package
+        run: |
+          # Sanitize version: hyphens not allowed in RPM version field
+          RPM_VERSION="${VERSION//-/.}"
+          fpm \
+            --input-type dir \
+            --output-type rpm \
+            --name stardust \
+            --version "$RPM_VERSION" \
+            --architecture ${{ matrix.rpm_arch }} \
+            --description "Lightweight DHCP server (RFC 2131/2132)" \
+            --url "https://github.com/${{ github.repository }}" \
+            --maintainer "Stardust contributors" \
+            --license "MIT" \
+            --package "dist/stardust-${RPM_VERSION}-1.${{ matrix.rpm_arch }}.rpm" \
+            stage/usr/local/bin/stardust=/usr/local/bin/stardust \
+            "stage/etc/stardust/config.yaml=/etc/stardust/config.yaml" \
+            "stage/lib/systemd/system/stardust.service=/usr/lib/systemd/system/stardust.service"
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: stardust-${{ matrix.target }}
-          path: stardust-*-linux.tar.gz
+          name: stardust-${{ matrix.arch_tag }}
+          path: dist/
 
   release:
     name: Create release
@@ -53,9 +120,10 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
+          path: dist/
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: "*.tar.gz"
+          files: "dist/*"
           generate_release_notes: true

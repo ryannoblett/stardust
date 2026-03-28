@@ -1,0 +1,16 @@
+[Unit]
+Description=Stardust DHCP Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/stardust -c /etc/stardust/config.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
+DynamicUser=yes
+StateDirectory=stardust
+RuntimeDirectory=stardust
+
+[Install]
+WantedBy=multi-user.target
