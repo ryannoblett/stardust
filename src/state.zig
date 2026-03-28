@@ -13,6 +13,7 @@ pub const Lease = struct {
     client_id: ?[]const u8,
     reserved: bool = false,
     last_modified: i64 = 0, // unix timestamp; 0 = unknown (old JSON records)
+    local: bool = false, // true = this server issued the DHCPACK; not persisted (defaults false on load/sync)
 };
 
 pub const StateStore = struct {

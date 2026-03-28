@@ -182,6 +182,30 @@ pub const SyncManager = struct {
         std.log.info("sync: pool hash changed, re-authenticating all peers", .{});
     }
 
+    /// Returns true if at least one peer is currently authenticated.
+    pub fn hasAuthenticatedPeers(self: *Self) bool {
+        for (self.peers.items) |p| {
+            if (p.authenticated) return true;
+        }
+        return false;
+    }
+
+    /// Returns true if this server has the lowest IP address among all currently
+    /// active servers (self + authenticated peers). Used to elect a single DNS
+    /// delegate when the originating server is down: only the lowest-IP active
+    /// server handles DNS for non-local leases, preventing duplicate updates in
+    /// groups of 3+ servers.
+    pub fn isLowestActivePeer(self: *Self, my_ip: [4]u8) bool {
+        const my_int = std.mem.readInt(u32, &my_ip, .big);
+        for (self.peers.items) |*p| {
+            if (!p.authenticated) continue;
+            const octets = peerIpOctets(p);
+            const peer_int = std.mem.readInt(u32, &octets, .big);
+            if (peer_int < my_int) return false;
+        }
+        return true;
+    }
+
     /// Called each main loop iteration. Handles keepalives, retries, and periodic full-sync.
     pub fn tick(self: *Self, now: i64) void {
         // Expire timed-out peers
@@ -595,7 +619,10 @@ pub const SyncManager = struct {
             .{ .ignore_unknown_fields = true },
         ) catch return;
         defer parsed.deinit();
-        const incoming = parsed.value;
+        // Force local=false: DNS ownership never transfers via sync. The originating
+        // server retains local=true (persisted in leases.json) and handles DNS for its leases.
+        var incoming = parsed.value;
+        incoming.local = false;
 
         // Last-write-wins: only apply if incoming is newer
         if (self.store.leases.get(incoming.mac)) |existing| {

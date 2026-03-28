@@ -777,9 +777,11 @@ pub const DHCPServer = struct {
         // Notify DNS before removing so the lease strings are still valid.
         for (to_remove[0..count]) |mac| {
             if (self.store.leases.get(mac)) |lease| {
-                if (self.poolForIp(lease.ip)) |pool| {
-                    if (self.dnsUpdaterForPool(pool)) |du| {
-                        du.notifyLeaseRemoved(lease.ip, lease.hostname);
+                if (self.shouldHandleDns(lease.local)) {
+                    if (self.poolForIp(lease.ip)) |pool| {
+                        if (self.dnsUpdaterForPool(pool)) |du| {
+                            du.notifyLeaseRemoved(lease.ip, lease.hostname);
+                        }
                     }
                 }
             }
@@ -851,6 +853,15 @@ pub const DHCPServer = struct {
         const subnet_bytes = config_mod.parseIpv4(pool.subnet) catch return false;
         const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
         return (ip_int & pool.subnet_mask) == subnet_int;
+    }
+
+    /// Returns true if this server should send a DNS update for the given lease.
+    /// The originating server (local=true) always handles DNS. A standby server (local=false)
+    /// takes over DNS when the originating peer is down or sync is disabled (failover mode).
+    fn shouldHandleDns(self: *Self, lease_local: bool) bool {
+        if (lease_local) return true;
+        const s = self.sync_mgr orelse return true; // no sync = single server, always handle
+        return s.isLowestActivePeer(self.server_ip);
     }
 
     /// Returns true if the given IP string has an active probe-conflict quarantine entry.
@@ -1261,6 +1272,24 @@ pub const DHCPServer = struct {
         // Option 54: ignore requests directed at a different server.
         if (getServerIdentifier(request)) |sid| {
             if (!std.mem.eql(u8, &sid, &self.server_ip)) return null;
+        } else {
+            // No server identifier — rebinding or renewal broadcast. If the client's existing
+            // lease was originated by a peer (local=false) and that peer is still authenticated,
+            // defer so only the originating server responds. If the peer is down, fall through
+            // and take over (failover).
+            const mac_bytes_tmp = req_header.chaddr[0..6];
+            var mac_str_tmp: [17]u8 = undefined;
+            const mac_s = std.fmt.bufPrint(&mac_str_tmp, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
+                mac_bytes_tmp[0], mac_bytes_tmp[1], mac_bytes_tmp[2],
+                mac_bytes_tmp[3], mac_bytes_tmp[4], mac_bytes_tmp[5],
+            }) catch "";
+            if (self.store.leases.get(mac_s)) |existing| {
+                if (!existing.local) {
+                    if (self.sync_mgr) |s| {
+                        if (!s.isLowestActivePeer(self.server_ip)) return null;
+                    }
+                }
+            }
         }
 
         // The client's requested IP comes from option 50, or ciaddr for renewals.
@@ -1318,6 +1347,7 @@ pub const DHCPServer = struct {
             .expires = now + @as(i64, pool.lease_time),
             .client_id = client_id_hex,
             .reserved = reservation != null,
+            .local = true, // this server issued the DHCPACK
         };
         self.store.addLease(new_lease) catch |err| {
             std.log.warn("Failed to store lease ({s})", .{@errorName(err)});
@@ -1550,8 +1580,10 @@ pub const DHCPServer = struct {
         self.store.removeLease(mac_str);
         if (old_lease) |l| {
             log_v.debug("DHCPRELEASE {s} from {s}", .{ l.ip, mac_str });
-            if (self.poolForIp(l.ip)) |pool| {
-                if (self.dnsUpdaterForPool(pool)) |du| du.notifyLeaseRemoved(l.ip, l.hostname);
+            if (self.shouldHandleDns(l.local)) {
+                if (self.poolForIp(l.ip)) |pool| {
+                    if (self.dnsUpdaterForPool(pool)) |du| du.notifyLeaseRemoved(l.ip, l.hostname);
+                }
             }
         }
         // Notify sync peers: reserved leases are LEASE_UPDATE (expires=0), regular are LEASE_DELETE
