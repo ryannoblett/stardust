@@ -1,0 +1,18 @@
+#!/sbin/openrc-run
+
+description="Stardust DHCP Server"
+
+command="/usr/local/bin/stardust"
+command_args="-c /etc/stardust/config.yaml"
+command_user="root"
+pidfile="/run/${RC_SVCNAME}.pid"
+command_background="yes"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    checkpath --directory --owner root:root --mode 0755 /var/lib/stardust
+}

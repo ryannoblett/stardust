@@ -62,7 +62,8 @@ jobs:
           cp stage/usr/local/bin/stardust pkg/
           cp stage/etc/stardust/config.yaml pkg/
           cp packaging/stardust.service pkg/
-          tar -czf "dist/$TARBALL" -C pkg stardust config.yaml stardust.service
+          cp packaging/stardust.openrc pkg/
+          tar -czf "dist/$TARBALL" -C pkg stardust config.yaml stardust.service stardust.openrc
           echo "TARBALL=$TARBALL" >> "$GITHUB_ENV"
 
       - name: Build .deb package

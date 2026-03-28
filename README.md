@@ -256,12 +256,55 @@ Pre-built binaries for x86\_64, aarch64, and riscv64 are available on the
 [Releases](../../releases) page. Each archive contains the binary and an
 example `config.yaml`.
 
+## Container image
+
+Multi-arch images (x86\_64, aarch64, riscv64) are published to the GitHub
+Container Registry on every release:
+
+```bash
+docker pull ghcr.io/ryannoblett/stardust:latest
+```
+
+The image is built on `scratch` — it contains only the statically-linked
+binary. Mount your config file and a volume for lease state:
+
+```bash
+docker run -d --name stardust \
+  --network host \
+  --cap-add NET_BIND_SERVICE \
+  --cap-add NET_RAW \
+  --restart unless-stopped \
+  -v /etc/stardust/config.yaml:/etc/stardust/config.yaml:ro \
+  -v stardust-state:/var/lib/stardust \
+  ghcr.io/ryannoblett/stardust:latest
+```
+
+`--network host` is required — DHCP uses 255.255.255.255 broadcasts that
+cannot cross Docker's default bridge NAT. Set `state_dir: "/var/lib/stardust"`
+in your config to use the named volume.
+
+Config reload works the same way inside a container:
+
+```bash
+docker kill -s HUP stardust
+```
+
 ## systemd unit
+
+The unit file is included in the `.deb` and `.rpm` packages and in the release
+tarballs as `stardust.service`. To install manually:
+
+```bash
+sudo install -m 644 stardust.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now stardust
+```
 
 ```ini
 [Unit]
 Description=Stardust DHCP Server
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/stardust -c /etc/stardust/config.yaml
@@ -274,4 +317,36 @@ RuntimeDirectory=stardust
 
 [Install]
 WantedBy=multi-user.target
+```
+
+## OpenRC init script
+
+For Devuan, Alpine Linux, Gentoo, and other OpenRC-based systems. The script
+is included in the release tarballs as `stardust.openrc`.
+
+```bash
+sudo install -m 755 stardust.openrc /etc/init.d/stardust
+sudo rc-update add stardust default
+sudo rc-service stardust start
+```
+
+```sh
+#!/sbin/openrc-run
+
+description="Stardust DHCP Server"
+
+command="/usr/local/bin/stardust"
+command_args="-c /etc/stardust/config.yaml"
+command_user="root"
+pidfile="/run/${RC_SVCNAME}.pid"
+command_background="yes"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    checkpath --directory --owner root:root --mode 0755 /var/lib/stardust
+}
 ```
