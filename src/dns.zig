@@ -14,6 +14,9 @@ pub const Config = struct {
     enable: bool,
     server: []const u8,
     zone: []const u8,
+    /// Reverse zone derived from pool subnet (e.g. "111.168.192.in-addr.arpa" for 192.168.111.0/24).
+    /// Computed automatically; not user-configured.
+    rev_zone: []const u8,
     key_name: []const u8,
     key_file: []const u8,
     /// TTL applied to DNS A/PTR records; set from DHCP lease_time in config.zig.
@@ -88,13 +91,18 @@ pub const DNSUpdater = struct {
             return;
         };
 
-        var msg_buf: [1024]u8 = undefined;
-        var msg_len = try buildUpdate(&msg_buf, self.config.zone, hostname, ip, self.config.lease_time, add);
-        // Sign with TSIG if a key is configured; otherwise send as an anonymous update.
-        if (self.tsig_key) |key| {
-            msg_len = try signTsig(&msg_buf, msg_len, &key, self.config.key_name);
-        }
-        try sendUpdate(self.config.server, msg_buf[0..msg_len]);
+        // Forward UPDATE: A record → forward zone (e.g. "test.lab")
+        var fwd_buf: [1024]u8 = undefined;
+        var fwd_len = try buildForwardUpdate(&fwd_buf, self.config.zone, hostname, ip, self.config.lease_time, add);
+        if (self.tsig_key) |key| fwd_len = try signTsig(&fwd_buf, fwd_len, &key, self.config.key_name);
+        try sendUpdate(self.config.server, fwd_buf[0..fwd_len]);
+
+        // Reverse UPDATE: PTR record → reverse zone (e.g. "111.168.192.in-addr.arpa")
+        var rev_buf: [1024]u8 = undefined;
+        var rev_len = try buildReverseUpdate(&rev_buf, self.config.rev_zone, self.config.zone, hostname, ip, self.config.lease_time, add);
+        if (self.tsig_key) |key| rev_len = try signTsig(&rev_buf, rev_len, &key, self.config.key_name);
+        try sendUpdate(self.config.server, rev_buf[0..rev_len]);
+
         log_v.debug("DNS: {s} A+PTR {s} {f} → {s}", .{
             if (add) "added" else "removed",
             ip_str,
@@ -149,12 +157,13 @@ fn encodeDnsName(buf: []u8, name: []const u8) error{NameTooLong}!usize {
 }
 
 // ---------------------------------------------------------------------------
-// DNS UPDATE message builder (RFC 2136)
+// DNS UPDATE message builders (RFC 2136)
 // ---------------------------------------------------------------------------
 
-/// Build a DNS UPDATE message without TSIG additional record.
-/// Returns the number of bytes written to buf.
-fn buildUpdate(
+/// Build a forward DNS UPDATE (A record only) against the forward zone.
+/// Zone section declares `zone`; the update section contains one A record
+/// for `hostname.zone`. Returns bytes written to buf.
+fn buildForwardUpdate(
     buf: []u8,
     zone: []const u8,
     hostname: []const u8,
@@ -164,56 +173,35 @@ fn buildUpdate(
 ) error{NameTooLong}!usize {
     var pos: usize = 0;
 
-    // Random message ID
-    const id = std.crypto.random.int(u16);
-    writeU16(buf[pos..], id);
+    writeU16(buf[pos..], std.crypto.random.int(u16)); // random ID
+    pos += 2;
+    writeU16(buf[pos..], 0x2800); // Flags: OPCODE=UPDATE
+    pos += 2;
+    writeU16(buf[pos..], 1); // ZOCOUNT = 1
+    pos += 2;
+    writeU16(buf[pos..], 0); // PRCOUNT = 0
+    pos += 2;
+    writeU16(buf[pos..], 1); // UPCOUNT = 1 (A record only)
+    pos += 2;
+    writeU16(buf[pos..], 0); // ADCOUNT = 0 (TSIG appended by signTsig)
     pos += 2;
 
-    // Flags: QR=0 (query), OPCODE=5 (UPDATE)
-    writeU16(buf[pos..], 0x2800);
-    pos += 2;
-
-    // ZOCOUNT = 1
-    writeU16(buf[pos..], 1);
-    pos += 2;
-
-    // PRCOUNT = 0
-    writeU16(buf[pos..], 0);
-    pos += 2;
-
-    // UPCOUNT = 2 (A + PTR)
-    writeU16(buf[pos..], 2);
-    pos += 2;
-
-    // ADCOUNT = 0 (TSIG appended later by signTsig)
-    writeU16(buf[pos..], 0);
-    pos += 2;
-
-    // Zone section: zone name, type SOA (6), class IN (1)
+    // Zone section: forward zone, SOA, IN
     pos += try encodeDnsName(buf[pos..], zone);
     writeU16(buf[pos..], 6); // SOA
     pos += 2;
     writeU16(buf[pos..], 1); // IN
     pos += 2;
 
-    // Build fully-qualified forward name: hostname.zone
+    // Build fully-qualified forward name: hostname.zone (strip trailing dot if any)
     var fqdn_buf: [512]u8 = undefined;
     const fqdn_raw = std.fmt.bufPrint(&fqdn_buf, "{s}.{s}", .{ hostname, zone }) catch hostname;
-    // Strip trailing dot if zone already ended with one
     const fqdn = if (fqdn_raw.len > 0 and fqdn_raw[fqdn_raw.len - 1] == '.') fqdn_raw[0 .. fqdn_raw.len - 1] else fqdn_raw;
     var fwd_wire: [256]u8 = undefined;
     const fwd_wire_len = try encodeDnsName(&fwd_wire, fqdn);
 
-    // Build reverse PTR name: d.c.b.a.in-addr.arpa
-    var ptr_str_buf: [40]u8 = undefined;
-    const ptr_str = std.fmt.bufPrint(&ptr_str_buf, "{d}.{d}.{d}.{d}.in-addr.arpa", .{
-        ip[3], ip[2], ip[1], ip[0],
-    }) catch unreachable;
-    var ptr_wire: [64]u8 = undefined;
-    const ptr_wire_len = try encodeDnsName(&ptr_wire, ptr_str);
-
     if (add) {
-        // A record: hostname.zone, A, IN, TTL, 4, ip
+        // A record: hostname.zone IN A TTL ip
         @memcpy(buf[pos .. pos + fwd_wire_len], fwd_wire[0..fwd_wire_len]);
         pos += fwd_wire_len;
         writeU16(buf[pos..], 1); // A
@@ -226,8 +214,75 @@ fn buildUpdate(
         pos += 2;
         @memcpy(buf[pos .. pos + 4], &ip);
         pos += 4;
+    } else {
+        // Delete all A records for hostname.zone
+        @memcpy(buf[pos .. pos + fwd_wire_len], fwd_wire[0..fwd_wire_len]);
+        pos += fwd_wire_len;
+        writeU16(buf[pos..], 1); // A
+        pos += 2;
+        writeU16(buf[pos..], 255); // ANY
+        pos += 2;
+        writeU32(buf[pos..], 0); // TTL = 0
+        pos += 4;
+        writeU16(buf[pos..], 0); // RDLENGTH = 0
+        pos += 2;
+    }
 
-        // PTR record: ptr_name, PTR, IN, TTL, fwd_wire_len, fwd_wire
+    return pos;
+}
+
+/// Build a reverse DNS UPDATE (PTR record only) against the reverse zone.
+/// Zone section declares `rev_zone` (e.g. "111.168.192.in-addr.arpa");
+/// the update section contains one PTR record for the individual host IP.
+/// Returns bytes written to buf.
+fn buildReverseUpdate(
+    buf: []u8,
+    rev_zone: []const u8,
+    zone: []const u8,
+    hostname: []const u8,
+    ip: [4]u8,
+    lease_time: u32,
+    add: bool,
+) error{NameTooLong}!usize {
+    var pos: usize = 0;
+
+    writeU16(buf[pos..], std.crypto.random.int(u16)); // random ID
+    pos += 2;
+    writeU16(buf[pos..], 0x2800); // Flags: OPCODE=UPDATE
+    pos += 2;
+    writeU16(buf[pos..], 1); // ZOCOUNT = 1
+    pos += 2;
+    writeU16(buf[pos..], 0); // PRCOUNT = 0
+    pos += 2;
+    writeU16(buf[pos..], 1); // UPCOUNT = 1 (PTR record only)
+    pos += 2;
+    writeU16(buf[pos..], 0); // ADCOUNT = 0 (TSIG appended by signTsig)
+    pos += 2;
+
+    // Zone section: reverse zone, SOA, IN
+    pos += try encodeDnsName(buf[pos..], rev_zone);
+    writeU16(buf[pos..], 6); // SOA
+    pos += 2;
+    writeU16(buf[pos..], 1); // IN
+    pos += 2;
+
+    // Build PTR owner name: d.c.b.a.in-addr.arpa (individual host IP, reversed)
+    var ptr_str_buf: [40]u8 = undefined;
+    const ptr_str = std.fmt.bufPrint(&ptr_str_buf, "{d}.{d}.{d}.{d}.in-addr.arpa", .{
+        ip[3], ip[2], ip[1], ip[0],
+    }) catch unreachable;
+    var ptr_wire: [64]u8 = undefined;
+    const ptr_wire_len = try encodeDnsName(&ptr_wire, ptr_str);
+
+    // Build forward FQDN wire format for PTR RDATA
+    var fqdn_buf: [512]u8 = undefined;
+    const fqdn_raw = std.fmt.bufPrint(&fqdn_buf, "{s}.{s}", .{ hostname, zone }) catch hostname;
+    const fqdn = if (fqdn_raw.len > 0 and fqdn_raw[fqdn_raw.len - 1] == '.') fqdn_raw[0 .. fqdn_raw.len - 1] else fqdn_raw;
+    var fwd_wire: [256]u8 = undefined;
+    const fwd_wire_len = try encodeDnsName(&fwd_wire, fqdn);
+
+    if (add) {
+        // PTR record: d.c.b.a.in-addr.arpa IN PTR TTL hostname.zone
         @memcpy(buf[pos .. pos + ptr_wire_len], ptr_wire[0..ptr_wire_len]);
         pos += ptr_wire_len;
         writeU16(buf[pos..], 12); // PTR
@@ -241,19 +296,7 @@ fn buildUpdate(
         @memcpy(buf[pos .. pos + fwd_wire_len], fwd_wire[0..fwd_wire_len]);
         pos += fwd_wire_len;
     } else {
-        // A record delete: hostname.zone, A, ANY, 0, 0
-        @memcpy(buf[pos .. pos + fwd_wire_len], fwd_wire[0..fwd_wire_len]);
-        pos += fwd_wire_len;
-        writeU16(buf[pos..], 1); // A
-        pos += 2;
-        writeU16(buf[pos..], 255); // ANY
-        pos += 2;
-        writeU32(buf[pos..], 0); // TTL = 0
-        pos += 4;
-        writeU16(buf[pos..], 0); // RDLENGTH = 0
-        pos += 2;
-
-        // PTR record delete: ptr_name, ANY, ANY, 0, 0
+        // Delete all records for d.c.b.a.in-addr.arpa
         @memcpy(buf[pos .. pos + ptr_wire_len], ptr_wire[0..ptr_wire_len]);
         pos += ptr_wire_len;
         writeU16(buf[pos..], 255); // ANY
@@ -562,12 +605,11 @@ test "encodeDnsName: name too long for buffer returns error" {
     try std.testing.expectError(error.NameTooLong, encodeDnsName(&buf, "example.com"));
 }
 
-test "buildUpdate: add=true has correct header fields and record class" {
+test "buildForwardUpdate: add=true has correct header fields and record class" {
     var buf: [1024]u8 = undefined;
-    const n = try buildUpdate(&buf, "example.com", "host1", .{ 192, 168, 1, 50 }, 3600, true);
-    // Header is 12 bytes; zone="example.com" encodes to 13 bytes; fqdn="host1.example.com"
-    // encodes to 19 bytes; PTR name encodes to 27 bytes; with record overhead → 118 bytes.
-    try std.testing.expectEqual(@as(usize, 118), n);
+    const n = try buildForwardUpdate(&buf, "example.com", "host1", .{ 192, 168, 1, 50 }, 3600, true);
+    // Header(12) + zone "example.com"(13) + SOA+IN(4) + fqdn "host1.example.com"(19) + A+IN+TTL+RDLEN+ip(14) = 62 bytes.
+    try std.testing.expectEqual(@as(usize, 62), n);
     // FLAGS = 0x2800 (QR=0, OPCODE=UPDATE=5)
     try std.testing.expectEqual(@as(u8, 0x28), buf[2]);
     try std.testing.expectEqual(@as(u8, 0x00), buf[3]);
@@ -575,23 +617,23 @@ test "buildUpdate: add=true has correct header fields and record class" {
     try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x01 }, buf[4..6]);
     // PRCOUNT = 0
     try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00 }, buf[6..8]);
-    // UPCOUNT = 2
-    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x02 }, buf[8..10]);
+    // UPCOUNT = 1 (A record only)
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x01 }, buf[8..10]);
     // ADCOUNT = 0 (TSIG not yet appended)
     try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00 }, buf[10..12]);
-    // First UPDATE record (A): type=A(1), class=IN(1) at bytes 48..52
+    // A record: type=A(1), class=IN(1) at bytes 48..52
     try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x01 }, buf[48..50]); // A type
     try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x01 }, buf[50..52]); // IN class
 }
 
-test "buildUpdate: add=false uses CLASS=ANY and TTL=0" {
+test "buildForwardUpdate: add=false uses CLASS=ANY and TTL=0" {
     var buf: [1024]u8 = undefined;
-    const n = try buildUpdate(&buf, "example.com", "host1", .{ 192, 168, 1, 50 }, 3600, false);
-    // Same names as above but no RDATA → 95 bytes.
-    try std.testing.expectEqual(@as(usize, 95), n);
-    // UPCOUNT = 2
-    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x02 }, buf[8..10]);
-    // First UPDATE record (A delete): type=A(1), class=ANY(255) at bytes 48..52
+    const n = try buildForwardUpdate(&buf, "example.com", "host1", .{ 192, 168, 1, 50 }, 3600, false);
+    // Header(12) + zone(13) + SOA+IN(4) + fqdn(19) + A+ANY+TTL=0+RDLEN=0(10) = 58 bytes.
+    try std.testing.expectEqual(@as(usize, 58), n);
+    // UPCOUNT = 1
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x01 }, buf[8..10]);
+    // A delete record: type=A(1), class=ANY(255) at bytes 48..52
     try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x01 }, buf[48..50]); // A type
     try std.testing.expectEqualSlices(u8, &.{ 0x00, 0xFF }, buf[50..52]); // ANY class
     // TTL = 0 at bytes 52..56

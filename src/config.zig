@@ -75,6 +75,7 @@ pub const PoolConfig = struct {
         allocator.free(self.boot_filename);
         allocator.free(self.dns_update.server);
         allocator.free(self.dns_update.zone);
+        allocator.free(self.dns_update.rev_zone);
         allocator.free(self.dns_update.key_name);
         allocator.free(self.dns_update.key_file);
         var it = self.dhcp_options.iterator();
@@ -267,6 +268,7 @@ fn parseOnePool(allocator: std.mem.Allocator, pool_map: anytype) !?PoolConfig {
             .enable = false,
             .server = try allocator.dupe(u8, ""),
             .zone = try allocator.dupe(u8, ""),
+            .rev_zone = try reverseZoneForSubnet(allocator, cidr.ip, cidr.prefix_len),
             .key_name = try allocator.dupe(u8, ""),
             .key_file = try allocator.dupe(u8, ""),
             .lease_time = lease_time_val,
@@ -852,6 +854,18 @@ fn parseLogLevel(s: []const u8) LogLevel {
     return .info;
 }
 
+/// Derive the in-addr.arpa reverse zone name from a subnet.
+/// Uses classful octet boundaries: /1–8 → 1 octet, /9–16 → 2 octets, /17–32 → 3 octets.
+/// Sub-/24 delegations (RFC 2317) are not supported; they use the /24 boundary.
+fn reverseZoneForSubnet(allocator: std.mem.Allocator, ip: [4]u8, prefix_len: u8) ![]u8 {
+    return if (prefix_len <= 8)
+        std.fmt.allocPrint(allocator, "{d}.in-addr.arpa", .{ip[0]})
+    else if (prefix_len <= 16)
+        std.fmt.allocPrint(allocator, "{d}.{d}.in-addr.arpa", .{ ip[1], ip[0] })
+    else
+        std.fmt.allocPrint(allocator, "{d}.{d}.{d}.in-addr.arpa", .{ ip[2], ip[1], ip[0] });
+}
+
 /// Parse a CIDR notation string (e.g. "192.168.1.0/24") into a network address,
 /// mask, and prefix length. The host bits are masked to zero.
 pub fn parseCidr(s: []const u8) !struct { ip: [4]u8, mask: u32, prefix_len: u8 } {
@@ -1040,6 +1054,7 @@ fn makeHashTestConfig(alloc: std.mem.Allocator) Config {
             .enable = false,
             .server = alloc.dupe(u8, "") catch unreachable,
             .zone = alloc.dupe(u8, "") catch unreachable,
+            .rev_zone = alloc.dupe(u8, "") catch unreachable,
             .key_name = alloc.dupe(u8, "") catch unreachable,
             .key_file = alloc.dupe(u8, "") catch unreachable,
             .lease_time = 3600,
@@ -1210,6 +1225,7 @@ test "computePoolHash: different pool count produces different hash" {
             .enable = false,
             .server = alloc.dupe(u8, "") catch unreachable,
             .zone = alloc.dupe(u8, "") catch unreachable,
+            .rev_zone = alloc.dupe(u8, "") catch unreachable,
             .key_name = alloc.dupe(u8, "") catch unreachable,
             .key_file = alloc.dupe(u8, "") catch unreachable,
             .lease_time = 3600,
