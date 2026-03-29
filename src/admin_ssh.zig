@@ -518,6 +518,9 @@ fn runTui(
         }
 
         // Non-blocking channel read (100 ms timeout).
+        // Return values: >=0 bytes read; 0 = timeout/no data; -1 = SSH_ERROR;
+        // -2 = SSH_AGAIN (session in non-blocking mode, no data yet — treat as
+        // 0 and sleep briefly to avoid spinning).
         const n_raw = c.ssh_channel_read_timeout(
             channel,
             &read_buf[read_start],
@@ -526,16 +529,19 @@ fn runTui(
             100,
         );
 
-        if (n_raw < 0) {
-            log.debug("{s}: channel read error ({d}), closing TUI", .{ peer, n_raw });
+        if (n_raw == -1) {
+            log.debug("{s}: channel read error, closing TUI", .{peer});
             break;
         }
         if (c.ssh_channel_is_eof(channel) != 0) {
             log.debug("{s}: channel EOF, closing TUI", .{peer});
             break;
         }
+        if (n_raw == -2) { // SSH_AGAIN: returned immediately, throttle the loop
+            std.Thread.sleep(50 * std.time.ns_per_ms);
+        }
 
-        const n: usize = @intCast(n_raw);
+        const n: usize = if (n_raw > 0) @intCast(n_raw) else 0;
         const avail = read_start + n;
 
         // Feed available bytes to the vaxis parser.
