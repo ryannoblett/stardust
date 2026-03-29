@@ -82,6 +82,27 @@ pools:
 #       key_name: "dhcp-update"
 #       key_file: "dhcp-update.key"
 
+# Prometheus metrics HTTP exporter.
+# Counters are always collected in-process (used by the SSH stats page).
+# Set http_enable: true to also expose them via HTTP for Prometheus scraping.
+# metrics:
+#   collect: true            # collect in-process counters (default true)
+#   http_enable: false       # expose GET /metrics via HTTP (default false)
+#   http_port: 9167          # port to listen on (default 9167)
+#   http_bind: "127.0.0.1"  # bind address (default 127.0.0.1)
+
+# SSH admin TUI — interactive full-screen terminal interface over SSH.
+# Authenticate with an Ed25519 key listed in authorized_keys.
+# Generate a host key:  ssh-keygen -t ed25519 -f /etc/stardust/ssh_host_key -N ""
+# Add your public key:  cat ~/.ssh/id_ed25519.pub >> /etc/stardust/authorized_keys
+# admin_ssh:
+#   enable: false
+#   port: 2267                                       # default 2267 (SSH=22, DHCP=67)
+#   bind: "0.0.0.0"                                 # bind address
+#   read_only: false                                 # true = view only, all writes blocked
+#   host_key: "/etc/stardust/ssh_host_key"          # Ed25519 private key path
+#   authorized_keys: "/etc/stardust/authorized_keys" # OpenSSH authorized_keys format
+
 # Randomize IP allocation order (reduces split-brain collision risk with sync enabled).
 # false (default) = sequential from pool_start; true = random starting offset.
 # pool_allocation_random: false
