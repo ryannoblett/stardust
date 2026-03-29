@@ -415,6 +415,7 @@ fn ptyWindowChangeCb(
     const ctx: *WinCtx = @ptrCast(@alignCast(userdata.?));
     if (width > 0) ctx.pending_cols.store(@intCast(width), .release);
     if (height > 0) ctx.pending_rows.store(@intCast(height), .release);
+    log.debug("pty resize callback: {d}x{d}", .{ width, height });
     return 0;
 }
 
@@ -561,24 +562,22 @@ fn runTui(
     var read_buf: [1024]u8 = undefined;
     var read_start: usize = 0;
 
+    // Track the current terminal dimensions so partial resize events (where only
+    // one dimension changes) can be merged with the other unchanged dimension.
+    var cur_cols: u32 = init_cols;
+    var cur_rows: u32 = init_rows;
+
     var running = true;
     while (running) {
-        // Check for pending window resize.
-        const pr = winctx.pending_rows.swap(0, .acq_rel);
-        const pc = winctx.pending_cols.swap(0, .acq_rel);
-        if (pr > 0 and pc > 0) {
-            try vx.resize(allocator, io, .{
-                .rows = @intCast(pr),
-                .cols = @intCast(pc),
-                .x_pixel = 0,
-                .y_pixel = 0,
-            });
-        }
-
         // Non-blocking channel read (100 ms timeout).
         // Return values: >=0 bytes read; 0 = timeout/no data; -1 = SSH_ERROR;
         // -2 = SSH_AGAIN (session in non-blocking mode, no data yet — treat as
         // 0 and sleep briefly to avoid spinning).
+        //
+        // NOTE: the ptyWindowChangeCb callback fires from WITHIN this call when
+        // libssh processes a WINDOW_CHANGE channel request.  We therefore check
+        // for a pending resize AFTER the read so it can be applied before the
+        // frame render in the same loop iteration.
         const n_raw = c.ssh_channel_read_timeout(
             channel,
             &read_buf[read_start],
@@ -597,6 +596,35 @@ fn runTui(
         }
         if (n_raw == -2) { // SSH_AGAIN: returned immediately, throttle the loop
             std.Thread.sleep(50 * std.time.ns_per_ms);
+        }
+
+        // Apply any pending resize.  Use cur_cols/cur_rows as fallback for
+        // whichever dimension the callback didn't update (some clients send
+        // WINDOW_CHANGE with only one non-zero dimension).
+        {
+            const pr = winctx.pending_rows.swap(0, .acq_rel);
+            const pc = winctx.pending_cols.swap(0, .acq_rel);
+            const new_cols = if (pc > 0) pc else cur_cols;
+            const new_rows = if (pr > 0) pr else cur_rows;
+            if (new_cols != cur_cols or new_rows != cur_rows) {
+                log.debug("{s}: applying resize {d}x{d} → {d}x{d}", .{
+                    peer, cur_cols, cur_rows, new_cols, new_rows,
+                });
+                cur_cols = new_cols;
+                cur_rows = new_rows;
+                try vx.resize(allocator, io, .{
+                    .rows = @intCast(new_rows),
+                    .cols = @intCast(new_cols),
+                    .x_pixel = 0,
+                    .y_pixel = 0,
+                });
+                // vx.resize() sends cursor-home + erase-below + flush.
+                // Also send an explicit full-screen erase so content left
+                // outside the new viewport (e.g. after a narrowing resize) is
+                // guaranteed gone before vaxis redraws.
+                try io.writeAll("\x1b[2J");
+                try io.flush();
+            }
         }
 
         const n: usize = if (n_raw > 0) @intCast(n_raw) else 0;
