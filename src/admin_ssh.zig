@@ -499,6 +499,10 @@ fn runTui(
         .active_bg = .{ .rgb = .{ 48, 96, 192 } },
     };
 
+    // Per-frame arena: reset each iteration after win.clear(), freed on exit.
+    var frame_arena = std.heap.ArenaAllocator.init(allocator);
+    defer frame_arena.deinit();
+
     // Read buffer for SSH channel input.
     var read_buf: [1024]u8 = undefined;
     var read_start: usize = 0;
@@ -583,10 +587,17 @@ fn runTui(
         }
 
         // Render a frame and flush to the SSH channel.
+        // win.clear() drops refs to the previous frame's grapheme slices; then
+        // reset the frame arena and rebuild for this frame.  The arena must
+        // stay alive through vx.render(io) because Cell.char.grapheme is a
+        // []const u8 slice into the input string — vaxis does NOT copy it.
+        // InternalScreen.eql dereferences that pointer during render.
         const win = vx.window();
         win.clear();
-        try renderFrame(server, &state, &table_ctx, win, allocator);
-        try vx.render(io);
+        _ = frame_arena.reset(.retain_capacity);
+        const fa = frame_arena.allocator();
+        try renderFrame(server, &state, &table_ctx, win, fa);
+        try vx.render(io); // frame_arena still alive — grapheme slices valid
         try io.flush();
     }
 
@@ -617,7 +628,7 @@ fn renderFrame(
     state: *TuiState,
     table_ctx: *vaxis.widgets.Table.TableContext,
     win: vaxis.Window,
-    allocator: std.mem.Allocator,
+    fa: std.mem.Allocator,
 ) !void {
     if (win.height < 4 or win.width < 20) return; // terminal too small
 
@@ -635,12 +646,12 @@ fn renderFrame(
     });
 
     switch (state.tab) {
-        .leases => try renderLeaseTab(server, state, table_ctx, body, allocator),
-        .stats => try renderStatsTab(server, body, allocator),
+        .leases => try renderLeaseTab(server, state, table_ctx, body, fa),
+        .stats => try renderStatsTab(server, body, fa),
     }
 
     // Status bar (last row)
-    renderStatus(server, state, win.child(.{ .y_off = h -| 1, .height = 1, .width = w }));
+    try renderStatus(server, state, win.child(.{ .y_off = h -| 1, .height = 1, .width = w }), fa);
 }
 
 fn renderHeader(state: *TuiState, win: vaxis.Window) void {
@@ -681,7 +692,7 @@ fn renderHeader(state: *TuiState, win: vaxis.Window) void {
     _ = win.print(&.{.{ .text = hint, .style = hint_style }}, .{ .col_offset = col, .wrap = .none });
 }
 
-fn renderStatus(server: *AdminServer, state: *TuiState, win: vaxis.Window) void {
+fn renderStatus(server: *AdminServer, state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
     _ = state;
     const now = std.time.timestamp();
     const uptime_s = now - server.start_time;
@@ -694,13 +705,13 @@ fn renderStatus(server: *AdminServer, state: *TuiState, win: vaxis.Window) void 
     };
     win.fill(.{ .style = .{ .bg = .{ .rgb = .{ 15, 15, 15 } } } });
 
-    var buf: [128]u8 = undefined;
-    const text = std.fmt.bufPrint(&buf, " uptime {d}h{d:0>2}m  {s}", .{
+    // Allocate into the frame arena so the slice outlives this function and
+    // remains valid when vx.render() dereferences Cell.char.grapheme.
+    const text = try std.fmt.allocPrint(fa, " uptime {d}h{d:0>2}m  {s}", .{
         uptime_h,
         uptime_m,
         if (server.cfg.admin_ssh.read_only) "read-only" else "read-write",
-    }) catch return;
-
+    });
     _ = win.print(&.{.{ .text = text, .style = style }}, .{ .col_offset = 0, .wrap = .none });
 }
 
@@ -713,13 +724,13 @@ fn renderLeaseTab(
     _state: *TuiState,
     table_ctx: *vaxis.widgets.Table.TableContext,
     win: vaxis.Window,
-    allocator: std.mem.Allocator,
+    fa: std.mem.Allocator,
 ) !void {
     _ = _state;
-    // Use an arena for per-frame string allocations.
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // Use the caller-supplied frame arena (fa).  Do NOT create a local arena
+    // here: Cell.char.grapheme stores a []const u8 into our strings, so they
+    // must remain alive through the vx.render() call in the parent.
+    const a = fa;
 
     const now = std.time.timestamp();
 
@@ -783,11 +794,11 @@ fn findPoolLabel(cfg: *const config_mod.Config, ip_str: []const u8) ?[]const u8 
 fn renderStatsTab(
     server: *AdminServer,
     win: vaxis.Window,
-    allocator: std.mem.Allocator,
+    fa: std.mem.Allocator,
 ) !void {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    // Use the caller-supplied frame arena (fa) — same lifetime requirement as
+    // renderLeaseTab: grapheme slices must outlive vx.render().
+    const a = fa;
 
     const now = std.time.timestamp();
     const leases = server.store.listLeases() catch return;
