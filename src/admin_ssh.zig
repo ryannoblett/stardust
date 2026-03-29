@@ -315,7 +315,7 @@ fn runSession(server: *AdminServer, session: c.ssh_session, peer: []const u8) !v
     log.info("{s}: TUI session started", .{peer});
     defer log.info("{s}: TUI session ended", .{peer});
 
-    try runTui(server, session, channel, cols, rows);
+    try runTui(server, session, channel, cols, rows, peer);
 
     _ = c.ssh_channel_request_send_exit_status(channel, 0);
     c.ssh_channel_free(channel);
@@ -446,10 +446,17 @@ fn runTui(
     channel: c.ssh_channel,
     init_cols: u32,
     init_rows: u32,
+    peer: []const u8,
 ) !void {
     _ = session;
 
     const allocator = server.allocator;
+
+    log.debug("{s}: channel open={d} eof={d}", .{
+        peer,
+        c.ssh_channel_is_open(channel),
+        c.ssh_channel_is_eof(channel),
+    });
 
     // Set up SSH channel callbacks so resize events update our WinCtx.
     var winctx: WinCtx = .{};
@@ -470,8 +477,12 @@ fn runTui(
     var vx = try vaxis.init(allocator, .{});
     defer vx.deinit(allocator, io);
 
-    // Enter alt-screen and set initial size.
+    // Enter alt-screen and set initial size; flush immediately so the client
+    // receives the sequences before the first read (SSH channel write is
+    // buffered through the adapter — explicit flush is required after each
+    // logical output operation).
     try vx.enterAltScreen(io);
+    try io.flush();
     try vx.resize(allocator, io, .{
         .rows = @intCast(init_rows),
         .cols = @intCast(init_cols),
@@ -479,6 +490,7 @@ fn runTui(
         .y_pixel = 0,
     });
     try vx.setMouseMode(io, true);
+    try io.flush();
 
     var parser: vaxis.Parser = .{};
     var state: TuiState = .{};
@@ -514,7 +526,14 @@ fn runTui(
             100,
         );
 
-        if (n_raw < 0 or c.ssh_channel_is_eof(channel) != 0) break;
+        if (n_raw < 0) {
+            log.debug("{s}: channel read error ({d}), closing TUI", .{ peer, n_raw });
+            break;
+        }
+        if (c.ssh_channel_is_eof(channel) != 0) {
+            log.debug("{s}: channel EOF, closing TUI", .{peer});
+            break;
+        }
 
         const n: usize = @intCast(n_raw);
         const avail = read_start + n;
@@ -557,14 +576,16 @@ fn runTui(
             }
         }
 
-        // Render a frame.
+        // Render a frame and flush to the SSH channel.
         const win = vx.window();
         win.clear();
         try renderFrame(server, &state, &table_ctx, win, allocator);
         try vx.render(io);
+        try io.flush();
     }
 
     try vx.exitAltScreen(io);
+    try io.flush();
 }
 
 fn handleLeaseKey(state: *TuiState, ctx: *vaxis.widgets.Table.TableContext, key: vaxis.Key) void {
