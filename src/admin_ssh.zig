@@ -503,9 +503,14 @@ fn runTui(
     init_rows: u32,
     peer: []const u8,
 ) !void {
-    _ = session;
-
     const allocator = server.allocator;
+
+    // ssh_event_dopoll is the only libssh mechanism that reliably dispatches
+    // channel request callbacks (including SSH_CHANNEL_REQUEST_WINDOW_CHANGE).
+    // ssh_channel_read_timeout does NOT fire them.
+    const ssh_ev = c.ssh_event_new() orelse return error.SshEventFailed;
+    defer c.ssh_event_free(ssh_ev);
+    if (c.ssh_event_add_session(ssh_ev, session) != 0) return error.SshEventFailed;
 
     log.debug("{s}: channel open={d} eof={d}", .{
         peer,
@@ -569,33 +574,33 @@ fn runTui(
 
     var running = true;
     while (running) {
-        // Non-blocking channel read (100 ms timeout).
-        // Return values: >=0 bytes read; 0 = timeout/no data; -1 = SSH_ERROR;
-        // -2 = SSH_AGAIN (session in non-blocking mode, no data yet — treat as
-        // 0 and sleep briefly to avoid spinning).
-        //
-        // NOTE: the ptyWindowChangeCb callback fires from WITHIN this call when
-        // libssh processes a WINDOW_CHANGE channel request.  We therefore check
-        // for a pending resize AFTER the read so it can be applied before the
-        // frame render in the same loop iteration.
-        const n_raw = c.ssh_channel_read_timeout(
-            channel,
-            &read_buf[read_start],
-            @intCast(read_buf.len - read_start),
-            0,
-            100,
-        );
-
-        if (n_raw == -1) {
-            log.debug("{s}: channel read error, closing TUI", .{peer});
+        // Poll for all SSH events with a 100 ms timeout.
+        // ssh_event_dopoll dispatches ALL channel callbacks (including
+        // SSH_CHANNEL_REQUEST_WINDOW_CHANGE → ptyWindowChangeCb) which
+        // ssh_channel_read_timeout does NOT do.
+        // Returns SSH_OK (0) or SSH_ERROR (-1).
+        const poll_rc = c.ssh_event_dopoll(ssh_ev, 100);
+        if (poll_rc < 0 and c.ssh_channel_is_open(channel) == 0) {
+            log.debug("{s}: session error during poll, closing TUI", .{peer});
             break;
         }
+
         if (c.ssh_channel_is_eof(channel) != 0) {
             log.debug("{s}: channel EOF, closing TUI", .{peer});
             break;
         }
-        if (n_raw == -2) { // SSH_AGAIN: returned immediately, throttle the loop
-            std.Thread.sleep(50 * std.time.ns_per_ms);
+
+        // Read any channel data buffered by dopoll (non-blocking — returns
+        // immediately with 0 if nothing available).
+        const n_raw = c.ssh_channel_read_nonblocking(
+            channel,
+            &read_buf[read_start],
+            @intCast(read_buf.len - read_start),
+            0,
+        );
+        if (n_raw < 0) {
+            log.debug("{s}: channel read error, closing TUI", .{peer});
+            break;
         }
 
         // Apply any pending resize.  Use cur_cols/cur_rows as fallback for
