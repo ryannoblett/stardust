@@ -31,7 +31,12 @@ pub fn build(b: *std.Build) void {
         .name = "stardust",
         .root_module = main_mod,
     });
-    exe.linkSystemLibrary("ssh");
+    // Prefer static libssh for the production binary (scratch Docker image has no .so).
+    // Falls back to dynamic if libssh.a is not found on the host.
+    // On Arch: no libssh.a by default — build from source or use AUR.
+    // On Alpine: apk add libssh-static provides libssh.a (used in CI).
+    // On Ubuntu/Debian: libssh-dev includes libssh.a.
+    exe.linkSystemLibrary2("ssh", .{ .preferred_link_mode = .static });
     exe.linkLibC();
     b.installArtifact(exe);
     const run_cmd = b.addRunArtifact(exe);
