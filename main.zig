@@ -5,6 +5,7 @@ const state_mod = @import("./src/state.zig");
 const dns = @import("./src/dns.zig");
 const sync_mod = @import("./src/sync.zig");
 const metrics_mod = @import("./src/metrics.zig");
+const admin_mod = @import("./src/admin_ssh.zig");
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -228,6 +229,36 @@ pub fn main() !void {
         std.log.info("Metrics HTTP server enabled on {s}:{d}", .{
             cfg.metrics.http_bind,
             cfg.metrics.http_port,
+        });
+    }
+
+    // Start SSH admin TUI server in a background thread if enabled.
+    var admin_server: ?*admin_mod.AdminServer = null;
+    var admin_thread: ?std.Thread = null;
+    if (cfg.admin_ssh.enable) {
+        admin_server = admin_mod.AdminServer.init(allocator, cfg, store, &dhcp_server.counters) catch |err| blk: {
+            std.log.err("Failed to initialize admin SSH server ({s}); running without admin TUI", .{@errorName(err)});
+            break :blk null;
+        };
+        if (admin_server) |as| {
+            admin_thread = std.Thread.spawn(.{}, admin_mod.AdminServer.run, .{as}) catch |err| blk: {
+                std.log.err("Failed to start admin SSH thread ({s}); running without admin TUI", .{@errorName(err)});
+                break :blk null;
+            };
+        }
+    }
+    defer {
+        if (admin_server) |as| {
+            as.stop();
+            if (admin_thread) |t| t.join();
+            as.deinit();
+        }
+    }
+
+    if (cfg.admin_ssh.enable and admin_server != null) {
+        std.log.info("Admin SSH server enabled on {s}:{d}", .{
+            cfg.admin_ssh.bind,
+            cfg.admin_ssh.port,
         });
     }
 

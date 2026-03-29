@@ -6,6 +6,10 @@
             .url = "https://github.com/kubkon/zig-yaml/archive/refs/tags/0.2.0.tar.gz",
             .hash = "zig_yaml-0.2.0-C1161pmrAgC_rL9WzjvgNg7HnmyAMwHsG3Sre0F4haPI",
         },
+        .vaxis = .{
+            .url = "git+https://github.com/rockorager/libvaxis#3d37f043a161fd32897ad44a2dddbfaab75faa8a",
+            .hash = "vaxis-0.5.1-BWNV_JJOCQAtdJyLvrYCKbKIhX9q3liQkKMAzujWS4HJ",
+        },
     },
     .paths = .{""},
     .fingerprint = 0xaa64878d2aabb77a,
