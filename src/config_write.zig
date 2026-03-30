@@ -290,6 +290,30 @@ fn parseIpv4Local(s: []const u8) ![4]u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Pool-level mutations (used by SSH TUI pool config tab)
+// ---------------------------------------------------------------------------
+
+/// Append a new pool to the Config's pools slice.
+/// The caller must have allocated all strings in `pool` with `allocator`.
+pub fn addPool(allocator: std.mem.Allocator, cfg: *config_mod.Config, pool: config_mod.PoolConfig) !void {
+    const new_len = cfg.pools.len + 1;
+    const new_pools = try allocator.realloc(cfg.pools, new_len);
+    cfg.pools = new_pools;
+    cfg.pools[new_len - 1] = pool;
+}
+
+/// Remove a pool by index. Calls deinit on the pool and shrinks the slice.
+pub fn removePool(allocator: std.mem.Allocator, cfg: *config_mod.Config, index: usize) void {
+    if (index >= cfg.pools.len) return;
+    cfg.pools[index].deinit(allocator);
+    // Shift remaining elements down.
+    for (index + 1..cfg.pools.len) |j| {
+        cfg.pools[j - 1] = cfg.pools[j];
+    }
+    cfg.pools = allocator.realloc(cfg.pools, cfg.pools.len - 1) catch cfg.pools[0 .. cfg.pools.len - 1];
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -518,4 +542,149 @@ test "removeReservation removes by MAC" {
     const removed = removeReservation(allocator, &pool, "aa:bb:cc:dd:ee:ff");
     try std.testing.expect(removed == true);
     try std.testing.expectEqual(@as(usize, 0), pool.reservations.len);
+}
+
+test "addPool appends to pools slice" {
+    const allocator = std.testing.allocator;
+
+    const pools = try allocator.alloc(config_mod.PoolConfig, 0);
+    var cfg = config_mod.Config{
+        .allocator = allocator,
+        .listen_address = try allocator.dupe(u8, "0.0.0.0"),
+        .state_dir = try allocator.dupe(u8, "/tmp"),
+        .log_level = .info,
+        .pool_allocation_random = false,
+        .sync = null,
+        .pools = pools,
+        .admin_ssh = .{
+            .enable = false,
+            .port = 2267,
+            .bind = try allocator.dupe(u8, "0.0.0.0"),
+            .read_only = false,
+            .host_key = try allocator.dupe(u8, ""),
+            .authorized_keys = try allocator.dupe(u8, ""),
+        },
+        .metrics = .{
+            .collect = false,
+            .http_enable = false,
+            .http_port = 9167,
+            .http_bind = try allocator.dupe(u8, "127.0.0.1"),
+        },
+    };
+    defer cfg.deinit();
+
+    const new_pool = config_mod.PoolConfig{
+        .subnet = try allocator.dupe(u8, "10.0.0.0"),
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = try allocator.dupe(u8, "10.0.0.1"),
+        .pool_start = try allocator.dupe(u8, "10.0.0.100"),
+        .pool_end = try allocator.dupe(u8, "10.0.0.200"),
+        .dns_servers = try allocator.alloc([]const u8, 0),
+        .domain_name = try allocator.dupe(u8, ""),
+        .domain_search = try allocator.alloc([]const u8, 0),
+        .lease_time = 7200,
+        .time_offset = null,
+        .time_servers = try allocator.alloc([]const u8, 0),
+        .log_servers = try allocator.alloc([]const u8, 0),
+        .ntp_servers = try allocator.alloc([]const u8, 0),
+        .tftp_server_name = try allocator.dupe(u8, ""),
+        .boot_filename = try allocator.dupe(u8, ""),
+        .http_boot_url = try allocator.dupe(u8, ""),
+        .dns_update = .{ .enable = false, .server = try allocator.dupe(u8, ""), .zone = try allocator.dupe(u8, ""), .rev_zone = try allocator.dupe(u8, ""), .key_name = try allocator.dupe(u8, ""), .key_file = try allocator.dupe(u8, ""), .lease_time = 7200 },
+        .dhcp_options = std.StringHashMap([]const u8).init(allocator),
+        .reservations = try allocator.alloc(config_mod.Reservation, 0),
+        .static_routes = try allocator.alloc(config_mod.StaticRoute, 0),
+    };
+
+    try addPool(allocator, &cfg, new_pool);
+    try std.testing.expectEqual(@as(usize, 1), cfg.pools.len);
+    try std.testing.expectEqualStrings("10.0.0.0", cfg.pools[0].subnet);
+    try std.testing.expectEqual(@as(u32, 7200), cfg.pools[0].lease_time);
+}
+
+test "removePool removes by index and frees resources" {
+    const allocator = std.testing.allocator;
+
+    const pool0 = config_mod.PoolConfig{
+        .subnet = try allocator.dupe(u8, "10.0.0.0"),
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = try allocator.dupe(u8, "10.0.0.1"),
+        .pool_start = try allocator.dupe(u8, ""),
+        .pool_end = try allocator.dupe(u8, ""),
+        .dns_servers = try allocator.alloc([]const u8, 0),
+        .domain_name = try allocator.dupe(u8, ""),
+        .domain_search = try allocator.alloc([]const u8, 0),
+        .lease_time = 3600,
+        .time_offset = null,
+        .time_servers = try allocator.alloc([]const u8, 0),
+        .log_servers = try allocator.alloc([]const u8, 0),
+        .ntp_servers = try allocator.alloc([]const u8, 0),
+        .tftp_server_name = try allocator.dupe(u8, ""),
+        .boot_filename = try allocator.dupe(u8, ""),
+        .http_boot_url = try allocator.dupe(u8, ""),
+        .dns_update = .{ .enable = false, .server = try allocator.dupe(u8, ""), .zone = try allocator.dupe(u8, ""), .rev_zone = try allocator.dupe(u8, ""), .key_name = try allocator.dupe(u8, ""), .key_file = try allocator.dupe(u8, ""), .lease_time = 3600 },
+        .dhcp_options = std.StringHashMap([]const u8).init(allocator),
+        .reservations = try allocator.alloc(config_mod.Reservation, 0),
+        .static_routes = try allocator.alloc(config_mod.StaticRoute, 0),
+    };
+
+    const pool1 = config_mod.PoolConfig{
+        .subnet = try allocator.dupe(u8, "172.16.0.0"),
+        .subnet_mask = 0xFFFF0000,
+        .prefix_len = 16,
+        .router = try allocator.dupe(u8, "172.16.0.1"),
+        .pool_start = try allocator.dupe(u8, ""),
+        .pool_end = try allocator.dupe(u8, ""),
+        .dns_servers = try allocator.alloc([]const u8, 0),
+        .domain_name = try allocator.dupe(u8, ""),
+        .domain_search = try allocator.alloc([]const u8, 0),
+        .lease_time = 1800,
+        .time_offset = null,
+        .time_servers = try allocator.alloc([]const u8, 0),
+        .log_servers = try allocator.alloc([]const u8, 0),
+        .ntp_servers = try allocator.alloc([]const u8, 0),
+        .tftp_server_name = try allocator.dupe(u8, ""),
+        .boot_filename = try allocator.dupe(u8, ""),
+        .http_boot_url = try allocator.dupe(u8, ""),
+        .dns_update = .{ .enable = false, .server = try allocator.dupe(u8, ""), .zone = try allocator.dupe(u8, ""), .rev_zone = try allocator.dupe(u8, ""), .key_name = try allocator.dupe(u8, ""), .key_file = try allocator.dupe(u8, ""), .lease_time = 1800 },
+        .dhcp_options = std.StringHashMap([]const u8).init(allocator),
+        .reservations = try allocator.alloc(config_mod.Reservation, 0),
+        .static_routes = try allocator.alloc(config_mod.StaticRoute, 0),
+    };
+
+    var pools_arr = [_]config_mod.PoolConfig{ pool0, pool1 };
+    const pools = try allocator.dupe(config_mod.PoolConfig, &pools_arr);
+
+    var cfg = config_mod.Config{
+        .allocator = allocator,
+        .listen_address = try allocator.dupe(u8, "0.0.0.0"),
+        .state_dir = try allocator.dupe(u8, "/tmp"),
+        .log_level = .info,
+        .pool_allocation_random = false,
+        .sync = null,
+        .pools = pools,
+        .admin_ssh = .{
+            .enable = false,
+            .port = 2267,
+            .bind = try allocator.dupe(u8, "0.0.0.0"),
+            .read_only = false,
+            .host_key = try allocator.dupe(u8, ""),
+            .authorized_keys = try allocator.dupe(u8, ""),
+        },
+        .metrics = .{
+            .collect = false,
+            .http_enable = false,
+            .http_port = 9167,
+            .http_bind = try allocator.dupe(u8, "127.0.0.1"),
+        },
+    };
+    defer cfg.deinit();
+
+    // Remove pool 0 (10.0.0.0/24) — pool 1 (172.16.0.0/16) should remain
+    removePool(allocator, &cfg, 0);
+    try std.testing.expectEqual(@as(usize, 1), cfg.pools.len);
+    try std.testing.expectEqualStrings("172.16.0.0", cfg.pools[0].subnet);
+    try std.testing.expectEqual(@as(u32, 1800), cfg.pools[0].lease_time);
 }

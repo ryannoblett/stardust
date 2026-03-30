@@ -60,15 +60,63 @@ fn logFn(
         .warn => "WARN",
         .err => "ERROR",
     };
+    // Format into a buffer so we can detect binary data before it hits stderr.
+    var msg_buf: [4096]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, format, args) catch "(message too long)";
+
     g_log_mutex.lock();
     defer g_log_mutex.unlock();
 
+    if (hasBinaryData(msg)) {
+        // Escape the comptime format string so {s}/{d}/etc. print literally.
+        const safe_fmt = comptime escapeFmtBraces(format);
+        const scope_tag = @tagName(scope);
+        if (g_journal_stream) {
+            std.debug.print(sd_prefix ++ "[" ++ level_str ++ "] <binary data, {d} bytes, scope={s}, fmt=\"" ++ safe_fmt ++ "\">\n", .{ msg.len, scope_tag });
+        } else {
+            var ts_buf: [20]u8 = undefined;
+            const ts = fmtTimestamp(&ts_buf, std.time.timestamp());
+            std.debug.print("{s} [" ++ level_str ++ "] <binary data, {d} bytes, scope={s}, fmt=\"" ++ safe_fmt ++ "\">\n", .{ ts, msg.len, scope_tag });
+        }
+        return;
+    }
+
     if (g_journal_stream) {
-        std.debug.print(sd_prefix ++ "[" ++ level_str ++ "] " ++ format ++ "\n", args);
+        std.debug.print(sd_prefix ++ "[" ++ level_str ++ "] {s}\n", .{msg});
     } else {
         var ts_buf: [20]u8 = undefined;
         const ts = fmtTimestamp(&ts_buf, std.time.timestamp());
-        std.debug.print("{s} [" ++ level_str ++ "] " ++ format ++ "\n", .{ts} ++ args);
+        std.debug.print("{s} [" ++ level_str ++ "] {s}\n", .{ ts, msg });
+    }
+}
+
+/// True if any byte is a non-printable control character (excludes \n, \r, \t and UTF-8 high bytes).
+fn hasBinaryData(s: []const u8) bool {
+    for (s) |b| {
+        if (b < 0x20 and b != '\n' and b != '\r' and b != '\t') return true;
+        if (b == 0x7f) return true;
+    }
+    return false;
+}
+
+/// Comptime: double every { and } so the format string prints literally via std.fmt.
+fn escapeFmtBraces(comptime s: []const u8) []const u8 {
+    comptime {
+        var len: usize = 0;
+        for (s) |ch| len += if (ch == '{' or ch == '}') @as(usize, 2) else 1;
+        var buf: [len]u8 = undefined;
+        var i: usize = 0;
+        for (s) |ch| {
+            if (ch == '{' or ch == '}') {
+                buf[i] = ch;
+                buf[i + 1] = ch;
+                i += 2;
+            } else {
+                buf[i] = ch;
+                i += 1;
+            }
+        }
+        return &buf;
     }
 }
 
