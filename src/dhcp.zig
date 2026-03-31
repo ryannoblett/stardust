@@ -1399,7 +1399,8 @@ pub const DHCPServer = struct {
         }
 
         // Option 4: Time Servers (RFC 868)
-        appendIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, pool.time_servers);
+        // Option 4: use explicit time_servers if configured, otherwise mirror ntp_servers.
+        appendIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, if (pool.time_servers.len > 0) pool.time_servers else pool.ntp_servers);
 
         // Option 7: Log Servers
         appendIpListOpt(&opts_buf, &opts_len, prl, .LogServer, pool.log_servers);
@@ -1714,7 +1715,8 @@ pub const DHCPServer = struct {
         }
 
         // Option 4: Time Servers (RFC 868)
-        appendIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, pool.time_servers);
+        // Option 4: use explicit time_servers if configured, otherwise mirror ntp_servers.
+        appendIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, if (pool.time_servers.len > 0) pool.time_servers else pool.ntp_servers);
 
         // Option 7: Log Servers
         appendIpListOpt(&opts_buf, &opts_len, prl, .LogServer, pool.log_servers);
@@ -2145,7 +2147,8 @@ pub const DHCPServer = struct {
         }
 
         // Option 4: Time Servers (RFC 868)
-        appendIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, pool.time_servers);
+        // Option 4: use explicit time_servers if configured, otherwise mirror ntp_servers.
+        appendIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, if (pool.time_servers.len > 0) pool.time_servers else pool.ntp_servers);
 
         // Option 7: Log Servers
         appendIpListOpt(&opts_buf, &opts_len, prl, .LogServer, pool.log_servers);

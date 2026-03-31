@@ -585,7 +585,7 @@ const PoolForm = struct {
     err_buf: [120]u8 = [_]u8{0} ** 120,
     err_len: usize = 0,
 
-    const FIELD_COUNT: u8 = 22; // 0..21 (20=Static Routes, 21=DHCP Options)
+    const FIELD_COUNT: u8 = 21; // 0..20 (19=Static Routes, 20=DHCP Options)
     const VISIBLE_ROWS: u8 = 12;
 
     fn isNew(self: *const PoolForm) bool {
@@ -2406,8 +2406,7 @@ const pool_field_meta = [_]PoolFieldMeta{
     .{ .label = "DNS Servers", .section = "DNS" },
     .{ .label = "Lease Time", .section = "Timing" },
     .{ .label = "Time Offset" },
-    .{ .label = "Time Servers", .section = "Servers" },
-    .{ .label = "Log Servers" },
+    .{ .label = "Log Servers", .section = "Servers" },
     .{ .label = "NTP Servers" },
     .{ .label = "TFTP Server", .section = "Boot" },
     .{ .label = "Boot Filename" },
@@ -2433,19 +2432,18 @@ fn poolFormFieldVal(form: *const PoolForm, idx: u8) []const u8 {
         6 => form.dns_servers_buf[0..form.dns_servers_len],
         7 => form.lease_time_buf[0..form.lease_time_len],
         8 => form.time_offset_buf[0..form.time_offset_len],
-        9 => form.time_servers_buf[0..form.time_servers_len],
-        10 => form.log_servers_buf[0..form.log_servers_len],
-        11 => form.ntp_servers_buf[0..form.ntp_servers_len],
-        12 => form.tftp_server_buf[0..form.tftp_server_len],
-        13 => form.boot_filename_buf[0..form.boot_filename_len],
-        14 => form.http_boot_url_buf[0..form.http_boot_url_len],
-        15 => if (form.dns_update_enable) "yes" else "no",
-        16 => form.dns_update_server_buf[0..form.dns_update_server_len],
-        17 => form.dns_update_zone_buf[0..form.dns_update_zone_len],
-        18 => form.dns_update_key_name_buf[0..form.dns_update_key_name_len],
-        19 => form.dns_update_key_file_buf[0..form.dns_update_key_file_len],
+        9 => form.log_servers_buf[0..form.log_servers_len],
+        10 => form.ntp_servers_buf[0..form.ntp_servers_len],
+        11 => form.tftp_server_buf[0..form.tftp_server_len],
+        12 => form.boot_filename_buf[0..form.boot_filename_len],
+        13 => form.http_boot_url_buf[0..form.http_boot_url_len],
+        14 => if (form.dns_update_enable) "yes" else "no",
+        15 => form.dns_update_server_buf[0..form.dns_update_server_len],
+        16 => form.dns_update_zone_buf[0..form.dns_update_zone_len],
+        17 => form.dns_update_key_name_buf[0..form.dns_update_key_name_len],
+        18 => form.dns_update_key_file_buf[0..form.dns_update_key_file_len],
+        19 => "(Enter to edit)",
         20 => "(Enter to edit)",
-        21 => "(Enter to edit)",
         else => "",
     };
 }
@@ -2462,17 +2460,16 @@ fn poolFormFieldBuf(form: *PoolForm, idx: u8) ?struct { buf: []u8, len: *usize }
         6 => .{ .buf = &form.dns_servers_buf, .len = &form.dns_servers_len },
         7 => .{ .buf = &form.lease_time_buf, .len = &form.lease_time_len },
         8 => .{ .buf = &form.time_offset_buf, .len = &form.time_offset_len },
-        9 => .{ .buf = &form.time_servers_buf, .len = &form.time_servers_len },
-        10 => .{ .buf = &form.log_servers_buf, .len = &form.log_servers_len },
-        11 => .{ .buf = &form.ntp_servers_buf, .len = &form.ntp_servers_len },
-        12 => .{ .buf = &form.tftp_server_buf, .len = &form.tftp_server_len },
-        13 => .{ .buf = &form.boot_filename_buf, .len = &form.boot_filename_len },
-        14 => .{ .buf = &form.http_boot_url_buf, .len = &form.http_boot_url_len },
-        // 15 = boolean toggle, not a text buffer
-        16 => .{ .buf = &form.dns_update_server_buf, .len = &form.dns_update_server_len },
-        17 => .{ .buf = &form.dns_update_zone_buf, .len = &form.dns_update_zone_len },
-        18 => .{ .buf = &form.dns_update_key_name_buf, .len = &form.dns_update_key_name_len },
-        19 => .{ .buf = &form.dns_update_key_file_buf, .len = &form.dns_update_key_file_len },
+        9 => .{ .buf = &form.log_servers_buf, .len = &form.log_servers_len },
+        10 => .{ .buf = &form.ntp_servers_buf, .len = &form.ntp_servers_len },
+        11 => .{ .buf = &form.tftp_server_buf, .len = &form.tftp_server_len },
+        12 => .{ .buf = &form.boot_filename_buf, .len = &form.boot_filename_len },
+        13 => .{ .buf = &form.http_boot_url_buf, .len = &form.http_boot_url_len },
+        // 14 = boolean toggle, not a text buffer
+        15 => .{ .buf = &form.dns_update_server_buf, .len = &form.dns_update_server_len },
+        16 => .{ .buf = &form.dns_update_zone_buf, .len = &form.dns_update_zone_len },
+        17 => .{ .buf = &form.dns_update_key_name_buf, .len = &form.dns_update_key_name_len },
+        18 => .{ .buf = &form.dns_update_key_file_buf, .len = &form.dns_update_key_file_len },
         else => null,
     };
 }
@@ -2913,17 +2910,16 @@ fn renderPoolDetail(server: *AdminServer, state: *TuiState, win: vaxis.Window, f
             } else "\xe2\x80\x94",
             7 => std.fmt.allocPrint(fa, "{d}", .{pool.lease_time}) catch "?",
             8 => if (pool.time_offset) |off| std.fmt.allocPrint(fa, "{d}", .{off}) catch "?" else "\xe2\x80\x94",
-            9 => if (pool.time_servers.len > 0) (std.mem.join(fa, ", ", pool.time_servers) catch "\xe2\x80\x94") else "\xe2\x80\x94",
-            10 => if (pool.log_servers.len > 0) (std.mem.join(fa, ", ", pool.log_servers) catch "\xe2\x80\x94") else "\xe2\x80\x94",
-            11 => if (pool.ntp_servers.len > 0) (std.mem.join(fa, ", ", pool.ntp_servers) catch "\xe2\x80\x94") else "\xe2\x80\x94",
-            12 => if (pool.tftp_server_name.len > 0) pool.tftp_server_name else "\xe2\x80\x94",
-            13 => if (pool.boot_filename.len > 0) pool.boot_filename else "\xe2\x80\x94",
-            14 => if (pool.http_boot_url.len > 0) pool.http_boot_url else "\xe2\x80\x94",
-            15 => if (pool.dns_update.enable) "yes" else "no",
-            16 => if (pool.dns_update.server.len > 0) pool.dns_update.server else "\xe2\x80\x94",
-            17 => if (pool.dns_update.zone.len > 0) pool.dns_update.zone else "\xe2\x80\x94",
-            18 => if (pool.dns_update.key_name.len > 0) pool.dns_update.key_name else "\xe2\x80\x94",
-            19 => if (pool.dns_update.key_file.len > 0) pool.dns_update.key_file else "\xe2\x80\x94",
+            9 => if (pool.log_servers.len > 0) (std.mem.join(fa, ", ", pool.log_servers) catch "\xe2\x80\x94") else "\xe2\x80\x94",
+            10 => if (pool.ntp_servers.len > 0) (std.mem.join(fa, ", ", pool.ntp_servers) catch "\xe2\x80\x94") else "\xe2\x80\x94",
+            11 => if (pool.tftp_server_name.len > 0) pool.tftp_server_name else "\xe2\x80\x94",
+            12 => if (pool.boot_filename.len > 0) pool.boot_filename else "\xe2\x80\x94",
+            13 => if (pool.http_boot_url.len > 0) pool.http_boot_url else "\xe2\x80\x94",
+            14 => if (pool.dns_update.enable) "yes" else "no",
+            15 => if (pool.dns_update.server.len > 0) pool.dns_update.server else "\xe2\x80\x94",
+            16 => if (pool.dns_update.zone.len > 0) pool.dns_update.zone else "\xe2\x80\x94",
+            17 => if (pool.dns_update.key_name.len > 0) pool.dns_update.key_name else "\xe2\x80\x94",
+            18 => if (pool.dns_update.key_file.len > 0) pool.dns_update.key_file else "\xe2\x80\x94",
             else => "\xe2\x80\x94",
         };
         const line = std.fmt.allocPrint(fa, "  {s:<18} {s}", .{ meta.label, val }) catch "";
@@ -3167,7 +3163,7 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
         const fw = @as(usize, FIELD_W);
         var vis_start: usize = 0;
         var cursor_vis: usize = 0;
-        if (is_active and fi != 15) {
+        if (is_active and fi != 14) {
             const cur = @min(form.cursor, val.len);
             if (cur >= fw) {
                 vis_start = cur - fw + 1;
@@ -3181,7 +3177,7 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
         _ = box.print(&.{.{ .text = padded, .style = style }}, .{ .col_offset = LABEL_W + 1, .row_offset = row, .wrap = .none });
 
         // Cursor block: show character under cursor with inverted colors.
-        if (is_active and fi != 15) {
+        if (is_active and fi != 14) {
             const cursor_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 20, 20, 30 } }, .bg = .{ .rgb = .{ 100, 160, 255 } } };
             const cursor_col = LABEL_W + 1 + @as(u16, @intCast(cursor_vis));
             if (cursor_col < BOX_W -| 1) {
@@ -3217,13 +3213,13 @@ fn handlePoolFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
     }
     if (key.matches(vaxis.Key.enter, .{})) {
         // Fields 20/21 open sub-modals instead of saving.
-        if (form.active_field == 20) {
+        if (form.active_field == 19) {
             state.sub_list_row = 0;
             state.sub_modal_parent = .pool_form;
             state.mode = .route_list;
             return;
         }
-        if (form.active_field == 21) {
+        if (form.active_field == 20) {
             state.sub_list_row = 0;
             state.sub_modal_parent = .pool_form;
             state.mode = .option_list;
@@ -3256,7 +3252,7 @@ fn handlePoolFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
     }
 
     // Field 15 = dns_update_enable: toggle on space or any printable
-    if (form.active_field == 15) {
+    if (form.active_field == 14) {
         if (key.codepoint == ' ' or (key.codepoint >= 0x20 and key.codepoint <= 0x7E)) {
             form.dns_update_enable = !form.dns_update_enable;
         }
@@ -3850,7 +3846,7 @@ const known_dhcp_options = [_]KnownOption{
     .{ .code = "1", .name = "Subnet Mask" },
     .{ .code = "2", .name = "Time Offset" },
     .{ .code = "3", .name = "Router" },
-    .{ .code = "4", .name = "Time Server" },
+    .{ .code = "4", .name = "Time Server (from NTP)" },
     .{ .code = "6", .name = "DNS Servers" },
     .{ .code = "7", .name = "Log Server" },
     .{ .code = "12", .name = "Hostname" },

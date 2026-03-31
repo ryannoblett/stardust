@@ -54,10 +54,10 @@ pools:
 
     # Time configuration
     # time_offset: 3600     # seconds east of UTC (option 2); e.g. -18000=UTC-5, 3600=UTC+1
-    # time_servers:         # RFC 868 time servers (option 4)
+    # ntp_servers:          # NTP servers (option 42); also serves option 4 (Time Servers)
     #   - "192.168.1.1"
-    # ntp_servers:          # NTP servers (option 42)
-    #   - "192.168.1.1"
+    # time_servers:         # RFC 868 time servers (option 4); overrides ntp_servers for option 4 only
+    #   - "192.168.1.1"    # usually not needed — ntp_servers is preferred
     # log_servers:          # syslog servers (option 7)
     #   - "192.168.1.1"
 

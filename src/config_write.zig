@@ -132,12 +132,9 @@ fn renderPool(w: anytype, pool: *const config_mod.PoolConfig) !void {
     if (pool.time_offset) |off| {
         try w.print("    time_offset: {d}\n", .{off});
     }
-    if (pool.time_servers.len > 0) {
-        try w.writeAll("    time_servers:\n");
-        for (pool.time_servers) |s| {
-            try w.print("      - {s}\n", .{s});
-        }
-    }
+    // time_servers (option 4) is deprecated — option 4 is now served from
+    // ntp_servers automatically when requested. Existing configs with
+    // time_servers are still parsed for backward compatibility.
     if (pool.log_servers.len > 0) {
         try w.writeAll("    log_servers:\n");
         for (pool.log_servers) |s| {

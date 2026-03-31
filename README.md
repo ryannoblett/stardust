@@ -61,7 +61,7 @@ kill -HUP $(pidof stardust)
 | 1 | Subnet mask |
 | 2 | Time offset (seconds east of UTC) |
 | 3 | Router (default gateway) |
-| 4 | RFC 868 time servers |
+| 4 | Time servers (mirrors NTP servers; override with `time_servers` in pool config) |
 | 6 | DNS servers |
 | 7 | Log servers |
 | 12 | Hostname (from reservation config or client request) |
