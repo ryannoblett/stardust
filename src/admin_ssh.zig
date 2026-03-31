@@ -669,6 +669,7 @@ const TuiState = struct {
     settings_pending_bind_buf: [64]u8 = [_]u8{0} ** 64,
     settings_pending_bind_len: usize = 0,
     settings_pending_random_alloc: bool = false,
+    settings_needs_scroll: bool = false, // set by key handler, cleared after auto-scroll
     // Route/option list sub-modals.
     sub_list_row: u16 = 0,
     sub_edit_field: u8 = 0, // 0=first column, 1=second column
@@ -3807,16 +3808,15 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
         }
     }
 
-    // Auto-scroll to keep the selected editable field visible (plus one line past).
-    if (!read_only) {
+    // Auto-scroll only when a key action requested it (not on mouse wheel scroll).
+    if (!read_only and state.settings_needs_scroll) {
+        state.settings_needs_scroll = false;
         for (lines_buf[0..lc], 0..) |line, li| {
             if (line.edit_idx != null and line.edit_idx.? == state.settings_row) {
                 const vr = @as(u16, @intCast(li));
-                // If above viewport, scroll up to show it with one line margin.
                 if (vr < state.settings_scroll +| 1) {
                     state.settings_scroll = vr -| 1;
                 }
-                // If below viewport, scroll down to show it with one line margin.
                 if (vr + 2 > state.settings_scroll + win.height) {
                     state.settings_scroll = vr + 2 -| win.height;
                 }
@@ -3949,7 +3949,9 @@ fn handleSettingsKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
         return;
     }
 
-    // Initialize pending values from live config on first use.
+    // Any key interaction should ensure the selected field is visible.
+    state.settings_needs_scroll = true;
+
     if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{}) or key.matches(vaxis.Key.tab, .{})) {
         if (state.settings_row + 1 < SETTINGS_EDITABLE_COUNT) state.settings_row += 1;
     } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{}) or key.matches(vaxis.Key.tab, .{ .shift = true })) {
