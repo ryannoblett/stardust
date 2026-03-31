@@ -659,6 +659,15 @@ const TuiState = struct {
     settings_buf: [64]u8 = [_]u8{0} ** 64,
     settings_buf_len: usize = 0,
     settings_cursor: usize = 0,
+    // Pending (dirty) values — applied on Enter, not immediately.
+    settings_dirty: [SETTINGS_EDITABLE_COUNT]bool = [_]bool{false} ** SETTINGS_EDITABLE_COUNT,
+    settings_pending_log_level: config_mod.LogLevel = .info,
+    settings_pending_collect: bool = true,
+    settings_pending_http_enable: bool = false,
+    settings_pending_port_buf: [6]u8 = [_]u8{0} ** 6,
+    settings_pending_port_len: usize = 0,
+    settings_pending_bind_buf: [64]u8 = [_]u8{0} ** 64,
+    settings_pending_bind_len: usize = 0,
     // Route/option list sub-modals.
     sub_list_row: u16 = 0,
     sub_edit_field: u8 = 0, // 0=first column, 1=second column
@@ -1348,7 +1357,7 @@ fn renderHeader(server: *AdminServer, state: *TuiState, win: vaxis.Window) void 
         .leases => "  /:filter  n:new  e:edit  d:delete",
         .stats => "",
         .pools => if (server.cfg.admin_ssh.read_only) "  /:filter  v:view" else "  /:filter  v:view  e:edit  n:new  d:del",
-        .settings => "",
+        .settings => if (state.settings_editing) "  Esc:cancel  Enter:apply" else "  j/k:move  Space:toggle  Enter:apply & reload",
     };
     _ = win.print(&.{.{ .text = hint, .style = hint_style }}, .{ .col_offset = col, .wrap = .none });
 }
@@ -3722,13 +3731,15 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
     const sel_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 255, 255 } }, .bg = .{ .rgb = .{ 50, 80, 140 } } };
     const hint_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 100, 130 } }, .bg = bg };
 
-    // Editable field values (read from config live).
+    const dirty_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 200, 60 } }, .bg = bg, .bold = true };
+
+    // Show pending values if dirty, otherwise live config values.
     const edit_vals = [SETTINGS_EDITABLE_COUNT][]const u8{
-        @tagName(cfg.log_level),
-        if (cfg.metrics.collect) "true" else "false",
-        if (cfg.metrics.http_enable) "true" else "false",
-        if (state.settings_editing and state.settings_row == 3) state.settings_buf[0..state.settings_buf_len] else try std.fmt.allocPrint(fa, "{d}", .{cfg.metrics.http_port}),
-        if (state.settings_editing and state.settings_row == 4) state.settings_buf[0..state.settings_buf_len] else cfg.metrics.http_bind,
+        if (state.settings_dirty[0]) @tagName(state.settings_pending_log_level) else @tagName(cfg.log_level),
+        if (state.settings_dirty[1]) (if (state.settings_pending_collect) "true" else "false") else (if (cfg.metrics.collect) "true" else "false"),
+        if (state.settings_dirty[2]) (if (state.settings_pending_http_enable) "true" else "false") else (if (cfg.metrics.http_enable) "true" else "false"),
+        if (state.settings_editing and state.settings_row == 3) state.settings_buf[0..state.settings_buf_len] else if (state.settings_dirty[3]) state.settings_pending_port_buf[0..state.settings_pending_port_len] else try std.fmt.allocPrint(fa, "{d}", .{cfg.metrics.http_port}),
+        if (state.settings_editing and state.settings_row == 4) state.settings_buf[0..state.settings_buf_len] else if (state.settings_dirty[4]) state.settings_pending_bind_buf[0..state.settings_pending_bind_len] else cfg.metrics.http_bind,
     };
 
     const LABEL_W: u16 = 20;
@@ -3794,6 +3805,10 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
         }
     }
 
+    // Clamp scroll so we can't scroll past the last line.
+    const max_scroll: u16 = if (lc > win.height) @intCast(lc - win.height) else 0;
+    if (state.settings_scroll > max_scroll) state.settings_scroll = max_scroll;
+
     // Render.
     const scroll = state.settings_scroll;
     for (lines_buf[0..lc], 0..) |line, li| {
@@ -3811,9 +3826,12 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
         const is_selected = is_editable and line.edit_idx.? == state.settings_row;
         const is_editing_this = is_selected and state.settings_editing;
 
-        // Label.
-        const label_text = try std.fmt.allocPrint(fa, "  {s:<18}", .{line.label});
-        _ = win.print(&.{.{ .text = label_text, .style = lbl_style }}, .{ .row_offset = dr, .wrap = .none });
+        // Label with dirty indicator.
+        const is_dirty = is_editable and state.settings_dirty[line.edit_idx.?];
+        const dirty_mark: []const u8 = if (is_dirty) "*" else " ";
+        _ = win.print(&.{.{ .text = dirty_mark, .style = dirty_style }}, .{ .col_offset = 1, .row_offset = dr, .wrap = .none });
+        const label_text = try std.fmt.allocPrint(fa, " {s:<18}", .{line.label});
+        _ = win.print(&.{.{ .text = label_text, .style = lbl_style }}, .{ .col_offset = 2, .row_offset = dr, .wrap = .none });
 
         // Value field.
         const field_w: u16 = if (win.width > LABEL_W + 4) win.width - LABEL_W - 4 else 10;
@@ -3845,12 +3863,6 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
             _ = win.print(&.{.{ .text = hint, .style = hint_style }}, .{ .col_offset = LABEL_W + 2 + @as(u16, @intCast(val_trunc.len)) + pad_n, .row_offset = dr, .wrap = .none });
         }
     }
-
-    // Bottom hint.
-    if (win.height > 1) {
-        const bh = if (state.settings_editing) "  Esc: cancel  Enter: save" else "  j/k: navigate  Enter: save config + reload";
-        _ = win.print(&.{.{ .text = bh, .style = hint_style }}, .{ .row_offset = win.height - 1, .wrap = .none });
-    }
 }
 
 fn handleSettingsKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) void {
@@ -3864,15 +3876,19 @@ fn handleSettingsKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
             return;
         }
         if (key.matches(vaxis.Key.enter, .{})) {
-            // Apply the edit.
-            const val = state.settings_buf[0..state.settings_buf_len];
+            // Store the edited value as pending (don't apply yet).
             if (state.settings_row == 3) {
-                cfg.metrics.http_port = std.fmt.parseInt(u16, val, 10) catch cfg.metrics.http_port;
+                const n = @min(state.settings_buf_len, state.settings_pending_port_buf.len);
+                @memcpy(state.settings_pending_port_buf[0..n], state.settings_buf[0..n]);
+                state.settings_pending_port_len = n;
+                state.settings_dirty[3] = true;
             } else if (state.settings_row == 4) {
-                replaceStr(server.allocator, @constCast(&cfg.metrics.http_bind), val);
+                const n = @min(state.settings_buf_len, state.settings_pending_bind_buf.len);
+                @memcpy(state.settings_pending_bind_buf[0..n], state.settings_buf[0..n]);
+                state.settings_pending_bind_len = n;
+                state.settings_dirty[4] = true;
             }
             state.settings_editing = false;
-            settingsSaveAndReload(server, state);
             return;
         }
         if (key.matches(vaxis.Key.backspace, .{})) {
@@ -3908,24 +3924,25 @@ fn handleSettingsKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
 
     // Navigation mode.
     if (read_only) {
-        // Read-only: only scroll.
         if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) state.settings_scroll +|= 1;
         if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) state.settings_scroll -|= 1;
         return;
     }
 
+    // Initialize pending values from live config on first use.
     if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{}) or key.matches(vaxis.Key.tab, .{})) {
         if (state.settings_row + 1 < SETTINGS_EDITABLE_COUNT) state.settings_row += 1;
     } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{}) or key.matches(vaxis.Key.tab, .{ .shift = true })) {
         state.settings_row -|= 1;
     } else if (key.matches(' ', .{}) or key.matches(vaxis.Key.left, .{}) or key.matches(vaxis.Key.right, .{})) {
-        // Toggle/cycle for fields 0-2.
+        // Toggle/cycle: update pending value, mark dirty.
         switch (state.settings_row) {
-            0 => { // log_level: cycle
+            0 => {
                 const levels = [_]config_mod.LogLevel{ .err, .warn, .info, .verbose, .debug };
+                const cur = if (state.settings_dirty[0]) state.settings_pending_log_level else cfg.log_level;
                 var idx: usize = 0;
                 for (levels, 0..) |l, i| {
-                    if (l == cfg.log_level) {
+                    if (l == cur) {
                         idx = i;
                         break;
                     }
@@ -3935,38 +3952,72 @@ fn handleSettingsKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
                 } else {
                     idx = (idx + 1) % levels.len;
                 }
-                cfg.log_level = levels[idx];
-                settingsSaveAndReload(server, state);
+                state.settings_pending_log_level = levels[idx];
+                state.settings_dirty[0] = true;
             },
-            1 => { // metrics.collect: toggle
-                cfg.metrics.collect = !cfg.metrics.collect;
-                settingsSaveAndReload(server, state);
+            1 => {
+                const cur = if (state.settings_dirty[1]) state.settings_pending_collect else cfg.metrics.collect;
+                state.settings_pending_collect = !cur;
+                state.settings_dirty[1] = true;
             },
-            2 => { // metrics.http_enable: toggle
-                cfg.metrics.http_enable = !cfg.metrics.http_enable;
-                settingsSaveAndReload(server, state);
+            2 => {
+                const cur = if (state.settings_dirty[2]) state.settings_pending_http_enable else cfg.metrics.http_enable;
+                state.settings_pending_http_enable = !cur;
+                state.settings_dirty[2] = true;
             },
             else => {},
         }
     } else if (key.matches(vaxis.Key.enter, .{})) {
-        // Enter text editing for fields 3-4.
+        // If any fields are dirty, apply all and reload.
+        var any_dirty = false;
+        for (state.settings_dirty) |d| {
+            if (d) {
+                any_dirty = true;
+                break;
+            }
+        }
+        if (any_dirty) {
+            settingsApplyAndReload(server, state);
+            return;
+        }
+        // If nothing dirty but on a text field, enter editing.
         if (state.settings_row == 3) {
-            const port_str = std.fmt.bufPrint(&state.settings_buf, "{d}", .{cfg.metrics.http_port}) catch "";
-            state.settings_buf_len = port_str.len;
-            state.settings_cursor = port_str.len;
+            const src = if (state.settings_dirty[3]) state.settings_pending_port_buf[0..state.settings_pending_port_len] else std.fmt.bufPrint(&state.settings_buf, "{d}", .{cfg.metrics.http_port}) catch "";
+            if (!state.settings_dirty[3]) {
+                state.settings_buf_len = src.len;
+            } else {
+                @memcpy(state.settings_buf[0..src.len], src);
+                state.settings_buf_len = src.len;
+            }
+            state.settings_cursor = state.settings_buf_len;
             state.settings_editing = true;
         } else if (state.settings_row == 4) {
-            const bind = cfg.metrics.http_bind;
-            const n = @min(bind.len, state.settings_buf.len);
-            @memcpy(state.settings_buf[0..n], bind[0..n]);
+            const src = if (state.settings_dirty[4]) state.settings_pending_bind_buf[0..state.settings_pending_bind_len] else cfg.metrics.http_bind;
+            const n = @min(src.len, state.settings_buf.len);
+            @memcpy(state.settings_buf[0..n], src[0..n]);
             state.settings_buf_len = n;
             state.settings_cursor = n;
             state.settings_editing = true;
-        } else {
-            // For toggle fields, Enter also saves.
-            settingsSaveAndReload(server, state);
         }
     }
+}
+
+fn settingsApplyAndReload(server: *AdminServer, state: *TuiState) void {
+    const cfg = server.cfg;
+    if (state.settings_dirty[0]) cfg.log_level = state.settings_pending_log_level;
+    if (state.settings_dirty[1]) cfg.metrics.collect = state.settings_pending_collect;
+    if (state.settings_dirty[2]) cfg.metrics.http_enable = state.settings_pending_http_enable;
+    if (state.settings_dirty[3]) {
+        cfg.metrics.http_port = std.fmt.parseInt(u16, state.settings_pending_port_buf[0..state.settings_pending_port_len], 10) catch cfg.metrics.http_port;
+    }
+    if (state.settings_dirty[4]) {
+        replaceStr(server.allocator, @constCast(&cfg.metrics.http_bind), state.settings_pending_bind_buf[0..state.settings_pending_bind_len]);
+    }
+    // Clear dirty flags.
+    state.settings_dirty = [_]bool{false} ** SETTINGS_EDITABLE_COUNT;
+    // Save and reload.
+    config_write.writeConfig(server.allocator, server.cfg, server.cfg_path) catch return;
+    triggerReload(state);
 }
 
 fn settingsSaveAndReload(server: *AdminServer, state: *TuiState) void {
