@@ -444,9 +444,9 @@ const LeaseRow = struct {
     pool: []const u8,
 };
 
-const Tab = enum(u8) { leases = 0, stats = 1, pools = 2 };
+const Tab = enum(u8) { leases = 0, stats = 1, pools = 2, settings = 3 };
 
-const TuiMode = enum { normal, reservation_form, delete_confirm, pool_detail, pool_form, pool_delete_confirm, pool_save_confirm };
+const TuiMode = enum { normal, reservation_form, delete_confirm, pool_detail, pool_form, pool_delete_confirm, pool_save_confirm, route_list, route_edit, option_list, option_edit, help };
 
 const ReservationForm = struct {
     /// MAC of the lease being edited; empty string means "new reservation".
@@ -461,6 +461,8 @@ const ReservationForm = struct {
     hostname_len: usize = 0,
     /// Index of the field currently receiving input: 0=ip  1=mac  2=hostname.
     active_field: u8 = 0,
+    /// Cursor position within the active field (byte offset).
+    cursor: usize = 0,
     /// Inline error message (empty = no error).
     err_buf: [80]u8 = [_]u8{0} ** 80,
     err_len: usize = 0,
@@ -470,6 +472,29 @@ const ReservationForm = struct {
     fn isNew(self: *const ReservationForm) bool {
         return self.orig_mac_len == 0;
     }
+
+    fn activeLen(self: *const ReservationForm) usize {
+        return switch (self.active_field) {
+            0 => self.ip_len,
+            1 => self.mac_len,
+            2 => self.hostname_len,
+            else => 0,
+        };
+    }
+};
+
+const RouteEntry = struct {
+    dest_buf: [18]u8 = [_]u8{0} ** 18, // "10.0.0.0/24"
+    dest_len: usize = 0,
+    router_buf: [16]u8 = [_]u8{0} ** 16,
+    router_len: usize = 0,
+};
+
+const OptionEntry = struct {
+    code_buf: [4]u8 = [_]u8{0} ** 4, // option code e.g. "150"
+    code_len: usize = 0,
+    value_buf: [128]u8 = [_]u8{0} ** 128,
+    value_len: usize = 0,
 };
 
 const PoolForm = struct {
@@ -530,11 +555,18 @@ const PoolForm = struct {
     dns_update_key_file_buf: [128]u8 = [_]u8{0} ** 128,
     dns_update_key_file_len: usize = 0,
 
-    // --- Status ---
+    // --- Static Routes & DHCP Options (edited via sub-modals) ---
+    routes: [32]RouteEntry = [_]RouteEntry{.{}} ** 32,
+    route_count: usize = 0,
+    options: [32]OptionEntry = [_]OptionEntry{.{}} ** 32,
+    option_count: usize = 0,
+
+    // --- Cursor & Status ---
+    cursor: usize = 0, // cursor position within the active field
     err_buf: [120]u8 = [_]u8{0} ** 120,
     err_len: usize = 0,
 
-    const FIELD_COUNT: u8 = 20; // 0..19
+    const FIELD_COUNT: u8 = 22; // 0..21 (20=Static Routes, 21=DHCP Options)
     const VISIBLE_ROWS: u8 = 12;
 
     fn isNew(self: *const PoolForm) bool {
@@ -603,6 +635,7 @@ const TuiState = struct {
     del_mac_len: usize = 0,
     del_ip: [16]u8 = [_]u8{0} ** 16,
     del_ip_len: usize = 0,
+    del_is_reservation: bool = false,
     // Pool tab state.
     pool_row: u16 = 0,
     pool_start: u16 = 0,
@@ -612,6 +645,21 @@ const TuiState = struct {
     pool_confirm: PoolSaveConfirm = .{},
     pool_detail_scroll: u16 = 0,
     pool_del_index: ?usize = null,
+    // Pool filter (same pattern as lease filter).
+    pool_filter_active: bool = false,
+    pool_filter_buf: [256]u8 = undefined,
+    pool_filter_len: usize = 0,
+    // Settings tab.
+    settings_row: u8 = 0,
+    settings_scroll: u16 = 0,
+    settings_editing: bool = false, // true when editing a text field on settings tab
+    settings_buf: [64]u8 = [_]u8{0} ** 64,
+    settings_buf_len: usize = 0,
+    settings_cursor: usize = 0,
+    // Route/option list sub-modals.
+    sub_list_row: u16 = 0,
+    sub_edit_field: u8 = 0, // 0=first column, 1=second column
+    sub_edit_cursor: usize = 0,
 };
 
 /// Replicate the vaxis Table dynamic_fill column-width calculation.
@@ -819,6 +867,33 @@ fn runTui(
                         handlePoolDeleteConfirmKey(server, &state, key);
                         continue :parse_loop;
                     }
+                    if (state.mode == .route_list or state.mode == .route_edit) {
+                        handleRouteListKey(server, &state, key);
+                        continue :parse_loop;
+                    }
+                    if (state.mode == .option_list or state.mode == .option_edit) {
+                        handleOptionListKey(server, &state, key);
+                        continue :parse_loop;
+                    }
+                    if (state.mode == .help) {
+                        state.mode = .normal; // any key closes help
+                        continue :parse_loop;
+                    }
+                    if (state.pool_filter_active) {
+                        if (key.matches(vaxis.Key.escape, .{}) or
+                            key.matches(vaxis.Key.enter, .{}))
+                        {
+                            state.pool_filter_active = false;
+                        } else if (key.matches(vaxis.Key.backspace, .{})) {
+                            if (state.pool_filter_len > 0) state.pool_filter_len -= 1;
+                        } else if (key.codepoint >= 0x20 and key.codepoint <= 0x7E) {
+                            if (state.pool_filter_len < state.pool_filter_buf.len - 1) {
+                                state.pool_filter_buf[state.pool_filter_len] = @intCast(key.codepoint);
+                                state.pool_filter_len += 1;
+                            }
+                        }
+                        continue :parse_loop;
+                    }
                     if (state.filter_active) {
                         // Filter input mode: Esc/Enter closes; Backspace deletes;
                         // printable ASCII appends.
@@ -905,22 +980,27 @@ fn runTui(
                             .leases => handleLeaseKey(&state, &table_ctx, key),
                             .stats => handleStatsKey(&state, key),
                             .pools => handlePoolsKey(server, &state, key),
+                            .settings => handleSettingsKey(server, &state, key),
                         }
                         if (key.matches('1', .{})) state.tab = .leases;
                         if (key.matches('2', .{})) state.tab = .stats;
                         if (key.matches('3', .{})) state.tab = .pools;
+                        if (key.matches('4', .{})) state.tab = .settings;
+                        if (key.matches('?', .{})) state.mode = .help;
                         if (key.matches(vaxis.Key.tab, .{})) {
                             state.tab = switch (state.tab) {
                                 .leases => .stats,
                                 .stats => .pools,
-                                .pools => .leases,
+                                .pools => .settings,
+                                .settings => .leases,
                             };
                         }
                         if (key.matches(vaxis.Key.tab, .{ .shift = true })) {
                             state.tab = switch (state.tab) {
-                                .leases => .pools,
+                                .leases => .settings,
                                 .stats => .leases,
                                 .pools => .stats,
+                                .settings => .pools,
                             };
                         }
 
@@ -945,15 +1025,17 @@ fn runTui(
                                 // Store orig_mac so we can remove the old entry on rename.
                                 @memcpy(state.form.orig_mac[0..mac.len], mac);
                                 state.form.orig_mac_len = mac.len;
+                                state.form.cursor = ip.len;
                                 state.mode = .reservation_form;
-                            } else if (key.matches('d', .{}) and state.sel_reserved) {
-                                // Delete confirmation for a reserved lease.
+                            } else if (key.matches('d', .{}) and state.sel_mac_len > 0) {
+                                // Delete/release confirmation for any lease.
                                 const mac = state.sel_mac[0..state.sel_mac_len];
                                 const ip = state.sel_ip[0..state.sel_ip_len];
                                 @memcpy(state.del_mac[0..mac.len], mac);
                                 state.del_mac_len = mac.len;
                                 @memcpy(state.del_ip[0..ip.len], ip);
                                 state.del_ip_len = ip.len;
+                                state.del_is_reservation = state.sel_reserved;
                                 state.mode = .delete_confirm;
                             }
                         }
@@ -962,8 +1044,18 @@ fn runTui(
                 .mouse => |mouse| {
                     switch (mouse.button) {
                         .left => if (mouse.type == .press) {
-                            // Modal overlays consume all mouse clicks.
-                            if (state.mode != .normal) break;
+                            // Modal overlays: [X] close button click detection.
+                            if (state.mode != .normal) {
+                                const mr: u16 = if (mouse.row >= 0) @intCast(mouse.row) else 0;
+                                const mc: u16 = if (mouse.col >= 0) @intCast(mouse.col) else 0;
+                                // Check if click is on the [X] button (top-right of modal).
+                                // All modals render [X] at row=modal_y, col=modal_x+BOX_W-4.
+                                const vwin = vx.window();
+                                if (isModalCloseClick(state.mode, vwin.width, vwin.height, mr, mc)) {
+                                    state.mode = .normal;
+                                }
+                                break;
+                            }
                             const term_row: u16 = if (mouse.row >= 0) @intCast(mouse.row) else 0;
                             const term_col: u16 = if (mouse.col >= 0) @intCast(mouse.col) else 0;
                             const now_ms = std.time.milliTimestamp();
@@ -976,12 +1068,15 @@ fn runTui(
                             if (term_row == 0) {
                                 // Header bar: tab switching.
                                 // Layout: " Stardust "(10) + " [1] Leases "(12) + " [2] Stats "(11) + " [3] Pools "(11)
+                                // Layout: " Stardust "(10) + " [1] Leases "(12) + " [2] Stats "(11) + " [3] Pools "(11) + " [4] Settings "(14)
                                 if (term_col >= 10 and term_col < 22) {
                                     state.tab = .leases;
                                 } else if (term_col >= 22 and term_col < 33) {
                                     state.tab = .stats;
                                 } else if (term_col >= 33 and term_col < 44) {
                                     state.tab = .pools;
+                                } else if (term_col >= 44 and term_col < 58) {
+                                    state.tab = .settings;
                                 }
                             } else if (state.tab == .pools) {
                                 if (term_row == 1) {
@@ -1043,6 +1138,7 @@ fn runTui(
                                             state.form.hostname_len = hn.len;
                                             @memcpy(state.form.orig_mac[0..mac.len], mac);
                                             state.form.orig_mac_len = mac.len;
+                                            state.form.cursor = ip.len;
                                             state.mode = .reservation_form;
                                         }
                                     }
@@ -1054,13 +1150,15 @@ fn runTui(
                                 .leases => .leases,
                                 .stats => .leases,
                                 .pools => .stats,
+                                .settings => .pools,
                             };
                         },
                         .wheel_left => if (state.mode == .normal) {
                             state.tab = switch (state.tab) {
                                 .leases => .stats,
                                 .stats => .pools,
-                                .pools => .pools,
+                                .pools => .settings,
+                                .settings => .settings,
                             };
                         },
                         .wheel_up => switch (state.mode) {
@@ -1073,12 +1171,13 @@ fn runTui(
                                 .leases => table_ctx.row -|= 1,
                                 .stats => state.stats_scroll -|= 3,
                                 .pools => state.pool_row -|= 1,
+                                .settings => state.settings_scroll -|= 1,
                             },
                             .reservation_form => {
                                 if (state.form.active_field > 0) state.form.active_field -= 1;
                             },
                             // All other modals: swallow scroll.
-                            .delete_confirm, .pool_delete_confirm => {},
+                            .delete_confirm, .pool_delete_confirm, .help, .route_list, .route_edit, .option_list, .option_edit => {},
                         },
                         .wheel_down => switch (state.mode) {
                             .pool_detail => state.pool_detail_scroll +|= 3,
@@ -1092,11 +1191,12 @@ fn runTui(
                                 .pools => if (state.pool_row + 1 < server.cfg.pools.len) {
                                     state.pool_row += 1;
                                 },
+                                .settings => state.settings_scroll +|= 1,
                             },
                             .reservation_form => {
                                 if (state.form.active_field < 2) state.form.active_field += 1;
                             },
-                            .delete_confirm, .pool_delete_confirm => {},
+                            .delete_confirm, .pool_delete_confirm, .help, .route_list, .route_edit, .option_list, .option_edit => {},
                         },
                         else => {},
                     }
@@ -1180,6 +1280,7 @@ fn renderFrame(
         .leases => try renderLeaseTab(server, state, table_ctx, body, fa),
         .stats => try renderStatsTab(server, state, body, fa),
         .pools => try renderPoolsTab(server, state, body, fa),
+        .settings => try renderSettingsTab(server, state, body, fa),
     }
 
     // Status bar (last row)
@@ -1194,6 +1295,9 @@ fn renderFrame(
         .pool_form => try renderPoolForm(state, win, fa),
         .pool_save_confirm => try renderPoolSaveConfirm(server, state, win, fa),
         .pool_delete_confirm => try renderPoolDeleteConfirm(server, state, win, fa),
+        .route_list, .route_edit => try renderRouteList(state, win, fa),
+        .option_list, .option_edit => try renderOptionList(state, win, fa),
+        .help => renderHelp(win),
     }
 }
 
@@ -1224,20 +1328,23 @@ fn renderHeader(server: *AdminServer, state: *TuiState, win: vaxis.Window) void 
     _ = win.print(&.{.{ .text = " Stardust ", .style = title_style }}, .{ .col_offset = col, .wrap = .none });
     col += 10;
 
-    const leases_label = " [1] Leases ";
-    const stats_label = " [2] Stats ";
-    const pools_label = " [3] Pools ";
-    _ = win.print(&.{.{ .text = leases_label, .style = if (state.tab == .leases) tab_style_active else tab_style_inactive }}, .{ .col_offset = col, .wrap = .none });
-    col += @intCast(leases_label.len);
-    _ = win.print(&.{.{ .text = stats_label, .style = if (state.tab == .stats) tab_style_active else tab_style_inactive }}, .{ .col_offset = col, .wrap = .none });
-    col += @intCast(stats_label.len);
-    _ = win.print(&.{.{ .text = pools_label, .style = if (state.tab == .pools) tab_style_active else tab_style_inactive }}, .{ .col_offset = col, .wrap = .none });
-    col += @intCast(pools_label.len);
+    const tab_labels = [_]struct { text: []const u8, tab: Tab }{
+        .{ .text = " [1] Leases ", .tab = .leases },
+        .{ .text = " [2] Stats ", .tab = .stats },
+        .{ .text = " [3] Pools ", .tab = .pools },
+        .{ .text = " [4] Settings ", .tab = .settings },
+    };
+    for (tab_labels) |tl| {
+        const style = if (state.tab == tl.tab) tab_style_active else tab_style_inactive;
+        _ = win.print(&.{.{ .text = tl.text, .style = style }}, .{ .col_offset = col, .wrap = .none });
+        col += @intCast(tl.text.len);
+    }
 
     const hint: []const u8 = switch (state.tab) {
-        .leases => "  j/k:move  /:filter  I/M/H/T/E/P:sort  y:yank  n:new  e:edit  d:del  ^R:reload  q:quit",
-        .stats => "  j/k:scroll  ^R:reload  q:quit",
-        .pools => if (server.cfg.admin_ssh.read_only) "  j/k:move  v:view  ^R:reload  q:quit" else "  j/k:move  v:view  e:edit  n:new  d:del  ^R:reload  q:quit",
+        .leases => "  /:filter  n:new  e:edit  d:del/release  ?:help  q:quit",
+        .stats => "  ?:help  q:quit",
+        .pools => if (server.cfg.admin_ssh.read_only) "  /:filter  v:view  ?:help  q:quit" else "  /:filter  v:view  e:edit  n:new  d:del  ?:help  q:quit",
+        .settings => "  ?:help  q:quit",
     };
     _ = win.print(&.{.{ .text = hint, .style = hint_style }}, .{ .col_offset = col, .wrap = .none });
 }
@@ -1257,6 +1364,17 @@ fn renderStatus(server: *AdminServer, state: *TuiState, win: vaxis.Window, fa: s
         return;
     }
 
+    if (state.tab == .pools and state.pool_filter_active) {
+        const filter_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 220, 80 } }, .bg = .{ .rgb = .{ 15, 15, 15 } } };
+        const cursor_style2: vaxis.Style = .{ .fg = .{ .rgb = .{ 0, 0, 0 } }, .bg = .{ .rgb = .{ 255, 220, 80 } } };
+        const prompt = try std.fmt.allocPrint(fa, " / {s}", .{state.pool_filter_buf[0..state.pool_filter_len]});
+        _ = win.print(&.{
+            .{ .text = prompt, .style = filter_style },
+            .{ .text = " ", .style = cursor_style2 },
+            .{ .text = "  Esc/Enter to close", .style = .{ .fg = .{ .rgb = .{ 100, 100, 100 } }, .bg = .{ .rgb = .{ 15, 15, 15 } } } },
+        }, .{ .col_offset = 0, .wrap = .none });
+        return;
+    }
     if (state.tab == .leases and state.filter_active) {
         // Filter input bar.
         const filter_style: vaxis.Style = .{
@@ -1833,9 +1951,9 @@ fn renderStatsTab(
 fn drawBox(win: vaxis.Window, row: u16, col: u16, w: u16, h: u16, style: vaxis.Style) void {
     if (w < 2 or h < 2) return;
 
-    // Top and bottom border strings.
-    var top_buf: [256]u8 = undefined;
-    var bot_buf: [256]u8 = undefined;
+    // Top and bottom border strings. Each inner cell is 3 bytes (UTF-8 box char).
+    var top_buf: [768]u8 = undefined;
+    var bot_buf: [768]u8 = undefined;
     const inner = w - 2;
     top_buf[0] = '\xe2';
     top_buf[1] = '\x94';
@@ -1899,8 +2017,10 @@ fn renderReservationForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Alloca
     }
     drawBox(win, row, col, BOX_W, BOX_H, border_style);
 
+    const close_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 80, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
     const title = if (state.form.isNew()) "  New Reservation" else "  Edit Reservation";
     _ = win.print(&.{.{ .text = title, .style = title_style }}, .{ .col_offset = col + 1, .row_offset = row + 1, .wrap = .none });
+    _ = win.print(&.{.{ .text = "[X]", .style = close_style }}, .{ .col_offset = col + BOX_W -| 5, .row_offset = row, .wrap = .none });
 
     const fields = [3]struct { label: []const u8, buf: []const u8, len: usize }{
         .{ .label = "  IP Address : ", .buf = &state.form.ip_buf, .len = state.form.ip_len },
@@ -1915,16 +2035,18 @@ fn renderReservationForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Alloca
         const is_active = state.form.active_field == @as(u8, @intCast(fi));
         const fs = if (is_active) active_style else field_style;
         const value = f.buf[0..f.len];
-        // Pad field to FIELD_W, show cursor at end if active.
+        const lbl_len: u16 = @intCast(f.label.len);
+        const field_x = col + 1 + lbl_len;
+        // Pad field to FIELD_W.
         const pad = if (value.len < FIELD_W) FIELD_W - @as(u16, @intCast(value.len)) else 0;
         const padded = try fa.alloc(u8, pad);
         @memset(padded, ' ');
-        const lbl_len: u16 = @intCast(f.label.len);
-        _ = win.print(&.{.{ .text = value, .style = fs }}, .{ .col_offset = col + 1 + lbl_len, .row_offset = fr, .wrap = .none });
-        _ = win.print(&.{.{ .text = padded, .style = fs }}, .{ .col_offset = col + 1 + lbl_len + @as(u16, @intCast(value.len)), .row_offset = fr, .wrap = .none });
+        _ = win.print(&.{.{ .text = value, .style = fs }}, .{ .col_offset = field_x, .row_offset = fr, .wrap = .none });
+        _ = win.print(&.{.{ .text = padded, .style = fs }}, .{ .col_offset = field_x + @as(u16, @intCast(value.len)), .row_offset = fr, .wrap = .none });
         if (is_active) {
-            // Draw cursor block at the insert position.
-            _ = win.print(&.{.{ .text = " ", .style = cursor_style }}, .{ .col_offset = col + 1 + lbl_len + @as(u16, @intCast(value.len)), .row_offset = fr, .wrap = .none });
+            const cur_pos = @min(state.form.cursor, f.len);
+            const ch: []const u8 = if (cur_pos < f.len) f.buf[cur_pos..][0..1] else " ";
+            _ = win.print(&.{.{ .text = ch, .style = cursor_style }}, .{ .col_offset = field_x + @as(u16, @intCast(cur_pos)), .row_offset = fr, .wrap = .none });
         }
     }
 
@@ -2006,49 +2128,68 @@ fn handleFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) void {
         return;
     }
 
-    if (key.matches(vaxis.Key.tab, .{})) {
+    // Field navigation.
+    if (key.matches(vaxis.Key.tab, .{}) or key.matches(vaxis.Key.down, .{})) {
         form.active_field = (form.active_field + 1) % 3;
+        form.cursor = form.activeLen();
         return;
     }
-    if (key.matches(vaxis.Key.tab, .{ .shift = true })) {
+    if (key.matches(vaxis.Key.tab, .{ .shift = true }) or key.matches(vaxis.Key.up, .{})) {
         form.active_field = if (form.active_field == 0) 2 else form.active_field - 1;
+        form.cursor = form.activeLen();
         return;
     }
 
-    // Text input for the active field.
-    if (key.matches(vaxis.Key.backspace, .{})) {
-        switch (form.active_field) {
-            0 => if (form.ip_len > 0) {
-                form.ip_len -= 1;
-            },
-            1 => if (form.mac_len > 0) {
-                form.mac_len -= 1;
-            },
-            2 => if (form.hostname_len > 0) {
-                form.hostname_len -= 1;
-            },
-            else => {},
-        }
+    // Cursor movement.
+    if (key.matches(vaxis.Key.left, .{})) {
+        if (form.cursor > 0) form.cursor -= 1;
         return;
     }
-    if (key.codepoint >= 0x20 and key.codepoint <= 0x7E) {
-        const ch: u8 = @intCast(key.codepoint);
-        switch (form.active_field) {
-            0 => if (form.ip_len < form.ip_buf.len - 1) {
-                form.ip_buf[form.ip_len] = ch;
-                form.ip_len += 1;
-            },
-            1 => if (form.mac_len < form.mac_buf.len - 1) {
-                form.mac_buf[form.mac_len] = ch;
-                form.mac_len += 1;
-            },
-            2 => if (form.hostname_len < form.hostname_buf.len - 1) {
-                form.hostname_buf[form.hostname_len] = ch;
-                form.hostname_len += 1;
-            },
-            else => {},
+    if (key.matches(vaxis.Key.right, .{})) {
+        if (form.cursor < form.activeLen()) form.cursor += 1;
+        return;
+    }
+    if (key.matches(vaxis.Key.home, .{})) {
+        form.cursor = 0;
+        return;
+    }
+    if (key.matches(vaxis.Key.end, .{})) {
+        form.cursor = form.activeLen();
+        return;
+    }
+
+    // Text editing at cursor position.
+    const fb = resFormFieldBuf(form) orelse return;
+    if (key.matches(vaxis.Key.backspace, .{})) {
+        if (form.cursor > 0 and fb.len.* > 0) {
+            const pos = form.cursor;
+            if (pos < fb.len.*) std.mem.copyForwards(u8, fb.buf[pos - 1 ..], fb.buf[pos..fb.len.*]);
+            fb.len.* -= 1;
+            form.cursor -= 1;
+        }
+    } else if (key.matches(vaxis.Key.delete, .{})) {
+        if (form.cursor < fb.len.*) {
+            std.mem.copyForwards(u8, fb.buf[form.cursor..], fb.buf[form.cursor + 1 .. fb.len.*]);
+            fb.len.* -= 1;
+        }
+    } else if (key.codepoint >= 0x20 and key.codepoint <= 0x7E) {
+        if (fb.len.* < fb.buf.len - 1) {
+            const pos = form.cursor;
+            if (pos < fb.len.*) std.mem.copyBackwards(u8, fb.buf[pos + 1 ..], fb.buf[pos..fb.len.*]);
+            fb.buf[pos] = @intCast(key.codepoint);
+            fb.len.* += 1;
+            form.cursor += 1;
         }
     }
+}
+
+fn resFormFieldBuf(form: *ReservationForm) ?struct { buf: []u8, len: *usize } {
+    return switch (form.active_field) {
+        0 => .{ .buf = &form.ip_buf, .len = &form.ip_len },
+        1 => .{ .buf = &form.mac_buf, .len = &form.mac_len },
+        2 => .{ .buf = &form.hostname_buf, .len = &form.hostname_len },
+        else => null,
+    };
 }
 
 fn renderDeleteConfirm(state: *TuiState, win: vaxis.Window) void {
@@ -2070,11 +2211,15 @@ fn renderDeleteConfirm(state: *TuiState, win: vaxis.Window) void {
         _ = win.print(&.{.{ .text = &fill_buf, .style = .{ .bg = .{ .rgb = .{ 30, 10, 10 } } } }}, .{ .col_offset = col, .row_offset = row + r, .wrap = .none });
     }
     drawBox(win, row, col, BOX_W, BOX_H, border_style);
+    const close_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 80, 80 } }, .bg = .{ .rgb = .{ 30, 10, 10 } }, .bold = true };
+    _ = win.print(&.{.{ .text = "[X]", .style = close_style }}, .{ .col_offset = col + BOX_W -| 5, .row_offset = row, .wrap = .none });
 
     const ip = state.del_ip[0..state.del_ip_len];
-    // Build prompt inline with a fixed-size buffer.
     var prompt_buf: [60]u8 = undefined;
-    const prompt = std.fmt.bufPrint(&prompt_buf, "  Delete reservation for {s}? [y/N]", .{ip}) catch "  Delete reservation? [y/N]";
+    const prompt = if (state.del_is_reservation)
+        std.fmt.bufPrint(&prompt_buf, "  Delete reservation for {s}? [y/N]", .{ip}) catch "  Delete reservation? [y/N]"
+    else
+        std.fmt.bufPrint(&prompt_buf, "  Release lease {s}? [y/N]", .{ip}) catch "  Release lease? [y/N]";
     _ = win.print(&.{.{ .text = prompt, .style = text_style }}, .{ .col_offset = col + 1, .row_offset = row + 1, .wrap = .none });
     _ = win.print(&.{.{ .text = "  y = confirm   Esc / any other key = cancel", .style = hint_style }}, .{ .col_offset = col + 1, .row_offset = row + 3, .wrap = .none });
 }
@@ -2084,11 +2229,17 @@ fn handleDeleteConfirmKey(server: *AdminServer, state: *TuiState, key: vaxis.Key
         const mac = state.del_mac[0..state.del_mac_len];
         const ip = state.del_ip[0..state.del_ip_len];
         server.store.forceRemoveLease(mac);
-        if (config_write.findPoolForIp(server.cfg, ip)) |pool| {
-            _ = config_write.removeReservation(server.allocator, pool, mac);
-            config_write.writeConfig(server.allocator, server.cfg, server.cfg_path) catch |err| {
-                log.warn("delete reservation: failed to write config: {s}", .{@errorName(err)});
-            };
+        if (state.del_is_reservation) {
+            // Reservation: also remove from config and persist.
+            if (config_write.findPoolForIp(server.cfg, ip)) |pool| {
+                _ = config_write.removeReservation(server.allocator, pool, mac);
+                config_write.writeConfig(server.allocator, server.cfg, server.cfg_path) catch |err| {
+                    log.warn("delete reservation: failed to write config: {s}", .{@errorName(err)});
+                };
+            }
+        } else {
+            // Dynamic lease: notify sync peers of deletion.
+            if (server.sync_mgr) |s| s.notifyLeaseDelete(mac);
         }
     }
     state.mode = .normal;
@@ -2150,6 +2301,8 @@ const pool_field_meta = [_]PoolFieldMeta{
     .{ .label = "DNS Upd Zone" },
     .{ .label = "DNS Upd Key Name", .sensitive = true },
     .{ .label = "DNS Upd Key File", .sensitive = true },
+    .{ .label = "Static Routes", .section = "Lists" },
+    .{ .label = "DHCP Options" },
 };
 
 /// Return the string value of a pool form field by index.
@@ -2175,6 +2328,8 @@ fn poolFormFieldVal(form: *const PoolForm, idx: u8) []const u8 {
         17 => form.dns_update_zone_buf[0..form.dns_update_zone_len],
         18 => form.dns_update_key_name_buf[0..form.dns_update_key_name_len],
         19 => form.dns_update_key_file_buf[0..form.dns_update_key_file_len],
+        20 => "(Enter to edit)",
+        21 => "(Enter to edit)",
         else => "",
     };
 }
@@ -2270,6 +2425,40 @@ fn populatePoolForm(form: *PoolForm, pool: *const config_mod.PoolConfig) void {
     copyField(&form.dns_update_zone_buf, &form.dns_update_zone_len, pool.dns_update.zone);
     copyField(&form.dns_update_key_name_buf, &form.dns_update_key_name_len, pool.dns_update.key_name);
     copyField(&form.dns_update_key_file_buf, &form.dns_update_key_file_len, pool.dns_update.key_file);
+
+    // Copy static routes.
+    form.route_count = @min(pool.static_routes.len, form.routes.len);
+    for (0..form.route_count) |i| {
+        const sr = &pool.static_routes[i];
+        var re = &form.routes[i];
+        re.* = .{};
+        const dest = std.fmt.bufPrint(&re.dest_buf, "{d}.{d}.{d}.{d}/{d}", .{
+            sr.destination[0], sr.destination[1], sr.destination[2], sr.destination[3], sr.prefix_len,
+        }) catch "";
+        re.dest_len = dest.len;
+        const rtr = std.fmt.bufPrint(&re.router_buf, "{d}.{d}.{d}.{d}", .{
+            sr.router[0], sr.router[1], sr.router[2], sr.router[3],
+        }) catch "";
+        re.router_len = rtr.len;
+    }
+
+    // Copy DHCP options.
+    form.option_count = 0;
+    var it = pool.dhcp_options.iterator();
+    while (it.next()) |entry| {
+        if (form.option_count >= form.options.len) break;
+        var oe = &form.options[form.option_count];
+        oe.* = .{};
+        const code = entry.key_ptr.*;
+        const val = entry.value_ptr.*;
+        const cn = @min(code.len, oe.code_buf.len);
+        @memcpy(oe.code_buf[0..cn], code[0..cn]);
+        oe.code_len = cn;
+        const vn = @min(val.len, oe.value_buf.len);
+        @memcpy(oe.value_buf[0..vn], val[0..vn]);
+        oe.value_len = vn;
+        form.option_count += 1;
+    }
 }
 
 fn copyField(buf: anytype, len: *usize, src: []const u8) void {
@@ -2284,9 +2473,28 @@ fn copyField(buf: anytype, len: *usize, src: []const u8) void {
 /// e.g. subnet=192.168.10.0, start=192.168.10.100, end=192.168.10.200 → ".100 – .200"
 ///      subnet=172.20.0.0, start=172.20.0.100, end=172.20.14.200 → ".0.100 – .14.200"
 fn fmtAbbrevRange(fa: std.mem.Allocator, pool: *const config_mod.PoolConfig) ![]const u8 {
-    if (pool.pool_start.len == 0 and pool.pool_end.len == 0) return "auto";
-    const start = if (pool.pool_start.len > 0) pool.pool_start else "(auto)";
-    const end = if (pool.pool_end.len > 0) pool.pool_end else "(auto)";
+    // Compute effective start/end IPs (resolve "auto" to subnet+1 / broadcast-1).
+    const subnet_bytes = config_mod.parseIpv4(pool.subnet) catch return "?";
+    const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
+    const broadcast_int = subnet_int | ~pool.subnet_mask;
+
+    var start_buf: [16]u8 = undefined;
+    const start: []const u8 = if (pool.pool_start.len > 0) pool.pool_start else blk: {
+        const s = subnet_int + 1;
+        break :blk std.fmt.bufPrint(&start_buf, "{d}.{d}.{d}.{d}", .{
+            @as(u8, @truncate(s >> 24)), @as(u8, @truncate(s >> 16)),
+            @as(u8, @truncate(s >> 8)),  @as(u8, @truncate(s)),
+        }) catch return "?";
+    };
+    var end_buf: [16]u8 = undefined;
+    const end: []const u8 = if (pool.pool_end.len > 0) pool.pool_end else blk: {
+        const e = broadcast_int - 1;
+        break :blk std.fmt.bufPrint(&end_buf, "{d}.{d}.{d}.{d}", .{
+            @as(u8, @truncate(e >> 24)), @as(u8, @truncate(e >> 16)),
+            @as(u8, @truncate(e >> 8)),  @as(u8, @truncate(e)),
+        }) catch return "?";
+    };
+
     // Find common prefix octets with subnet.
     const sub_octets = splitOctets(pool.subnet);
     const start_octets = splitOctets(start);
@@ -2407,10 +2615,11 @@ fn renderPoolsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, fa:
     }
 
     // --- Build sortable row data ---
+    const filter = state.pool_filter_buf[0..state.pool_filter_len];
     const PoolRowData = struct { subnet: []const u8, range: []const u8, router: []const u8, lease: []const u8, res: []const u8, dns: []const u8, orig_idx: usize };
     var row_data = std.ArrayList(PoolRowData){};
     for (pools, 0..) |*p, pi| {
-        try row_data.append(fa, .{
+        const rd = PoolRowData{
             .subnet = std.fmt.allocPrint(fa, "{s}/{d}", .{ p.subnet, p.prefix_len }) catch "?",
             .range = fmtAbbrevRange(fa, p) catch "?",
             .router = p.router,
@@ -2418,7 +2627,17 @@ fn renderPoolsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, fa:
             .res = std.fmt.allocPrint(fa, "{d}", .{p.reservations.len}) catch "?",
             .dns = if (p.dns_update.enable) "yes" else "no",
             .orig_idx = pi,
-        });
+        };
+        // Apply filter.
+        if (filter.len > 0) {
+            const match = containsIgnoreCase(rd.subnet, filter) or
+                containsIgnoreCase(rd.range, filter) or
+                containsIgnoreCase(rd.router, filter) or
+                containsIgnoreCase(rd.lease, filter) or
+                containsIgnoreCase(rd.dns, filter);
+            if (!match) continue;
+        }
+        try row_data.append(fa, rd);
     }
 
     // Sort if a column is selected.
@@ -2511,6 +2730,11 @@ fn handlePoolsKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) void {
     } else if (key.matches('d', .{}) and !server.cfg.admin_ssh.read_only) {
         state.pool_del_index = state.pool_row;
         state.mode = .pool_delete_confirm;
+    } else if (key.matches('/', .{})) {
+        state.pool_filter_active = true;
+        state.pool_filter_len = 0;
+    } else if (key.matches(vaxis.Key.escape, .{})) {
+        state.pool_filter_len = 0;
     }
 }
 
@@ -2531,14 +2755,18 @@ fn renderPoolDetail(server: *AdminServer, state: *TuiState, win: vaxis.Window, f
     box.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = .{ .rgb = .{ 20, 20, 30 } } } });
 
     const border_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 160, 255 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+    drawBox(box, 0, 0, BOX_W, BOX_H, border_style);
     const label_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 140, 160, 200 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
     const val_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 220, 220, 220 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
     const section_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 80, 180, 255 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
     const hint_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 100, 130 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
 
-    // Title.
+    const close_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 80, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
+
+    // Title + [X].
     const title = std.fmt.allocPrint(fa, " Pool: {s}/{d} ", .{ pool.subnet, pool.prefix_len }) catch " Pool ";
     _ = box.print(&.{.{ .text = title, .style = border_style }}, .{ .row_offset = 0, .wrap = .none });
+    _ = box.print(&.{.{ .text = "[X]", .style = close_style }}, .{ .col_offset = BOX_W -| 4, .row_offset = 0, .wrap = .none });
 
     // Build lines.
     var lines: [40]struct { text: []const u8, style: vaxis.Style } = undefined;
@@ -2605,6 +2833,68 @@ fn renderPoolDetail(server: *AdminServer, state: *TuiState, win: vaxis.Window, f
     _ = box.print(&.{.{ .text = hint_text, .style = hint_style }}, .{ .row_offset = BOX_H - 1, .wrap = .none });
 }
 
+/// Check if a click at (row, col) hits the [X] close button of the current modal.
+fn isModalCloseClick(mode: TuiMode, win_w: u16, win_h: u16, row: u16, col: u16) bool {
+    // Compute the modal's position and width based on mode.
+    const dims = modalDims(mode, win_w, win_h);
+    const modal_y = dims.y;
+    const modal_x = dims.x;
+    const modal_w = dims.w;
+    // [X] is rendered at (modal_y, modal_x + modal_w - 4), occupying 3 chars.
+    return (row == modal_y and col >= modal_x + modal_w -| 4 and col < modal_x + modal_w -| 1);
+}
+
+fn modalDims(mode: TuiMode, win_w: u16, win_h: u16) struct { x: u16, y: u16, w: u16, h: u16 } {
+    switch (mode) {
+        .pool_form => {
+            const w = @max(60, @min(win_w * 4 / 5, win_w -| 4));
+            const h = @max(14, @min(win_h * 4 / 5, win_h -| 2));
+            return .{ .x = (win_w - w) / 2, .y = (win_h - h) / 2, .w = w, .h = h };
+        },
+        .pool_detail => {
+            const w: u16 = 62;
+            const h: u16 = 24;
+            return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
+        },
+        .reservation_form => {
+            const w: u16 = 54;
+            const h: u16 = 11;
+            return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
+        },
+        .delete_confirm => {
+            const w: u16 = 52;
+            const h: u16 = 5;
+            return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
+        },
+        .pool_delete_confirm => {
+            const w: u16 = 50;
+            const h: u16 = 8;
+            return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
+        },
+        .pool_save_confirm => {
+            const w: u16 = 64;
+            const h: u16 = 16;
+            return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
+        },
+        .route_list, .route_edit => {
+            const w: u16 = 56;
+            const h: u16 = 16;
+            return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
+        },
+        .option_list, .option_edit => {
+            const w: u16 = 56;
+            const h: u16 = 16;
+            return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
+        },
+        .help => {
+            const w: u16 = 52;
+            const h: u16 = 28;
+            return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
+        },
+        .normal => return .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    }
+}
+
 fn handlePoolDetailKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) void {
     if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
         state.mode = .normal;
@@ -2625,29 +2915,35 @@ fn handlePoolDetailKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) v
 
 fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
     const form = &state.pool_form;
-    const BOX_W: u16 = 64;
-    const BOX_H: u16 = 20;
-    if (win.width < BOX_W or win.height < BOX_H) return;
+    // Size modal to ~80% of terminal, clamped to reasonable bounds.
+    const BOX_W: u16 = @max(60, @min(win.width * 4 / 5, win.width -| 4));
+    const BOX_H: u16 = @max(14, @min(win.height * 4 / 5, win.height -| 2));
+    if (win.width < 40 or win.height < 10) return;
     const x = (win.width - BOX_W) / 2;
     const y = (win.height - BOX_H) / 2;
     const box = win.child(.{ .x_off = x, .y_off = y, .width = BOX_W, .height = BOX_H });
     box.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = .{ .rgb = .{ 20, 20, 30 } } } });
 
-    const border_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 160, 255 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
-    const section_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 80, 180, 255 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
-    const label_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 160, 160, 190 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+    const bg: vaxis.Style = .{ .bg = .{ .rgb = .{ 20, 20, 30 } } };
+    const border_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 160, 255 } }, .bg = bg.bg };
+    drawBox(box, 0, 0, BOX_W, BOX_H, border_style);
+    const section_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 80, 180, 255 } }, .bg = bg.bg, .bold = true };
+    const label_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 160, 160, 190 } }, .bg = bg.bg };
     const field_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 200, 200, 200 } }, .bg = .{ .rgb = .{ 30, 30, 45 } } };
     const active_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 255, 255 } }, .bg = .{ .rgb = .{ 50, 80, 140 } } };
-    const hint_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 100, 130 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
-    const err_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 80, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+    const hint_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 100, 130 } }, .bg = bg.bg };
+    const err_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 80, 80 } }, .bg = bg.bg };
+    const close_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 80, 80 } }, .bg = bg.bg, .bold = true };
 
-    // Title.
+    // Title + [X] close button.
     const title = if (form.isNew()) "  New Pool" else std.fmt.allocPrint(fa, "  Edit Pool: {s}", .{form.subnet_buf[0..form.subnet_len]}) catch "  Edit Pool";
     _ = box.print(&.{.{ .text = title, .style = border_style }}, .{ .row_offset = 0, .wrap = .none });
+    _ = box.print(&.{.{ .text = "[X]", .style = close_style }}, .{ .col_offset = BOX_W -| 4, .row_offset = 0, .wrap = .none });
 
     // Field rendering area: rows 1 .. BOX_H-3.
     const field_h = BOX_H - 3;
-    const FIELD_W: u16 = 32;
+    const LABEL_W: u16 = 19; // "  DNS Upd Key Name " = ~19
+    const FIELD_W: u16 = BOX_W -| LABEL_W -| 2; // 2 = right margin
 
     // Compute the rendered row for each field, accounting for section headers.
     // Then pick scroll_offset so active_field is vertically centered.
@@ -2714,18 +3010,32 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
         const label_text = std.fmt.allocPrint(fa, "  {s:<17}", .{meta.label}) catch "";
         _ = box.print(&.{.{ .text = label_text, .style = label_style }}, .{ .row_offset = row, .wrap = .none });
 
-        // Value field — pad to FIELD_W.
-        const val_trunc = val[0..@min(val.len, FIELD_W)];
-        const pad_len = FIELD_W - @as(u16, @intCast(val_trunc.len));
-        const padded = std.fmt.allocPrint(fa, "{s}{s}", .{ val_trunc, spaces(fa, pad_len) catch "" }) catch val_trunc;
-        _ = box.print(&.{.{ .text = padded, .style = style }}, .{ .col_offset = 19, .row_offset = row, .wrap = .none });
+        // Value field with horizontal scrolling for active field.
+        const fw = @as(usize, FIELD_W);
+        var vis_start: usize = 0;
+        var cursor_vis: usize = 0; // cursor position within the visible window
+        if (is_active and fi != 15) {
+            // Ensure cursor is visible by scrolling the text window.
+            const cur = @min(form.cursor, val.len);
+            if (cur >= fw) {
+                vis_start = cur - fw + 1;
+            }
+            cursor_vis = cur - vis_start;
+        }
+        const vis_end = @min(val.len, vis_start + fw);
+        const vis_text = val[vis_start..vis_end];
+        const pad_len = fw - vis_text.len;
+        const padded = std.fmt.allocPrint(fa, "{s}{s}", .{ vis_text, spaces(fa, @intCast(pad_len)) catch "" }) catch vis_text;
+        _ = box.print(&.{.{ .text = padded, .style = style }}, .{ .col_offset = LABEL_W, .row_offset = row, .wrap = .none });
 
-        // Cursor for active field.
-        if (is_active and fi != 15) { // 15 = boolean toggle, no cursor
+        // Cursor block: show character under cursor with inverted colors.
+        if (is_active and fi != 15) {
             const cursor_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 20, 20, 30 } }, .bg = .{ .rgb = .{ 100, 160, 255 } } };
-            const cursor_col: u16 = 19 + @as(u16, @intCast(val_trunc.len));
-            if (cursor_col < BOX_W - 1) {
-                _ = box.print(&.{.{ .text = " ", .style = cursor_style }}, .{ .col_offset = cursor_col, .row_offset = row, .wrap = .none });
+            const cursor_col = LABEL_W + @as(u16, @intCast(cursor_vis));
+            if (cursor_col < BOX_W -| 1) {
+                const cur_abs = vis_start + cursor_vis;
+                const ch: []const u8 = if (cur_abs < val.len) val[cur_abs..][0..1] else " ";
+                _ = box.print(&.{.{ .text = ch, .style = cursor_style }}, .{ .col_offset = cursor_col, .row_offset = row, .wrap = .none });
             }
         }
         row += 1;
@@ -2754,7 +3064,17 @@ fn handlePoolFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
         return;
     }
     if (key.matches(vaxis.Key.enter, .{})) {
-        // Validate and proceed to confirm screen.
+        // Fields 20/21 open sub-modals instead of saving.
+        if (form.active_field == 20) {
+            state.sub_list_row = 0;
+            state.mode = .route_list;
+            return;
+        }
+        if (form.active_field == 21) {
+            state.sub_list_row = 0;
+            state.mode = .option_list;
+            return;
+        }
         if (validatePoolForm(form)) |err_msg| {
             form.err_len = @min(err_msg.len, form.err_buf.len);
             @memcpy(form.err_buf[0..form.err_len], err_msg[0..form.err_len]);
@@ -2764,12 +3084,20 @@ fn handlePoolFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
         state.mode = .pool_save_confirm;
         return;
     }
-    if (key.matches(vaxis.Key.tab, .{ .shift = true })) {
-        if (form.active_field > 0) form.active_field -= 1;
+
+    // Field navigation: Tab/Shift-Tab and Up/Down arrows.
+    if (key.matches(vaxis.Key.tab, .{ .shift = true }) or key.matches(vaxis.Key.up, .{})) {
+        if (form.active_field > 0) {
+            form.active_field -= 1;
+            form.cursor = poolFormFieldLen(form, form.active_field);
+        }
         return;
     }
-    if (key.matches(vaxis.Key.tab, .{})) {
-        if (form.active_field + 1 < PoolForm.FIELD_COUNT) form.active_field += 1;
+    if (key.matches(vaxis.Key.tab, .{}) or key.matches(vaxis.Key.down, .{})) {
+        if (form.active_field + 1 < PoolForm.FIELD_COUNT) {
+            form.active_field += 1;
+            form.cursor = poolFormFieldLen(form, form.active_field);
+        }
         return;
     }
 
@@ -2781,19 +3109,62 @@ fn handlePoolFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
         return;
     }
 
-    // Text input.
+    // Cursor movement within field.
+    if (key.matches(vaxis.Key.left, .{})) {
+        if (form.cursor > 0) form.cursor -= 1;
+        return;
+    }
+    if (key.matches(vaxis.Key.right, .{})) {
+        if (form.cursor < poolFormFieldLen(form, form.active_field)) form.cursor += 1;
+        return;
+    }
+    if (key.matches(vaxis.Key.home, .{})) {
+        form.cursor = 0;
+        return;
+    }
+    if (key.matches(vaxis.Key.end, .{})) {
+        form.cursor = poolFormFieldLen(form, form.active_field);
+        return;
+    }
+
+    // Text editing at cursor position.
     if (key.matches(vaxis.Key.backspace, .{})) {
         if (poolFormFieldBuf(form, form.active_field)) |fb| {
-            if (fb.len.* > 0) fb.len.* -= 1;
+            if (form.cursor > 0 and fb.len.* > 0) {
+                // Shift bytes after cursor left by one.
+                const pos = form.cursor;
+                if (pos < fb.len.*) {
+                    std.mem.copyForwards(u8, fb.buf[pos - 1 ..], fb.buf[pos..fb.len.*]);
+                }
+                fb.len.* -= 1;
+                form.cursor -= 1;
+            }
+        }
+    } else if (key.matches(vaxis.Key.delete, .{})) {
+        if (poolFormFieldBuf(form, form.active_field)) |fb| {
+            if (form.cursor < fb.len.*) {
+                std.mem.copyForwards(u8, fb.buf[form.cursor..], fb.buf[form.cursor + 1 .. fb.len.*]);
+                fb.len.* -= 1;
+            }
         }
     } else if (key.codepoint >= 0x20 and key.codepoint <= 0x7E) {
         if (poolFormFieldBuf(form, form.active_field)) |fb| {
             if (fb.len.* < fb.buf.len) {
-                fb.buf[fb.len.*] = @intCast(key.codepoint);
+                // Shift bytes after cursor right by one, insert character.
+                const pos = form.cursor;
+                if (pos < fb.len.*) {
+                    std.mem.copyBackwards(u8, fb.buf[pos + 1 ..], fb.buf[pos..fb.len.*]);
+                }
+                fb.buf[pos] = @intCast(key.codepoint);
                 fb.len.* += 1;
+                form.cursor += 1;
             }
         }
     }
+}
+
+fn poolFormFieldLen(form: *const PoolForm, idx: u8) usize {
+    return (poolFormFieldVal(form, idx)).len;
 }
 
 fn validatePoolForm(form: *const PoolForm) ?[]const u8 {
@@ -2853,7 +3224,9 @@ fn validateIpList(input: []const u8) ?[]const u8 {
     return null;
 }
 
-fn parseSubnet(s: []const u8) ?struct { ip: [4]u8, prefix: u8, mask: u32 } {
+const SubnetInfo = struct { ip: [4]u8, prefix: u8, mask: u32 };
+
+fn parseSubnet(s: []const u8) ?SubnetInfo {
     const slash = std.mem.indexOfScalar(u8, s, '/') orelse return null;
     const ip = config_mod.parseIpv4(s[0..slash]) catch return null;
     const prefix = std.fmt.parseInt(u8, s[slash + 1 ..], 10) catch return null;
@@ -2943,13 +3316,16 @@ fn renderPoolSaveConfirm(server: *AdminServer, state: *TuiState, win: vaxis.Wind
     box.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = .{ .rgb = .{ 20, 20, 30 } } } });
 
     const border_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 160, 255 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+    drawBox(box, 0, 0, BOX_W, BOX_H, border_style);
     const sync_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 80, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
     const drift_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 220, 180, 60 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
     const hint_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 100, 130 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
     const warn_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 100, 100 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
 
+    const close_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 80, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
     const title = if (confirm.is_new_pool) " Confirm New Pool " else if (confirm.is_delete) " Confirm Delete " else " Confirm Changes ";
     _ = box.print(&.{.{ .text = title, .style = border_style }}, .{ .row_offset = 0, .wrap = .none });
+    _ = box.print(&.{.{ .text = "[X]", .style = close_style }}, .{ .col_offset = BOX_W -| 4, .row_offset = 0, .wrap = .none });
 
     if (confirm.change_count == 0 and !confirm.is_new_pool and !confirm.is_delete) {
         _ = box.print(&.{.{ .text = "  No changes detected.", .style = hint_style }}, .{ .row_offset = 1, .wrap = .none });
@@ -3026,37 +3402,106 @@ fn buildPoolFromForm(allocator: std.mem.Allocator, form: *const PoolForm) ?confi
     const subnet_info = parseSubnet(form.subnet_buf[0..form.subnet_len]) orelse return null;
     const lease_time = std.fmt.parseInt(u32, form.lease_time_buf[0..form.lease_time_len], 10) catch return null;
 
-    return config_mod.PoolConfig{
-        .subnet = allocator.dupe(u8, subnetIpStr(form)) catch return null,
-        .subnet_mask = subnet_info.mask,
-        .prefix_len = subnet_info.prefix,
-        .router = allocator.dupe(u8, form.router_buf[0..form.router_len]) catch return null,
-        .pool_start = allocator.dupe(u8, form.pool_start_buf[0..form.pool_start_len]) catch return null,
-        .pool_end = allocator.dupe(u8, form.pool_end_buf[0..form.pool_end_len]) catch return null,
-        .dns_servers = splitCommaDupe(allocator, form.dns_servers_buf[0..form.dns_servers_len]) catch return null,
-        .domain_name = allocator.dupe(u8, form.domain_name_buf[0..form.domain_name_len]) catch return null,
-        .domain_search = splitCommaDupe(allocator, form.domain_search_buf[0..form.domain_search_len]) catch return null,
+    // Build via helper that returns errors so errdefer can clean up on OOM.
+    var pool = buildPoolFromFormInner(allocator, form, subnet_info, lease_time) catch return null;
+    _ = &pool;
+    return pool;
+}
+
+fn buildPoolFromFormInner(
+    allocator: std.mem.Allocator,
+    form: *const PoolForm,
+    subnet_info: SubnetInfo,
+    lease_time: u32,
+) !config_mod.PoolConfig {
+    var pool: config_mod.PoolConfig = undefined;
+    pool.subnet = try allocator.dupe(u8, subnetIpStr(form));
+    errdefer allocator.free(pool.subnet);
+    pool.subnet_mask = subnet_info.mask;
+    pool.prefix_len = subnet_info.prefix;
+    pool.router = try allocator.dupe(u8, form.router_buf[0..form.router_len]);
+    errdefer allocator.free(pool.router);
+    pool.pool_start = try allocator.dupe(u8, form.pool_start_buf[0..form.pool_start_len]);
+    errdefer allocator.free(pool.pool_start);
+    pool.pool_end = try allocator.dupe(u8, form.pool_end_buf[0..form.pool_end_len]);
+    errdefer allocator.free(pool.pool_end);
+    pool.dns_servers = try splitCommaDupe(allocator, form.dns_servers_buf[0..form.dns_servers_len]);
+    errdefer {
+        for (pool.dns_servers) |s| allocator.free(s);
+        allocator.free(pool.dns_servers);
+    }
+    pool.domain_name = try allocator.dupe(u8, form.domain_name_buf[0..form.domain_name_len]);
+    errdefer allocator.free(pool.domain_name);
+    pool.domain_search = try splitCommaDupe(allocator, form.domain_search_buf[0..form.domain_search_len]);
+    errdefer {
+        for (pool.domain_search) |s| allocator.free(s);
+        allocator.free(pool.domain_search);
+    }
+    pool.lease_time = lease_time;
+    pool.time_offset = if (form.time_offset_len > 0) (std.fmt.parseInt(i32, form.time_offset_buf[0..form.time_offset_len], 10) catch null) else null;
+    pool.time_servers = try splitCommaDupe(allocator, form.time_servers_buf[0..form.time_servers_len]);
+    errdefer {
+        for (pool.time_servers) |s| allocator.free(s);
+        allocator.free(pool.time_servers);
+    }
+    pool.log_servers = try splitCommaDupe(allocator, form.log_servers_buf[0..form.log_servers_len]);
+    errdefer {
+        for (pool.log_servers) |s| allocator.free(s);
+        allocator.free(pool.log_servers);
+    }
+    pool.ntp_servers = try splitCommaDupe(allocator, form.ntp_servers_buf[0..form.ntp_servers_len]);
+    errdefer {
+        for (pool.ntp_servers) |s| allocator.free(s);
+        allocator.free(pool.ntp_servers);
+    }
+    pool.tftp_server_name = try allocator.dupe(u8, form.tftp_server_buf[0..form.tftp_server_len]);
+    errdefer allocator.free(pool.tftp_server_name);
+    pool.boot_filename = try allocator.dupe(u8, form.boot_filename_buf[0..form.boot_filename_len]);
+    errdefer allocator.free(pool.boot_filename);
+    pool.http_boot_url = try allocator.dupe(u8, form.http_boot_url_buf[0..form.http_boot_url_len]);
+    errdefer allocator.free(pool.http_boot_url);
+    pool.dns_update = .{
+        .enable = form.dns_update_enable,
+        .server = try allocator.dupe(u8, form.dns_update_server_buf[0..form.dns_update_server_len]),
+        .zone = try allocator.dupe(u8, form.dns_update_zone_buf[0..form.dns_update_zone_len]),
+        .rev_zone = try allocator.dupe(u8, ""),
+        .key_name = try allocator.dupe(u8, form.dns_update_key_name_buf[0..form.dns_update_key_name_len]),
+        .key_file = try allocator.dupe(u8, form.dns_update_key_file_buf[0..form.dns_update_key_file_len]),
         .lease_time = lease_time,
-        .time_offset = if (form.time_offset_len > 0) (std.fmt.parseInt(i32, form.time_offset_buf[0..form.time_offset_len], 10) catch null) else null,
-        .time_servers = splitCommaDupe(allocator, form.time_servers_buf[0..form.time_servers_len]) catch return null,
-        .log_servers = splitCommaDupe(allocator, form.log_servers_buf[0..form.log_servers_len]) catch return null,
-        .ntp_servers = splitCommaDupe(allocator, form.ntp_servers_buf[0..form.ntp_servers_len]) catch return null,
-        .tftp_server_name = allocator.dupe(u8, form.tftp_server_buf[0..form.tftp_server_len]) catch return null,
-        .boot_filename = allocator.dupe(u8, form.boot_filename_buf[0..form.boot_filename_len]) catch return null,
-        .http_boot_url = allocator.dupe(u8, form.http_boot_url_buf[0..form.http_boot_url_len]) catch return null,
-        .dns_update = .{
-            .enable = form.dns_update_enable,
-            .server = allocator.dupe(u8, form.dns_update_server_buf[0..form.dns_update_server_len]) catch return null,
-            .zone = allocator.dupe(u8, form.dns_update_zone_buf[0..form.dns_update_zone_len]) catch return null,
-            .rev_zone = allocator.dupe(u8, "") catch return null,
-            .key_name = allocator.dupe(u8, form.dns_update_key_name_buf[0..form.dns_update_key_name_len]) catch return null,
-            .key_file = allocator.dupe(u8, form.dns_update_key_file_buf[0..form.dns_update_key_file_len]) catch return null,
-            .lease_time = lease_time,
-        },
-        .dhcp_options = std.StringHashMap([]const u8).init(allocator),
-        .reservations = allocator.alloc(config_mod.Reservation, 0) catch return null,
-        .static_routes = allocator.alloc(config_mod.StaticRoute, 0) catch return null,
     };
+    pool.dhcp_options = std.StringHashMap([]const u8).init(allocator);
+    // Copy DHCP options from form.
+    for (0..form.option_count) |i| {
+        const oe = &form.options[i];
+        if (oe.code_len > 0) {
+            const k = try allocator.dupe(u8, oe.code_buf[0..oe.code_len]);
+            errdefer allocator.free(k);
+            const v = try allocator.dupe(u8, oe.value_buf[0..oe.value_len]);
+            errdefer allocator.free(v);
+            try pool.dhcp_options.put(k, v);
+        }
+    }
+    pool.reservations = try allocator.alloc(config_mod.Reservation, 0);
+    // Build static routes from form.
+    pool.static_routes = try buildRoutesFromForm(allocator, form);
+    return pool;
+}
+
+fn buildRoutesFromForm(allocator: std.mem.Allocator, form: *const PoolForm) ![]config_mod.StaticRoute {
+    if (form.route_count == 0) return try allocator.alloc(config_mod.StaticRoute, 0);
+    var routes = try allocator.alloc(config_mod.StaticRoute, form.route_count);
+    for (0..form.route_count) |i| {
+        const re = &form.routes[i];
+        const dest_str = re.dest_buf[0..re.dest_len];
+        const router_str = re.router_buf[0..re.router_len];
+        const subnet_info = parseSubnet(dest_str) orelse {
+            routes[i] = .{ .destination = .{ 0, 0, 0, 0 }, .prefix_len = 0, .router = .{ 0, 0, 0, 0 } };
+            continue;
+        };
+        const rtr = config_mod.parseIpv4(router_str) catch [4]u8{ 0, 0, 0, 0 };
+        routes[i] = .{ .destination = subnet_info.ip, .prefix_len = subnet_info.prefix, .router = rtr };
+    }
+    return routes;
 }
 
 fn subnetIpStr(form: *const PoolForm) []const u8 {
@@ -3120,17 +3565,46 @@ fn applyFormToPool(allocator: std.mem.Allocator, pool: *config_mod.PoolConfig, f
     replaceStr(allocator, &pool.dns_update.key_name, form.dns_update_key_name_buf[0..form.dns_update_key_name_len]);
     replaceStr(allocator, &pool.dns_update.key_file, form.dns_update_key_file_buf[0..form.dns_update_key_file_len]);
     pool.dns_update.lease_time = lease_time;
+
+    // Replace static routes.
+    allocator.free(pool.static_routes);
+    pool.static_routes = buildRoutesFromForm(allocator, form) catch (allocator.alloc(config_mod.StaticRoute, 0) catch unreachable);
+
+    // Replace DHCP options.
+    var opt_it = pool.dhcp_options.iterator();
+    while (opt_it.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+        allocator.free(entry.value_ptr.*);
+    }
+    pool.dhcp_options.clearRetainingCapacity();
+    for (0..form.option_count) |i| {
+        const oe = &form.options[i];
+        if (oe.code_len > 0) {
+            const k = allocator.dupe(u8, oe.code_buf[0..oe.code_len]) catch continue;
+            const v = allocator.dupe(u8, oe.value_buf[0..oe.value_len]) catch {
+                allocator.free(k);
+                continue;
+            };
+            pool.dhcp_options.put(k, v) catch {
+                allocator.free(k);
+                allocator.free(v);
+                continue;
+            };
+        }
+    }
 }
 
 fn replaceStr(allocator: std.mem.Allocator, field: *[]const u8, new_val: []const u8) void {
     allocator.free(field.*);
-    field.* = allocator.dupe(u8, new_val) catch "";
+    // field.* must always be allocator-owned (safe to free later).
+    // Fall back to zero-length allocated slice on OOM (can't use a string literal).
+    field.* = allocator.dupe(u8, new_val) catch (allocator.alloc(u8, 0) catch unreachable);
 }
 
 fn replaceStrSlice(allocator: std.mem.Allocator, field: *[][]const u8, csv: []const u8) void {
     for (field.*) |s| allocator.free(s);
     allocator.free(field.*);
-    field.* = splitCommaDupe(allocator, csv) catch allocator.alloc([]const u8, 0) catch &.{};
+    field.* = splitCommaDupe(allocator, csv) catch (allocator.alloc([]const u8, 0) catch unreachable);
 }
 
 fn triggerReload(state: *TuiState) void {
@@ -3149,7 +3623,9 @@ fn renderPoolDeleteConfirm(server: *AdminServer, state: *TuiState, win: vaxis.Wi
 
     // Count active leases in this pool.
     var lease_count: usize = 0;
-    const leases = server.store.listLeases() catch &.{};
+    const leases_allocated = server.store.listLeases() catch null;
+    defer if (leases_allocated) |l| server.store.allocator.free(l);
+    const leases: []const state_mod.Lease = leases_allocated orelse &.{};
     for (leases) |l| {
         if (isIpInPool(l.ip, pool)) lease_count += 1;
     }
@@ -3163,11 +3639,14 @@ fn renderPoolDeleteConfirm(server: *AdminServer, state: *TuiState, win: vaxis.Wi
     box.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = .{ .rgb = .{ 20, 20, 30 } } } });
 
     const border_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 100, 100 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
+    drawBox(box, 0, 0, BOX_W, BOX_H, border_style);
     const text_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 220, 220, 220 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
     const warn_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 100, 100 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
     const hint_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 100, 130 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
 
+    const close_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 80, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
     _ = box.print(&.{.{ .text = " Delete Pool ", .style = border_style }}, .{ .row_offset = 0, .wrap = .none });
+    _ = box.print(&.{.{ .text = "[X]", .style = close_style }}, .{ .col_offset = BOX_W -| 4, .row_offset = 0, .wrap = .none });
 
     const label = std.fmt.allocPrint(fa, "  Delete pool {s}/{d}?", .{ pool.subnet, pool.prefix_len }) catch "  Delete pool?";
     _ = box.print(&.{.{ .text = label, .style = text_style }}, .{ .row_offset = 1, .wrap = .none });
@@ -3203,6 +3682,370 @@ fn handlePoolDeleteConfirmKey(server: *AdminServer, state: *TuiState, key: vaxis
         }
     }
     state.mode = .normal;
+}
+
+// ---------------------------------------------------------------------------
+// Settings tab
+// ---------------------------------------------------------------------------
+
+fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
+    const cfg = server.cfg;
+    const hdr_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 80, 180, 255 } }, .bold = true };
+    const label_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 160, 160, 190 } } };
+    const val_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 220, 220, 220 } } };
+    const ro_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 120, 120, 140 } } };
+
+    var row: u16 = 0;
+    const scroll = state.settings_scroll;
+
+    const lines = [_]struct { text: []const u8, style: vaxis.Style }{
+        .{ .text = "  -- General --", .style = hdr_style },
+        .{ .text = try std.fmt.allocPrint(fa, "  Listen Address:    {s}  (restart required)", .{cfg.listen_address}), .style = ro_style },
+        .{ .text = try std.fmt.allocPrint(fa, "  State Directory:   {s}", .{cfg.state_dir}), .style = ro_style },
+        .{ .text = try std.fmt.allocPrint(fa, "  Log Level:         {s}", .{@tagName(cfg.log_level)}), .style = val_style },
+        .{ .text = try std.fmt.allocPrint(fa, "  Random Allocation: {s}", .{if (cfg.pool_allocation_random) "true" else "false"}), .style = ro_style },
+        .{ .text = "", .style = label_style },
+        .{ .text = "  -- Admin SSH --", .style = hdr_style },
+        .{ .text = try std.fmt.allocPrint(fa, "  Enable:     {s}", .{if (cfg.admin_ssh.enable) "true" else "false"}), .style = ro_style },
+        .{ .text = try std.fmt.allocPrint(fa, "  Port:       {d}", .{cfg.admin_ssh.port}), .style = ro_style },
+        .{ .text = try std.fmt.allocPrint(fa, "  Bind:       {s}", .{cfg.admin_ssh.bind}), .style = ro_style },
+        .{ .text = try std.fmt.allocPrint(fa, "  Read Only:  {s}", .{if (cfg.admin_ssh.read_only) "true" else "false"}), .style = ro_style },
+        .{ .text = "", .style = label_style },
+        .{ .text = "  -- Metrics --", .style = hdr_style },
+        .{ .text = try std.fmt.allocPrint(fa, "  Collect:     {s}", .{if (cfg.metrics.collect) "true" else "false"}), .style = val_style },
+        .{ .text = try std.fmt.allocPrint(fa, "  HTTP Enable: {s}", .{if (cfg.metrics.http_enable) "true" else "false"}), .style = val_style },
+        .{ .text = try std.fmt.allocPrint(fa, "  HTTP Port:   {d}", .{cfg.metrics.http_port}), .style = val_style },
+        .{ .text = try std.fmt.allocPrint(fa, "  HTTP Bind:   {s}", .{cfg.metrics.http_bind}), .style = val_style },
+    };
+
+    // Add sync section if configured.
+    var sync_lines: [8]struct { text: []const u8, style: vaxis.Style } = undefined;
+    var sync_count: usize = 0;
+    if (cfg.sync) |s| {
+        sync_lines[0] = .{ .text = "", .style = label_style };
+        sync_lines[1] = .{ .text = "  -- Sync --", .style = hdr_style };
+        sync_lines[2] = .{ .text = try std.fmt.allocPrint(fa, "  Enable:        true", .{}), .style = ro_style };
+        sync_lines[3] = .{ .text = try std.fmt.allocPrint(fa, "  Group:         {s}", .{s.group_name}), .style = ro_style };
+        sync_lines[4] = .{ .text = try std.fmt.allocPrint(fa, "  Port:          {d}", .{s.port}), .style = ro_style };
+        if (s.multicast) |mc| {
+            sync_lines[5] = .{ .text = try std.fmt.allocPrint(fa, "  Multicast:     {s}", .{mc}), .style = ro_style };
+            sync_count = 6;
+        } else if (s.peers.len > 0) {
+            sync_lines[5] = .{ .text = try std.fmt.allocPrint(fa, "  Peers:         {s}", .{try std.mem.join(fa, ", ", s.peers)}), .style = ro_style };
+            sync_count = 6;
+        } else {
+            sync_count = 5;
+        }
+    }
+
+    // Render visible lines.
+    for (lines) |line| {
+        if (row >= scroll and row - scroll < win.height) {
+            _ = win.print(&.{.{ .text = line.text, .style = line.style }}, .{ .row_offset = row - scroll, .wrap = .none });
+        }
+        row += 1;
+    }
+    for (sync_lines[0..sync_count]) |line| {
+        if (row >= scroll and row - scroll < win.height) {
+            _ = win.print(&.{.{ .text = line.text, .style = line.style }}, .{ .row_offset = row - scroll, .wrap = .none });
+        }
+        row += 1;
+    }
+}
+
+fn handleSettingsKey(_: *AdminServer, state: *TuiState, key: vaxis.Key) void {
+    if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
+        state.settings_scroll +|= 1;
+    } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
+        state.settings_scroll -|= 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Help screen
+// ---------------------------------------------------------------------------
+
+fn renderHelp(win: vaxis.Window) void {
+    const BOX_W: u16 = 52;
+    const BOX_H: u16 = 28;
+    if (win.width < BOX_W or win.height < BOX_H) return;
+    const x = (win.width - BOX_W) / 2;
+    const y = (win.height -| BOX_H) / 2;
+    const box = win.child(.{ .x_off = x, .y_off = y, .width = BOX_W, .height = BOX_H });
+    box.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = .{ .rgb = .{ 20, 20, 35 } } } });
+    const border_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 160, 255 } }, .bg = .{ .rgb = .{ 20, 20, 35 } } };
+    drawBox(box, 0, 0, BOX_W, BOX_H, border_style);
+    const close_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 80, 80 } }, .bg = .{ .rgb = .{ 20, 20, 35 } }, .bold = true };
+    _ = box.print(&.{.{ .text = "[X]", .style = close_style }}, .{ .col_offset = BOX_W -| 4, .row_offset = 0, .wrap = .none });
+
+    const t: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 160, 255 } }, .bg = .{ .rgb = .{ 20, 20, 35 } }, .bold = true };
+    const s: vaxis.Style = .{ .fg = .{ .rgb = .{ 80, 180, 255 } }, .bg = .{ .rgb = .{ 20, 20, 35 } }, .bold = true };
+    const n: vaxis.Style = .{ .fg = .{ .rgb = .{ 200, 200, 200 } }, .bg = .{ .rgb = .{ 20, 20, 35 } } };
+    const d: vaxis.Style = .{ .fg = .{ .rgb = .{ 130, 130, 150 } }, .bg = .{ .rgb = .{ 20, 20, 35 } } };
+
+    const lines = [_]struct { text: []const u8, style: vaxis.Style }{
+        .{ .text = " Keyboard Shortcuts", .style = t },
+        .{ .text = "", .style = n },
+        .{ .text = " -- Global --", .style = s },
+        .{ .text = "  1/2/3/4       Switch tabs", .style = n },
+        .{ .text = "  Tab/Shift-Tab Next/prev tab", .style = n },
+        .{ .text = "  Ctrl+R        Reload configuration", .style = n },
+        .{ .text = "  ?             This help screen", .style = n },
+        .{ .text = "  q / Ctrl+C    Quit session", .style = n },
+        .{ .text = "", .style = n },
+        .{ .text = " -- Leases --", .style = s },
+        .{ .text = "  j/k           Navigate rows", .style = n },
+        .{ .text = "  /             Filter leases", .style = n },
+        .{ .text = "  I/M/H/T/E/P  Sort by column", .style = n },
+        .{ .text = "  y + i/m/h     Yank IP/MAC/hostname", .style = n },
+        .{ .text = "  n  New reservation   e  Edit", .style = n },
+        .{ .text = "  d  Delete / force-release", .style = n },
+        .{ .text = "", .style = n },
+        .{ .text = " -- Pools --", .style = s },
+        .{ .text = "  v/Enter  View     e  Edit", .style = n },
+        .{ .text = "  n  New pool       d  Delete", .style = n },
+        .{ .text = "  /  Filter pools", .style = n },
+        .{ .text = "", .style = n },
+        .{ .text = " -- Forms --", .style = s },
+        .{ .text = "  Up/Down/Tab   Navigate fields", .style = n },
+        .{ .text = "  Left/Right    Move cursor", .style = n },
+        .{ .text = "  Home/End      Jump to start/end", .style = n },
+        .{ .text = "  Enter  Save   Esc  Cancel", .style = d },
+    };
+
+    for (lines, 0..) |line, i| {
+        _ = box.print(&.{.{ .text = line.text, .style = line.style }}, .{ .row_offset = @intCast(i + 1), .wrap = .none });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Route list sub-modal
+// ---------------------------------------------------------------------------
+
+fn renderRouteList(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
+    const form = &state.pool_form;
+    const BOX_W: u16 = 56;
+    const BOX_H: u16 = @min(win.height -| 2, @as(u16, @intCast(@min(form.route_count + 5, 20))));
+    if (win.width < BOX_W or win.height < 6) return;
+    const x = (win.width - BOX_W) / 2;
+    const y = (win.height -| BOX_H) / 2;
+    const box = win.child(.{ .x_off = x, .y_off = y, .width = BOX_W, .height = BOX_H });
+    box.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = .{ .rgb = .{ 20, 20, 30 } } } });
+    const border_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 160, 255 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+    drawBox(box, 0, 0, BOX_W, BOX_H, border_style);
+    const close_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 80, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
+    _ = box.print(&.{.{ .text = " Static Routes ", .style = border_style }}, .{ .row_offset = 0, .col_offset = 1, .wrap = .none });
+    _ = box.print(&.{.{ .text = "[X]", .style = close_style }}, .{ .col_offset = BOX_W -| 4, .row_offset = 0, .wrap = .none });
+
+    const sel_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 255, 255 } }, .bg = .{ .rgb = .{ 50, 80, 140 } } };
+    const norm_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 200, 200, 200 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+    const edit_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 255, 255 } }, .bg = .{ .rgb = .{ 50, 80, 140 } } };
+    const hint_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 100, 130 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+
+    if (form.route_count == 0) {
+        _ = box.print(&.{.{ .text = "  (no routes)", .style = hint_style }}, .{ .row_offset = 1, .wrap = .none });
+    }
+    var row: u16 = 1;
+    for (0..form.route_count) |ri| {
+        if (row >= BOX_H - 2) break;
+        const r = &form.routes[ri];
+        const is_sel = ri == state.sub_list_row;
+        const is_editing = is_sel and state.mode == .route_edit;
+        const style = if (is_sel) sel_style else norm_style;
+        const dest = r.dest_buf[0..r.dest_len];
+        const router = r.router_buf[0..r.router_len];
+        const line = std.fmt.allocPrint(fa, "  {s:<20} via {s}", .{
+            if (dest.len > 0) dest else "...",
+            if (router.len > 0) router else "...",
+        }) catch "";
+        if (is_editing) {
+            _ = box.print(&.{.{ .text = line, .style = edit_style }}, .{ .row_offset = row, .wrap = .none });
+        } else {
+            _ = box.print(&.{.{ .text = line, .style = style }}, .{ .row_offset = row, .wrap = .none });
+        }
+        row += 1;
+    }
+    _ = box.print(&.{.{ .text = "  n:add  e:edit  d:del  Esc:back", .style = hint_style }}, .{ .row_offset = BOX_H - 1, .wrap = .none });
+}
+
+fn handleRouteListKey(_: *AdminServer, state: *TuiState, key: vaxis.Key) void {
+    var form = &state.pool_form;
+
+    if (state.mode == .route_edit) {
+        // Editing a route entry inline.
+        if (key.matches(vaxis.Key.escape, .{})) {
+            state.mode = .route_list;
+            return;
+        }
+        if (key.matches(vaxis.Key.enter, .{})) {
+            state.mode = .route_list;
+            return;
+        }
+        if (key.matches(vaxis.Key.tab, .{}) or key.matches(vaxis.Key.tab, .{ .shift = true })) {
+            state.sub_edit_field = if (state.sub_edit_field == 0) 1 else 0;
+            return;
+        }
+        const ri = state.sub_list_row;
+        if (ri >= form.route_count) return;
+        const r = &form.routes[ri];
+        const buf: []u8 = if (state.sub_edit_field == 0) &r.dest_buf else &r.router_buf;
+        const len: *usize = if (state.sub_edit_field == 0) &r.dest_len else &r.router_len;
+        if (key.matches(vaxis.Key.backspace, .{})) {
+            if (len.* > 0) len.* -= 1;
+        } else if (key.codepoint >= 0x20 and key.codepoint <= 0x7E) {
+            if (len.* < buf.len) {
+                buf[len.*] = @intCast(key.codepoint);
+                len.* += 1;
+            }
+        }
+        return;
+    }
+
+    // List mode.
+    if (key.matches(vaxis.Key.escape, .{})) {
+        state.mode = .pool_form;
+        return;
+    }
+    if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
+        if (form.route_count > 0 and state.sub_list_row + 1 < form.route_count) state.sub_list_row += 1;
+    } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
+        state.sub_list_row -|= 1;
+    } else if (key.matches('n', .{})) {
+        if (form.route_count < form.routes.len) {
+            form.routes[form.route_count] = .{};
+            form.route_count += 1;
+            state.sub_list_row = @intCast(form.route_count - 1);
+            state.sub_edit_field = 0;
+            state.mode = .route_edit;
+        }
+    } else if (key.matches('e', .{}) and form.route_count > 0) {
+        state.sub_edit_field = 0;
+        state.mode = .route_edit;
+    } else if (key.matches('d', .{}) and form.route_count > 0) {
+        const ri = state.sub_list_row;
+        if (ri < form.route_count) {
+            // Shift remaining entries down.
+            var i: usize = ri;
+            while (i + 1 < form.route_count) : (i += 1) {
+                form.routes[i] = form.routes[i + 1];
+            }
+            form.route_count -= 1;
+            if (state.sub_list_row > 0 and state.sub_list_row >= form.route_count) {
+                state.sub_list_row -= 1;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Option list sub-modal
+// ---------------------------------------------------------------------------
+
+fn renderOptionList(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
+    const form = &state.pool_form;
+    const BOX_W: u16 = 56;
+    const BOX_H: u16 = @min(win.height -| 2, @as(u16, @intCast(@min(form.option_count + 5, 20))));
+    if (win.width < BOX_W or win.height < 6) return;
+    const x = (win.width - BOX_W) / 2;
+    const y = (win.height -| BOX_H) / 2;
+    const box = win.child(.{ .x_off = x, .y_off = y, .width = BOX_W, .height = BOX_H });
+    box.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = .{ .rgb = .{ 20, 20, 30 } } } });
+    const border_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 160, 255 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+    drawBox(box, 0, 0, BOX_W, BOX_H, border_style);
+    const close_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 80, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
+    _ = box.print(&.{.{ .text = " DHCP Options ", .style = border_style }}, .{ .row_offset = 0, .col_offset = 1, .wrap = .none });
+    _ = box.print(&.{.{ .text = "[X]", .style = close_style }}, .{ .col_offset = BOX_W -| 4, .row_offset = 0, .wrap = .none });
+
+    const sel_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 255, 255 } }, .bg = .{ .rgb = .{ 50, 80, 140 } } };
+    const norm_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 200, 200, 200 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+    const hint_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 100, 130 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+
+    if (form.option_count == 0) {
+        _ = box.print(&.{.{ .text = "  (no options)", .style = hint_style }}, .{ .row_offset = 1, .wrap = .none });
+    }
+    var row: u16 = 1;
+    for (0..form.option_count) |oi| {
+        if (row >= BOX_H - 2) break;
+        const o = &form.options[oi];
+        const is_sel = oi == state.sub_list_row;
+        const style = if (is_sel) sel_style else norm_style;
+        const code = o.code_buf[0..o.code_len];
+        const val = o.value_buf[0..o.value_len];
+        const line = std.fmt.allocPrint(fa, "  {s:<6} {s}", .{
+            if (code.len > 0) code else "...",
+            if (val.len > 0) val else "...",
+        }) catch "";
+        _ = box.print(&.{.{ .text = line, .style = style }}, .{ .row_offset = row, .wrap = .none });
+        row += 1;
+    }
+    _ = box.print(&.{.{ .text = "  n:add  e:edit  d:del  Esc:back", .style = hint_style }}, .{ .row_offset = BOX_H - 1, .wrap = .none });
+}
+
+fn handleOptionListKey(_: *AdminServer, state: *TuiState, key: vaxis.Key) void {
+    var form = &state.pool_form;
+
+    if (state.mode == .option_edit) {
+        if (key.matches(vaxis.Key.escape, .{})) {
+            state.mode = .option_list;
+            return;
+        }
+        if (key.matches(vaxis.Key.enter, .{})) {
+            state.mode = .option_list;
+            return;
+        }
+        if (key.matches(vaxis.Key.tab, .{}) or key.matches(vaxis.Key.tab, .{ .shift = true })) {
+            state.sub_edit_field = if (state.sub_edit_field == 0) 1 else 0;
+            return;
+        }
+        const oi = state.sub_list_row;
+        if (oi >= form.option_count) return;
+        const o = &form.options[oi];
+        const buf: []u8 = if (state.sub_edit_field == 0) &o.code_buf else &o.value_buf;
+        const len: *usize = if (state.sub_edit_field == 0) &o.code_len else &o.value_len;
+        if (key.matches(vaxis.Key.backspace, .{})) {
+            if (len.* > 0) len.* -= 1;
+        } else if (key.codepoint >= 0x20 and key.codepoint <= 0x7E) {
+            if (len.* < buf.len) {
+                buf[len.*] = @intCast(key.codepoint);
+                len.* += 1;
+            }
+        }
+        return;
+    }
+
+    // List mode.
+    if (key.matches(vaxis.Key.escape, .{})) {
+        state.mode = .pool_form;
+        return;
+    }
+    if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
+        if (form.option_count > 0 and state.sub_list_row + 1 < form.option_count) state.sub_list_row += 1;
+    } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
+        state.sub_list_row -|= 1;
+    } else if (key.matches('n', .{})) {
+        if (form.option_count < form.options.len) {
+            form.options[form.option_count] = .{};
+            form.option_count += 1;
+            state.sub_list_row = @intCast(form.option_count - 1);
+            state.sub_edit_field = 0;
+            state.mode = .option_edit;
+        }
+    } else if (key.matches('e', .{}) and form.option_count > 0) {
+        state.sub_edit_field = 0;
+        state.mode = .option_edit;
+    } else if (key.matches('d', .{}) and form.option_count > 0) {
+        const oi = state.sub_list_row;
+        if (oi < form.option_count) {
+            var i: usize = oi;
+            while (i + 1 < form.option_count) : (i += 1) {
+                form.options[i] = form.options[i + 1];
+            }
+            form.option_count -= 1;
+            if (state.sub_list_row > 0 and state.sub_list_row >= form.option_count) {
+                state.sub_list_row -= 1;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3701,4 +4544,406 @@ test "handleStatsKey: up arrow at zero saturates" {
     state.stats_scroll = 0;
     handleStatsKey(&state, vaxis.Key{ .codepoint = vaxis.Key.up, .mods = .{} });
     try std.testing.expectEqual(@as(u16, 0), state.stats_scroll);
+}
+
+// ---------------------------------------------------------------------------
+// Pool tab helper tests
+// ---------------------------------------------------------------------------
+
+test "parseSubnet: valid /24" {
+    const result = parseSubnet("192.168.1.0/24").?;
+    try std.testing.expectEqual(@as(u8, 24), result.prefix);
+    try std.testing.expectEqual(@as(u32, 0xFFFFFF00), result.mask);
+    try std.testing.expectEqual([4]u8{ 192, 168, 1, 0 }, result.ip);
+}
+
+test "parseSubnet: valid /32" {
+    const result = parseSubnet("10.0.0.1/32").?;
+    try std.testing.expectEqual(@as(u8, 32), result.prefix);
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), result.mask);
+}
+
+test "parseSubnet: valid /16" {
+    const result = parseSubnet("172.20.0.0/16").?;
+    try std.testing.expectEqual(@as(u8, 16), result.prefix);
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), result.mask);
+}
+
+test "parseSubnet: missing slash returns null" {
+    try std.testing.expect(parseSubnet("192.168.1.0") == null);
+}
+
+test "parseSubnet: invalid prefix returns null" {
+    try std.testing.expect(parseSubnet("192.168.1.0/0") == null);
+    try std.testing.expect(parseSubnet("192.168.1.0/33") == null);
+}
+
+test "parseSubnet: invalid IP returns null" {
+    try std.testing.expect(parseSubnet("999.168.1.0/24") == null);
+}
+
+test "splitOctets: four octets" {
+    const result = splitOctets("192.168.10.100");
+    try std.testing.expectEqual(@as(usize, 4), result.count);
+    try std.testing.expectEqualStrings("192", result.items[0]);
+    try std.testing.expectEqualStrings("168", result.items[1]);
+    try std.testing.expectEqualStrings("10", result.items[2]);
+    try std.testing.expectEqualStrings("100", result.items[3]);
+}
+
+test "splitOctets: fewer than four" {
+    const result = splitOctets("10.0");
+    try std.testing.expectEqual(@as(usize, 2), result.count);
+}
+
+test "joinFromOctet: skip common octets" {
+    const octets = splitOctets("192.168.10.100");
+    const result = try joinFromOctet(std.testing.allocator, &octets, 3);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings(".100", result);
+}
+
+test "joinFromOctet: skip two common octets" {
+    const octets = splitOctets("172.20.5.200");
+    const result = try joinFromOctet(std.testing.allocator, &octets, 2);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings(".5.200", result);
+}
+
+test "joinFromOctet: no common octets" {
+    const octets = splitOctets("10.0.0.1");
+    const result = try joinFromOctet(std.testing.allocator, &octets, 0);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings(".10.0.0.1", result);
+}
+
+test "hitTestCol: click within first column" {
+    const widths = [3]u16{ 10, 20, 15 };
+    try std.testing.expectEqual(@as(?usize, 0), hitTestCol(u16, &widths, 1, 5));
+}
+
+test "hitTestCol: click in separator returns next column" {
+    const widths = [3]u16{ 10, 20, 15 };
+    // col 10 = separator after first column; col 11 = start of second
+    try std.testing.expectEqual(@as(?usize, 1), hitTestCol(u16, &widths, 1, 11));
+}
+
+test "hitTestCol: click past all columns returns null" {
+    const widths = [2]u16{ 10, 20 };
+    try std.testing.expectEqual(@as(?usize, null), hitTestCol(u16, &widths, 1, 50));
+}
+
+test "validatePoolForm: valid minimal config" {
+    var form = PoolForm{};
+    @memcpy(form.subnet_buf[0..14], "192.168.1.0/24");
+    form.subnet_len = 14;
+    @memcpy(form.router_buf[0..11], "192.168.1.1");
+    form.router_len = 11;
+    @memcpy(form.lease_time_buf[0..4], "3600");
+    form.lease_time_len = 4;
+    try std.testing.expect(validatePoolForm(&form) == null);
+}
+
+test "validatePoolForm: missing subnet" {
+    var form = PoolForm{};
+    @memcpy(form.router_buf[0..11], "192.168.1.1");
+    form.router_len = 11;
+    @memcpy(form.lease_time_buf[0..4], "3600");
+    form.lease_time_len = 4;
+    try std.testing.expect(validatePoolForm(&form) != null);
+}
+
+test "validatePoolForm: subnet missing slash" {
+    var form = PoolForm{};
+    @memcpy(form.subnet_buf[0..11], "192.168.1.0");
+    form.subnet_len = 11;
+    @memcpy(form.router_buf[0..11], "192.168.1.1");
+    form.router_len = 11;
+    @memcpy(form.lease_time_buf[0..4], "3600");
+    form.lease_time_len = 4;
+    try std.testing.expect(validatePoolForm(&form) != null);
+}
+
+test "validatePoolForm: invalid router IP" {
+    var form = PoolForm{};
+    @memcpy(form.subnet_buf[0..14], "192.168.1.0/24");
+    form.subnet_len = 14;
+    @memcpy(form.router_buf[0..3], "abc");
+    form.router_len = 3;
+    @memcpy(form.lease_time_buf[0..4], "3600");
+    form.lease_time_len = 4;
+    try std.testing.expect(validatePoolForm(&form) != null);
+}
+
+test "validatePoolForm: invalid lease time" {
+    var form = PoolForm{};
+    @memcpy(form.subnet_buf[0..14], "192.168.1.0/24");
+    form.subnet_len = 14;
+    @memcpy(form.router_buf[0..11], "192.168.1.1");
+    form.router_len = 11;
+    @memcpy(form.lease_time_buf[0..3], "abc");
+    form.lease_time_len = 3;
+    try std.testing.expect(validatePoolForm(&form) != null);
+}
+
+test "validateIpList: valid comma-separated IPs" {
+    try std.testing.expect(validateIpList("8.8.8.8, 8.8.4.4") == null);
+}
+
+test "validateIpList: invalid IP in list" {
+    try std.testing.expect(validateIpList("8.8.8.8, bad") != null);
+}
+
+test "splitCommaDupe: empty input returns empty slice" {
+    const result = try splitCommaDupe(std.testing.allocator, "");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "splitCommaDupe: single item" {
+    const result = try splitCommaDupe(std.testing.allocator, "8.8.8.8");
+    defer {
+        for (result) |s| std.testing.allocator.free(s);
+        std.testing.allocator.free(result);
+    }
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+    try std.testing.expectEqualStrings("8.8.8.8", result[0]);
+}
+
+test "splitCommaDupe: multiple items with whitespace" {
+    const result = try splitCommaDupe(std.testing.allocator, "8.8.8.8 , 1.1.1.1 , 9.9.9.9");
+    defer {
+        for (result) |s| std.testing.allocator.free(s);
+        std.testing.allocator.free(result);
+    }
+    try std.testing.expectEqual(@as(usize, 3), result.len);
+    try std.testing.expectEqualStrings("8.8.8.8", result[0]);
+    try std.testing.expectEqualStrings("1.1.1.1", result[1]);
+    try std.testing.expectEqualStrings("9.9.9.9", result[2]);
+}
+
+test "joinComma: joins array items" {
+    var buf: [64]u8 = undefined;
+    const items = [_][]const u8{ "a", "bb", "ccc" };
+    const len = joinComma(64, &buf, &items);
+    try std.testing.expectEqualStrings("a, bb, ccc", buf[0..len]);
+}
+
+test "joinComma: empty array" {
+    var buf: [64]u8 = undefined;
+    const items = [_][]const u8{};
+    const len = joinComma(64, &buf, &items);
+    try std.testing.expectEqual(@as(usize, 0), len);
+}
+
+test "calcPoolColWidths: fits at normal terminal width" {
+    const widths = calcPoolColWidths(120);
+    var total: u16 = 0;
+    for (widths) |w| total += w;
+    total += 5; // 5 separators
+    try std.testing.expect(total <= 120);
+}
+
+test "fmtAbbrevRange: both endpoints explicit, same /24 subnet" {
+    var pool = config_mod.PoolConfig{
+        .subnet = "192.168.10.0",
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = "192.168.10.1",
+        .pool_start = "192.168.10.100",
+        .pool_end = "192.168.10.200",
+        .dns_servers = &.{},
+        .domain_name = "",
+        .domain_search = &.{},
+        .lease_time = 3600,
+        .time_offset = null,
+        .time_servers = &.{},
+        .log_servers = &.{},
+        .ntp_servers = &.{},
+        .tftp_server_name = "",
+        .boot_filename = "",
+        .http_boot_url = "",
+        .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
+        .dhcp_options = std.StringHashMap([]const u8).init(std.testing.allocator),
+        .reservations = &.{},
+        .static_routes = &.{},
+    };
+    const result = try fmtAbbrevRange(std.testing.allocator, &pool);
+    defer std.testing.allocator.free(result);
+    // Both IPs share 192.168.10 with subnet → abbreviated to .100 – .200
+    try std.testing.expect(std.mem.indexOf(u8, result, ".100") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, ".200") != null);
+}
+
+test "fmtAbbrevRange: start only, end auto-computed" {
+    var pool = config_mod.PoolConfig{
+        .subnet = "10.99.99.0",
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = "10.99.99.1",
+        .pool_start = "10.99.99.10",
+        .pool_end = "",
+        .dns_servers = &.{},
+        .domain_name = "",
+        .domain_search = &.{},
+        .lease_time = 3600,
+        .time_offset = null,
+        .time_servers = &.{},
+        .log_servers = &.{},
+        .ntp_servers = &.{},
+        .tftp_server_name = "",
+        .boot_filename = "",
+        .http_boot_url = "",
+        .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
+        .dhcp_options = std.StringHashMap([]const u8).init(std.testing.allocator),
+        .reservations = &.{},
+        .static_routes = &.{},
+    };
+    const result = try fmtAbbrevRange(std.testing.allocator, &pool);
+    defer std.testing.allocator.free(result);
+    // Start=10.99.99.10 abbreviated to .10; end=10.99.99.254 abbreviated to .254
+    try std.testing.expect(std.mem.indexOf(u8, result, ".10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, ".254") != null);
+    // Must NOT contain "(auto)"
+    try std.testing.expect(std.mem.indexOf(u8, result, "(auto)") == null);
+}
+
+test "fmtAbbrevRange: both auto returns 'auto'" {
+    var pool = config_mod.PoolConfig{
+        .subnet = "10.0.0.0",
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = "10.0.0.1",
+        .pool_start = "",
+        .pool_end = "",
+        .dns_servers = &.{},
+        .domain_name = "",
+        .domain_search = &.{},
+        .lease_time = 3600,
+        .time_offset = null,
+        .time_servers = &.{},
+        .log_servers = &.{},
+        .ntp_servers = &.{},
+        .tftp_server_name = "",
+        .boot_filename = "",
+        .http_boot_url = "",
+        .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
+        .dhcp_options = std.StringHashMap([]const u8).init(std.testing.allocator),
+        .reservations = &.{},
+        .static_routes = &.{},
+    };
+    const result = try fmtAbbrevRange(std.testing.allocator, &pool);
+    try std.testing.expectEqualStrings("auto", result);
+}
+
+test "calcPoolColWidths: narrow terminal reduces columns" {
+    const widths = calcPoolColWidths(40);
+    var total: u16 = 0;
+    for (widths) |w| total += w;
+    total += 5;
+    try std.testing.expect(total <= 40);
+    // All columns should be at least their minimum
+    for (POOL_COL_SPECS, 0..) |spec, i| {
+        try std.testing.expect(widths[i] >= spec.min);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Route/Option entry tests
+// ---------------------------------------------------------------------------
+
+test "RouteEntry: default is empty" {
+    const re = RouteEntry{};
+    try std.testing.expectEqual(@as(usize, 0), re.dest_len);
+    try std.testing.expectEqual(@as(usize, 0), re.router_len);
+}
+
+test "OptionEntry: default is empty" {
+    const oe = OptionEntry{};
+    try std.testing.expectEqual(@as(usize, 0), oe.code_len);
+    try std.testing.expectEqual(@as(usize, 0), oe.value_len);
+}
+
+test "PoolForm: FIELD_COUNT matches pool_field_meta length" {
+    try std.testing.expectEqual(@as(usize, PoolForm.FIELD_COUNT), pool_field_meta.len);
+}
+
+test "poolFormFieldVal: fields 20-21 return edit prompt" {
+    const form = PoolForm{};
+    try std.testing.expectEqualStrings("(Enter to edit)", poolFormFieldVal(&form, 20));
+    try std.testing.expectEqualStrings("(Enter to edit)", poolFormFieldVal(&form, 21));
+}
+
+test "buildRoutesFromForm: empty routes" {
+    const form = PoolForm{};
+    const routes = try buildRoutesFromForm(std.testing.allocator, &form);
+    defer std.testing.allocator.free(routes);
+    try std.testing.expectEqual(@as(usize, 0), routes.len);
+}
+
+test "buildRoutesFromForm: valid route" {
+    var form = PoolForm{};
+    form.route_count = 1;
+    const dest = "10.0.0.0/24";
+    @memcpy(form.routes[0].dest_buf[0..dest.len], dest);
+    form.routes[0].dest_len = dest.len;
+    const rtr = "10.0.0.1";
+    @memcpy(form.routes[0].router_buf[0..rtr.len], rtr);
+    form.routes[0].router_len = rtr.len;
+
+    const routes = try buildRoutesFromForm(std.testing.allocator, &form);
+    defer std.testing.allocator.free(routes);
+    try std.testing.expectEqual(@as(usize, 1), routes.len);
+    try std.testing.expectEqual([4]u8{ 10, 0, 0, 0 }, routes[0].destination);
+    try std.testing.expectEqual(@as(u8, 24), routes[0].prefix_len);
+    try std.testing.expectEqual([4]u8{ 10, 0, 0, 1 }, routes[0].router);
+}
+
+test "handleRouteListKey: add and delete route" {
+    // Use a mock server-like setup — we only need the state.
+    var state = TuiState{};
+    state.mode = .route_list;
+    state.pool_form.route_count = 0;
+
+    // Simulate 'n' to add.
+    handleRouteListKey(undefined, &state, vaxis.Key{ .codepoint = 'n', .mods = .{} });
+    try std.testing.expectEqual(@as(usize, 1), state.pool_form.route_count);
+    try std.testing.expect(state.mode == .route_edit);
+
+    // Back to list.
+    state.mode = .route_list;
+
+    // Simulate 'd' to delete.
+    state.sub_list_row = 0;
+    handleRouteListKey(undefined, &state, vaxis.Key{ .codepoint = 'd', .mods = .{} });
+    try std.testing.expectEqual(@as(usize, 0), state.pool_form.route_count);
+}
+
+test "handleOptionListKey: add and delete option" {
+    var state = TuiState{};
+    state.mode = .option_list;
+    state.pool_form.option_count = 0;
+
+    handleOptionListKey(undefined, &state, vaxis.Key{ .codepoint = 'n', .mods = .{} });
+    try std.testing.expectEqual(@as(usize, 1), state.pool_form.option_count);
+    try std.testing.expect(state.mode == .option_edit);
+
+    state.mode = .option_list;
+    state.sub_list_row = 0;
+    handleOptionListKey(undefined, &state, vaxis.Key{ .codepoint = 'd', .mods = .{} });
+    try std.testing.expectEqual(@as(usize, 0), state.pool_form.option_count);
+}
+
+test "validatePoolForm: valid with DHCP options and routes" {
+    var form = PoolForm{};
+    @memcpy(form.subnet_buf[0..14], "192.168.1.0/24");
+    form.subnet_len = 14;
+    @memcpy(form.router_buf[0..11], "192.168.1.1");
+    form.router_len = 11;
+    @memcpy(form.lease_time_buf[0..4], "3600");
+    form.lease_time_len = 4;
+    // Add a route and option — these don't affect validation.
+    form.route_count = 1;
+    form.option_count = 1;
+    try std.testing.expect(validatePoolForm(&form) == null);
 }

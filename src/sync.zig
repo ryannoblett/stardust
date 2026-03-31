@@ -542,13 +542,30 @@ pub const SyncManager = struct {
         const result = try self.decrypt(raw, &plain_buf);
 
         switch (result.msg_type) {
+            // Handshake messages are always accepted (they establish/verify auth).
             .hello => self.processHello(src, result.plaintext, false),
             .hello_ack => self.processHello(src, result.plaintext, true),
             .hello_nak => self.processHelloNak(src, result.plaintext),
-            .lease_update => self.applyLeaseUpdate(result.plaintext),
-            .lease_delete => self.applyLeaseDelete(result.plaintext),
-            .keepalive => self.updatePeerSeen(src),
-            .lease_hash => self.processLeaseHash(src, result.plaintext),
+            // Lease and hash messages require the peer to be authenticated
+            // (pool hash matched during the HELLO handshake).  After a pool
+            // config change, updatePoolHash() marks all peers unauthenticated,
+            // so stale-config peers are locked out until they re-handshake with
+            // a matching hash.
+            .lease_update, .lease_delete, .keepalive, .lease_hash => {
+                const peer = self.findPeer(src) orelse return;
+                if (!peer.authenticated) {
+                    log_v.debug("sync: ignoring {s} from unauthenticated peer", .{@tagName(result.msg_type)});
+                    return;
+                }
+                peer.last_seen = std.time.timestamp();
+                switch (result.msg_type) {
+                    .lease_update => self.applyLeaseUpdate(result.plaintext),
+                    .lease_delete => self.applyLeaseDelete(result.plaintext),
+                    .lease_hash => self.processLeaseHash(src, result.plaintext),
+                    .keepalive => {},
+                    else => unreachable,
+                }
+            },
             else => {},
         }
     }

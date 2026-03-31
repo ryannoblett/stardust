@@ -616,6 +616,16 @@ pub const DHCPServer = struct {
         self.cfg.* = new_cfg;
         self.log_level.* = self.cfg.log_level;
 
+        // Update the StateStore's dir reference — the old string was freed by deinit().
+        self.store.dir = self.cfg.state_dir;
+
+        // Recompute pool hash and notify sync manager so peers with stale
+        // configs are disconnected and forced to re-handshake.
+        if (self.sync_mgr) |s| {
+            const new_hash = config_mod.computePoolHash(self.cfg);
+            s.updatePoolHash(new_hash);
+        }
+
         freeDnsUpdaters(self.allocator, self.dns_updaters);
         self.dns_updaters = new_updaters;
 
