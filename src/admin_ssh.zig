@@ -3140,67 +3140,39 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
     const LABEL_W: u16 = 19;
     const FIELD_W: u16 = BOX_W -| LABEL_W -| 3; // 1 left border + 2 right margin
 
-    // Compute the rendered row for each field, accounting for section headers.
-    // Then pick scroll_offset so active_field is vertically centered.
+    // Compute absolute rendered row for each field (accounting for section headers
+    // and blank lines), then set scroll_offset to center the active field while
+    // clamping so the last field always has a blank line below it.
     {
-        // First: compute the total rendered rows for each possible scroll_offset.
-        // We need to find the scroll_offset where active_field's row is ~centered.
-        // Strategy: compute the row of active_field relative to scroll_offset=0,
-        // then back-calculate the right scroll_offset.
         var field_rows: [PoolForm.FIELD_COUNT]u16 = undefined;
         var r: u16 = 0;
         for (0..PoolForm.FIELD_COUNT) |fi| {
             if (pool_field_meta[fi].section != null) {
                 r += 1; // blank line before section
-                r += 1; // section header itself
+                r += 1; // section header
             }
             field_rows[fi] = r;
             r += 1;
         }
+        const total_rows = r;
         const active_row = field_rows[form.active_field];
-        const half_h = field_h / 2;
-        // We want active_row - scroll_row_offset ≈ half_h.
-        // scroll_row_offset = active_row - half_h (clamped).
-        const target_scroll_row: u16 = if (active_row > half_h) active_row - half_h else 0;
-        // Find the field index whose rendered row is closest to target_scroll_row.
-        var best: u8 = 0;
-        for (0..PoolForm.FIELD_COUNT) |fi| {
-            if (field_rows[fi] <= target_scroll_row) best = @intCast(fi);
-        }
-        form.scroll_offset = best;
-        // Ensure active_field is actually visible: if it rendered past field_h,
-        // advance scroll_offset until it fits.
-        while (form.scroll_offset < form.active_field) {
-            var vis_rows: u16 = 0;
-            var fi: u8 = form.scroll_offset;
-            var found = false;
-            while (fi < PoolForm.FIELD_COUNT and vis_rows < field_h) : (fi += 1) {
-                if (pool_field_meta[fi].section != null) {
-                    vis_rows += 1; // blank line before section
-                    vis_rows += 1; // header
-                }
-                if (vis_rows >= field_h) break;
-                if (fi == form.active_field) {
-                    found = true;
-                    break;
-                }
-                vis_rows += 1;
-            }
-            if (found) break;
-            form.scroll_offset += 1;
-        }
 
-        // Clamp: don't scroll past the last field + 2 blank lines below it.
-        const last_field_row = field_rows[PoolForm.FIELD_COUNT - 1];
-        var max_so: u8 = 0;
-        for (0..PoolForm.FIELD_COUNT) |fj| {
-            if (last_field_row -| field_rows[fj] + 2 < field_h) {
-                max_so = @intCast(fj);
-                break;
+        // Target: center active field in the visible area.
+        const half = field_h / 2;
+        var scroll_row: u16 = if (active_row > half) active_row - half else 0;
+
+        // Clamp bottom: ensure last field + 1 blank line fits.
+        // max_scroll_row = total_rows - field_h + 1 (the +1 is the blank line).
+        const max_scroll = if (total_rows + 1 > field_h) total_rows + 1 - field_h else 0;
+        if (scroll_row > max_scroll) scroll_row = max_scroll;
+
+        // Map scroll_row back to a field index (scroll_offset).
+        form.scroll_offset = 0;
+        for (0..PoolForm.FIELD_COUNT) |fi| {
+            if (field_rows[fi] <= scroll_row) {
+                form.scroll_offset = @intCast(fi);
             }
-            max_so = @intCast(fj);
         }
-        if (form.scroll_offset > max_so) form.scroll_offset = max_so;
     }
 
     var row: u16 = 2; // start below border + title
