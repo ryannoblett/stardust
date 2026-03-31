@@ -4277,8 +4277,8 @@ fn settingsSaveAndReload(server: *AdminServer, state: *TuiState) void {
 
 fn renderHelp(win: vaxis.Window) void {
     const bg: vaxis.Color = .{ .rgb = .{ 20, 20, 35 } };
-    // Adapt size to terminal — min 30x10, max 52x30.
-    const BOX_W: u16 = @min(52, @max(30, win.width -| 4));
+    // Adapt size: prefer 60 wide for two-column, shrink to fit.
+    const BOX_W: u16 = @min(60, @max(30, win.width -| 4));
     const BOX_H: u16 = @min(30, @max(10, win.height -| 2));
     if (win.width < 20 or win.height < 8) return;
     const x = (win.width - BOX_W) / 2;
@@ -4337,13 +4337,12 @@ fn renderHelp(win: vaxis.Window) void {
         .{ .kind = .single, .k1 = "Esc", .d1 = "Cancel / close" },
     };
 
-    const content_h = BOX_H -| 4; // border + title + hint + border
-    const total_lines: u16 = lines.len;
+    // Two-column mode if box is wide enough (need ~56 inner cols).
+    const two_col = (BOX_W >= 58);
 
-    // Scroll: no state for help, just show what fits.
     var row: u16 = 2; // inside border, below title
     for (lines) |line| {
-        if (row >= BOX_H - 2) break; // leave room for hint + border
+        if (row >= BOX_H - 2) break;
 
         switch (line.kind) {
             .title => {
@@ -4358,9 +4357,15 @@ fn renderHelp(win: vaxis.Window) void {
             .pair => {
                 _ = box.print(&.{.{ .text = line.k1, .style = key_style }}, .{ .col_offset = 2, .row_offset = row, .wrap = .none });
                 _ = box.print(&.{.{ .text = line.d1, .style = desc_style }}, .{ .col_offset = 2 + K, .row_offset = row, .wrap = .none });
-                if (2 + C2 + K < BOX_W - 1) {
+                if (two_col) {
                     _ = box.print(&.{.{ .text = line.k2, .style = key_style }}, .{ .col_offset = 2 + C2, .row_offset = row, .wrap = .none });
                     _ = box.print(&.{.{ .text = line.d2, .style = desc_style }}, .{ .col_offset = 2 + C2 + K, .row_offset = row, .wrap = .none });
+                } else {
+                    // Single-column fallback: render second pair on next row.
+                    row += 1;
+                    if (row >= BOX_H - 2) break;
+                    _ = box.print(&.{.{ .text = line.k2, .style = key_style }}, .{ .col_offset = 2, .row_offset = row, .wrap = .none });
+                    _ = box.print(&.{.{ .text = line.d2, .style = desc_style }}, .{ .col_offset = 2 + K, .row_offset = row, .wrap = .none });
                 }
             },
             .single => {
@@ -4373,8 +4378,6 @@ fn renderHelp(win: vaxis.Window) void {
 
     // Bottom hint inside border.
     _ = box.print(&.{.{ .text = " Press any key to close", .style = hint_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 2, .wrap = .none });
-    _ = &content_h;
-    _ = &total_lines;
 }
 
 // ---------------------------------------------------------------------------
