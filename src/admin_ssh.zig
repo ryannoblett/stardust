@@ -2728,8 +2728,8 @@ fn handlePoolsKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) void {
         state.mode = .pool_detail;
     } else if (key.matches('e', .{}) and !server.cfg.admin_ssh.read_only) {
         state.pool_form = .{};
-        state.pool_form.editing_index = state.pool_row;
         populatePoolForm(&state.pool_form, &server.cfg.pools[state.pool_row]);
+        state.pool_form.editing_index = state.pool_row; // must be after populatePoolForm (which resets form)
         state.mode = .pool_form;
     } else if (key.matches('n', .{}) and !server.cfg.admin_ssh.read_only) {
         state.pool_form = .{};
@@ -2773,9 +2773,11 @@ fn renderPoolDetail(server: *AdminServer, state: *TuiState, win: vaxis.Window, f
 
     const close_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 80, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
 
-    // Title + [X].
+    const title_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 200, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
+
+    // Title (inside border) + [X] (on border).
     const title = std.fmt.allocPrint(fa, " Pool: {s}/{d} ", .{ pool.subnet, pool.prefix_len }) catch " Pool ";
-    _ = box.print(&.{.{ .text = title, .style = border_style }}, .{ .row_offset = 0, .wrap = .none });
+    _ = box.print(&.{.{ .text = title, .style = title_style }}, .{ .col_offset = 1, .row_offset = 1, .wrap = .none });
     _ = box.print(&.{.{ .text = "[X]", .style = close_style }}, .{ .col_offset = BOX_W -| 4, .row_offset = 0, .wrap = .none });
 
     // Build lines.
@@ -2824,23 +2826,23 @@ fn renderPoolDetail(server: *AdminServer, state: *TuiState, win: vaxis.Window, f
     lines[lcount] = .{ .text = std.fmt.allocPrint(fa, "  Reservations: {d}    Static routes: {d}", .{ pool.reservations.len, pool.static_routes.len }) catch "", .style = label_style };
     lcount += 1;
 
-    // Scrollable content.
-    const content_h = BOX_H - 3; // title + hint + bottom padding
+    // Scrollable content (inside border: rows 2..BOX_H-2).
+    const content_h = BOX_H - 4; // top border + title + hint + bottom border
     if (state.pool_detail_scroll + content_h > lcount) {
         state.pool_detail_scroll = if (lcount > content_h) @intCast(lcount - content_h) else 0;
     }
-    var row: u16 = 1;
+    var row: u16 = 2;
     var li: usize = state.pool_detail_scroll;
     while (li < lcount and row < BOX_H - 2) : ({
         li += 1;
         row += 1;
     }) {
-        _ = box.print(&.{.{ .text = lines[li].text, .style = lines[li].style }}, .{ .row_offset = row, .wrap = .none });
+        _ = box.print(&.{.{ .text = lines[li].text, .style = lines[li].style }}, .{ .col_offset = 1, .row_offset = row, .wrap = .none });
     }
 
-    // Hint bar.
+    // Hint bar (inside border, last content row).
     const hint_text = if (read_only) "  Esc: close  \xe2\x86\x91/\xe2\x86\x93: scroll" else "  e: edit  Esc: close  \xe2\x86\x91/\xe2\x86\x93: scroll";
-    _ = box.print(&.{.{ .text = hint_text, .style = hint_style }}, .{ .row_offset = BOX_H - 1, .wrap = .none });
+    _ = box.print(&.{.{ .text = hint_text, .style = hint_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 2, .wrap = .none });
 }
 
 /// Check if a click at (row, col) hits the [X] close button of the current modal.
@@ -2877,8 +2879,8 @@ fn modalDims(mode: TuiMode, win_w: u16, win_h: u16) struct { x: u16, y: u16, w: 
             return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
         },
         .pool_delete_confirm => {
-            const w: u16 = 50;
-            const h: u16 = 8;
+            const w: u16 = 52;
+            const h: u16 = 10;
             return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
         },
         .pool_save_confirm => {
@@ -2911,8 +2913,8 @@ fn handlePoolDetailKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) v
     } else if (key.matches('e', .{}) and !server.cfg.admin_ssh.read_only) {
         // Transition to edit form for the same pool.
         state.pool_form = .{};
-        state.pool_form.editing_index = state.pool_row;
         populatePoolForm(&state.pool_form, &server.cfg.pools[state.pool_row]);
+        state.pool_form.editing_index = state.pool_row;
         state.mode = .pool_form;
     } else if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
         state.pool_detail_scroll +|= 1;
@@ -2945,15 +2947,17 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
     const err_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 80, 80 } }, .bg = bg.bg };
     const close_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 80, 80 } }, .bg = bg.bg, .bold = true };
 
-    // Title + [X] close button.
+    const title_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 200, 80 } }, .bg = bg.bg, .bold = true };
+
+    // Title (inside border) + [X] (on border).
     const title = if (form.isNew()) "  New Pool" else std.fmt.allocPrint(fa, "  Edit Pool: {s}", .{form.subnet_buf[0..form.subnet_len]}) catch "  Edit Pool";
-    _ = box.print(&.{.{ .text = title, .style = border_style }}, .{ .row_offset = 0, .wrap = .none });
+    _ = box.print(&.{.{ .text = title, .style = title_style }}, .{ .col_offset = 1, .row_offset = 1, .wrap = .none });
     _ = box.print(&.{.{ .text = "[X]", .style = close_style }}, .{ .col_offset = BOX_W -| 4, .row_offset = 0, .wrap = .none });
 
-    // Field rendering area: rows 1 .. BOX_H-3.
-    const field_h = BOX_H - 3;
-    const LABEL_W: u16 = 19; // "  DNS Upd Key Name " = ~19
-    const FIELD_W: u16 = BOX_W -| LABEL_W -| 2; // 2 = right margin
+    // Field rendering area: rows 2 .. BOX_H-3 (inside border, below title).
+    const field_h = BOX_H - 4; // top border + title + hint + bottom border
+    const LABEL_W: u16 = 19;
+    const FIELD_W: u16 = BOX_W -| LABEL_W -| 3; // 1 left border + 2 right margin
 
     // Compute the rendered row for each field, accounting for section headers.
     // Then pick scroll_offset so active_field is vertically centered.
@@ -3000,15 +3004,15 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
         }
     }
 
-    var row: u16 = 1;
+    var row: u16 = 2; // start below border + title
     var fi: u8 = form.scroll_offset;
-    while (fi < PoolForm.FIELD_COUNT and row <= field_h) : (fi += 1) {
+    while (fi < PoolForm.FIELD_COUNT and row < BOX_H - 2) : (fi += 1) {
         const meta = pool_field_meta[fi];
         // Section header (if this is the first field in a group and we have room).
         if (meta.section) |sec| {
-            if (row <= field_h) {
+            if (row < BOX_H - 2) {
                 const sec_text = std.fmt.allocPrint(fa, "  -- {s} --", .{sec}) catch "";
-                _ = box.print(&.{.{ .text = sec_text, .style = section_style }}, .{ .row_offset = row, .wrap = .none });
+                _ = box.print(&.{.{ .text = sec_text, .style = section_style }}, .{ .col_offset = 1, .row_offset = row, .wrap = .none });
                 row += 1;
                 if (row > field_h) break;
             }
@@ -3018,14 +3022,13 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
         const style = if (is_active) active_style else field_style;
         const val = poolFormFieldVal(form, fi);
         const label_text = std.fmt.allocPrint(fa, "  {s:<17}", .{meta.label}) catch "";
-        _ = box.print(&.{.{ .text = label_text, .style = label_style }}, .{ .row_offset = row, .wrap = .none });
+        _ = box.print(&.{.{ .text = label_text, .style = label_style }}, .{ .col_offset = 1, .row_offset = row, .wrap = .none });
 
         // Value field with horizontal scrolling for active field.
         const fw = @as(usize, FIELD_W);
         var vis_start: usize = 0;
-        var cursor_vis: usize = 0; // cursor position within the visible window
+        var cursor_vis: usize = 0;
         if (is_active and fi != 15) {
-            // Ensure cursor is visible by scrolling the text window.
             const cur = @min(form.cursor, val.len);
             if (cur >= fw) {
                 vis_start = cur - fw + 1;
@@ -3036,12 +3039,12 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
         const vis_text = val[vis_start..vis_end];
         const pad_len = fw - vis_text.len;
         const padded = std.fmt.allocPrint(fa, "{s}{s}", .{ vis_text, spaces(fa, @intCast(pad_len)) catch "" }) catch vis_text;
-        _ = box.print(&.{.{ .text = padded, .style = style }}, .{ .col_offset = LABEL_W, .row_offset = row, .wrap = .none });
+        _ = box.print(&.{.{ .text = padded, .style = style }}, .{ .col_offset = LABEL_W + 1, .row_offset = row, .wrap = .none });
 
         // Cursor block: show character under cursor with inverted colors.
         if (is_active and fi != 15) {
             const cursor_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 20, 20, 30 } }, .bg = .{ .rgb = .{ 100, 160, 255 } } };
-            const cursor_col = LABEL_W + @as(u16, @intCast(cursor_vis));
+            const cursor_col = LABEL_W + 1 + @as(u16, @intCast(cursor_vis));
             if (cursor_col < BOX_W -| 1) {
                 const cur_abs = vis_start + cursor_vis;
                 const ch: []const u8 = if (cur_abs < val.len) val[cur_abs..][0..1] else " ";
@@ -3051,10 +3054,10 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
         row += 1;
     }
 
-    // Hint + error.
-    _ = box.print(&.{.{ .text = "  Tab: next  Shift-Tab: prev  Enter: review  Esc: cancel", .style = hint_style }}, .{ .row_offset = BOX_H - 2, .wrap = .none });
+    // Hint + error (inside border).
+    _ = box.print(&.{.{ .text = "  Tab: next  Shift-Tab: prev  Enter: review  Esc: cancel", .style = hint_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 2, .wrap = .none });
     if (form.err_len > 0) {
-        _ = box.print(&.{.{ .text = form.err_buf[0..form.err_len], .style = err_style }}, .{ .row_offset = BOX_H - 1, .wrap = .none });
+        _ = box.print(&.{.{ .text = form.err_buf[0..form.err_len], .style = err_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 3, .wrap = .none });
     }
 }
 
@@ -3320,7 +3323,7 @@ fn renderPoolSaveConfirm(server: *AdminServer, state: *TuiState, win: vaxis.Wind
     const BOX_W: u16 = 64;
     const change_lines: u16 = @intCast(@min(confirm.change_count, 10));
     const warn_lines: u16 = if (confirm.has_sync_break and has_sync) 3 else 0;
-    const BOX_H: u16 = 5 + change_lines + warn_lines;
+    const BOX_H: u16 = 7 + change_lines + warn_lines; // border*2 + title + changes + warn + action + hints
     if (win.width < BOX_W or win.height < BOX_H) return;
     const x = (win.width - BOX_W) / 2;
     const y = (win.height - BOX_H) / 2;
@@ -3335,17 +3338,18 @@ fn renderPoolSaveConfirm(server: *AdminServer, state: *TuiState, win: vaxis.Wind
     const warn_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 100, 100 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
 
     const close_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 80, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
+    const title_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 200, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
     const title = if (confirm.is_new_pool) " Confirm New Pool " else if (confirm.is_delete) " Confirm Delete " else " Confirm Changes ";
-    _ = box.print(&.{.{ .text = title, .style = border_style }}, .{ .row_offset = 0, .wrap = .none });
+    _ = box.print(&.{.{ .text = title, .style = title_style }}, .{ .col_offset = 1, .row_offset = 1, .wrap = .none });
     _ = box.print(&.{.{ .text = "[X]", .style = close_style }}, .{ .col_offset = BOX_W -| 4, .row_offset = 0, .wrap = .none });
 
     if (confirm.change_count == 0 and !confirm.is_new_pool and !confirm.is_delete) {
-        _ = box.print(&.{.{ .text = "  No changes detected.", .style = hint_style }}, .{ .row_offset = 1, .wrap = .none });
-        _ = box.print(&.{.{ .text = "  Esc: back", .style = hint_style }}, .{ .row_offset = 2, .wrap = .none });
+        _ = box.print(&.{.{ .text = "  No changes detected.", .style = hint_style }}, .{ .col_offset = 1, .row_offset = 2, .wrap = .none });
+        _ = box.print(&.{.{ .text = "  Esc: back", .style = hint_style }}, .{ .col_offset = 1, .row_offset = 3, .wrap = .none });
         return;
     }
 
-    var row: u16 = 1;
+    var row: u16 = 2;
 
     // Change list.
     var ci: usize = 0;
@@ -3357,22 +3361,22 @@ fn renderPoolSaveConfirm(server: *AdminServer, state: *TuiState, win: vaxis.Wind
             std.fmt.allocPrint(fa, "{s}{s}: {s}", .{ prefix, ch.label, ch.new_val }) catch ""
         else
             std.fmt.allocPrint(fa, "{s}{s}: {s} -> {s}", .{ prefix, ch.label, ch.old_val, ch.new_val }) catch "";
-        _ = box.print(&.{.{ .text = line, .style = style }}, .{ .row_offset = row, .wrap = .none });
+        _ = box.print(&.{.{ .text = line, .style = style }}, .{ .col_offset = 1, .row_offset = row, .wrap = .none });
         row += 1;
     }
 
     // Sync warning.
     if (confirm.has_sync_break and has_sync) {
         row += 1;
-        _ = box.print(&.{.{ .text = "  !! This will break peer sync. All peers must", .style = warn_style }}, .{ .row_offset = row, .wrap = .none });
+        _ = box.print(&.{.{ .text = "  !! This will break peer sync. All peers must", .style = warn_style }}, .{ .col_offset = 1, .row_offset = row, .wrap = .none });
         row += 1;
-        _ = box.print(&.{.{ .text = "     be updated and restarted with matching config.", .style = warn_style }}, .{ .row_offset = row, .wrap = .none });
+        _ = box.print(&.{.{ .text = "     be updated and restarted with matching config.", .style = warn_style }}, .{ .col_offset = 1, .row_offset = row, .wrap = .none });
         row += 1;
     }
 
-    // Action + hint.
-    _ = box.print(&.{.{ .text = "  Config will be saved and reloaded.", .style = hint_style }}, .{ .row_offset = BOX_H - 2, .wrap = .none });
-    _ = box.print(&.{.{ .text = "  Y: confirm  N/Esc: cancel", .style = hint_style }}, .{ .row_offset = BOX_H - 1, .wrap = .none });
+    // Action + hint (inside border).
+    _ = box.print(&.{.{ .text = "  Config will be saved and reloaded.", .style = hint_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 3, .wrap = .none });
+    _ = box.print(&.{.{ .text = "  Y: confirm  N/Esc: cancel", .style = hint_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 2, .wrap = .none });
 }
 
 fn handlePoolSaveConfirmKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) void {
@@ -3643,7 +3647,7 @@ fn renderPoolDeleteConfirm(server: *AdminServer, state: *TuiState, win: vaxis.Wi
     }
 
     const BOX_W: u16 = 50;
-    const BOX_H: u16 = if (has_sync) 8 else 6;
+    const BOX_H: u16 = if (has_sync) 10 else 8; // +2 for border
     if (win.width < BOX_W or win.height < BOX_H) return;
     const x = (win.width - BOX_W) / 2;
     const y = (win.height - BOX_H) / 2;
@@ -3657,24 +3661,25 @@ fn renderPoolDeleteConfirm(server: *AdminServer, state: *TuiState, win: vaxis.Wi
     const hint_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 100, 130 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
 
     const close_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 80, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
-    _ = box.print(&.{.{ .text = " Delete Pool ", .style = border_style }}, .{ .row_offset = 0, .wrap = .none });
+    const title_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 200, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
+    _ = box.print(&.{.{ .text = " Delete Pool ", .style = title_style }}, .{ .col_offset = 1, .row_offset = 1, .wrap = .none });
     _ = box.print(&.{.{ .text = "[X]", .style = close_style }}, .{ .col_offset = BOX_W -| 4, .row_offset = 0, .wrap = .none });
 
     const label = std.fmt.allocPrint(fa, "  Delete pool {s}/{d}?", .{ pool.subnet, pool.prefix_len }) catch "  Delete pool?";
-    _ = box.print(&.{.{ .text = label, .style = text_style }}, .{ .row_offset = 1, .wrap = .none });
+    _ = box.print(&.{.{ .text = label, .style = text_style }}, .{ .col_offset = 1, .row_offset = 2, .wrap = .none });
 
-    var row: u16 = 2;
+    var row: u16 = 3;
     if (lease_count > 0) {
         const lease_msg = std.fmt.allocPrint(fa, "  {d} active lease(s) in this pool.", .{lease_count}) catch "";
-        _ = box.print(&.{.{ .text = lease_msg, .style = warn_style }}, .{ .row_offset = row, .wrap = .none });
+        _ = box.print(&.{.{ .text = lease_msg, .style = warn_style }}, .{ .col_offset = 1, .row_offset = row, .wrap = .none });
         row += 1;
     }
     if (has_sync) {
-        _ = box.print(&.{.{ .text = "  !! This will break peer sync.", .style = warn_style }}, .{ .row_offset = row, .wrap = .none });
+        _ = box.print(&.{.{ .text = "  !! This will break peer sync.", .style = warn_style }}, .{ .col_offset = 1, .row_offset = row, .wrap = .none });
         row += 1;
     }
 
-    _ = box.print(&.{.{ .text = "  y: confirm  any other key: cancel", .style = hint_style }}, .{ .row_offset = BOX_H - 1, .wrap = .none });
+    _ = box.print(&.{.{ .text = "  y: confirm  any other key: cancel", .style = hint_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 2, .wrap = .none });
 }
 
 fn handlePoolDeleteConfirmKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) void {
