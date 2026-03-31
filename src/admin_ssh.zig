@@ -4276,56 +4276,105 @@ fn settingsSaveAndReload(server: *AdminServer, state: *TuiState) void {
 // ---------------------------------------------------------------------------
 
 fn renderHelp(win: vaxis.Window) void {
-    const BOX_W: u16 = 52;
-    const BOX_H: u16 = 28;
-    if (win.width < BOX_W or win.height < BOX_H) return;
+    const bg: vaxis.Color = .{ .rgb = .{ 20, 20, 35 } };
+    // Adapt size to terminal — min 30x10, max 52x30.
+    const BOX_W: u16 = @min(52, @max(30, win.width -| 4));
+    const BOX_H: u16 = @min(30, @max(10, win.height -| 2));
+    if (win.width < 20 or win.height < 8) return;
     const x = (win.width - BOX_W) / 2;
     const y = (win.height -| BOX_H) / 2;
     const box = win.child(.{ .x_off = x, .y_off = y, .width = BOX_W, .height = BOX_H });
-    box.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = .{ .rgb = .{ 20, 20, 35 } } } });
-    const border_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 160, 255 } }, .bg = .{ .rgb = .{ 20, 20, 35 } } };
+    box.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = bg } });
+    const border_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 160, 255 } }, .bg = bg };
     drawBox(box, 0, 0, BOX_W, BOX_H, border_style);
-    const close_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 80, 80 } }, .bg = .{ .rgb = .{ 20, 20, 35 } }, .bold = true };
+    const close_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 80, 80 } }, .bg = bg, .bold = true };
     _ = box.print(&.{.{ .text = "[X]", .style = close_style }}, .{ .col_offset = BOX_W -| 4, .row_offset = 0, .wrap = .none });
 
-    const t: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 160, 255 } }, .bg = .{ .rgb = .{ 20, 20, 35 } }, .bold = true };
-    const s: vaxis.Style = .{ .fg = .{ .rgb = .{ 80, 180, 255 } }, .bg = .{ .rgb = .{ 20, 20, 35 } }, .bold = true };
-    const n: vaxis.Style = .{ .fg = .{ .rgb = .{ 200, 200, 200 } }, .bg = .{ .rgb = .{ 20, 20, 35 } } };
-    const d: vaxis.Style = .{ .fg = .{ .rgb = .{ 130, 130, 150 } }, .bg = .{ .rgb = .{ 20, 20, 35 } } };
+    const title_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 200, 80 } }, .bg = bg, .bold = true };
+    const sec: vaxis.Style = .{ .fg = .{ .rgb = .{ 80, 180, 255 } }, .bg = bg, .bold = true };
+    const key_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 220, 255 } }, .bg = bg };
+    const desc_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 180, 190 } }, .bg = bg };
+    const hint_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 100, 130 } }, .bg = bg };
 
-    const lines = [_]struct { text: []const u8, style: vaxis.Style }{
-        .{ .text = " Keyboard Shortcuts", .style = t },
-        .{ .text = "", .style = n },
-        .{ .text = " -- Global --", .style = s },
-        .{ .text = "  1/2/3/4       Switch tabs", .style = n },
-        .{ .text = "  Tab/Shift-Tab Next/prev tab", .style = n },
-        .{ .text = "  Ctrl+R        Reload configuration", .style = n },
-        .{ .text = "  ?             This help screen", .style = n },
-        .{ .text = "  q / Ctrl+C    Quit session", .style = n },
-        .{ .text = "", .style = n },
-        .{ .text = " -- Leases --", .style = s },
-        .{ .text = "  j/k           Navigate rows", .style = n },
-        .{ .text = "  /             Filter leases", .style = n },
-        .{ .text = "  I/M/H/T/E/P  Sort by column", .style = n },
-        .{ .text = "  y + i/m/h     Yank IP/MAC/hostname", .style = n },
-        .{ .text = "  n  New reservation   e  Edit", .style = n },
-        .{ .text = "  d  Delete / force-release", .style = n },
-        .{ .text = "", .style = n },
-        .{ .text = " -- Pools --", .style = s },
-        .{ .text = "  v/Enter  View     e  Edit", .style = n },
-        .{ .text = "  n  New pool       d  Delete", .style = n },
-        .{ .text = "  /  Filter pools", .style = n },
-        .{ .text = "", .style = n },
-        .{ .text = " -- Forms --", .style = s },
-        .{ .text = "  Up/Down/Tab   Navigate fields", .style = n },
-        .{ .text = "  Left/Right    Move cursor", .style = n },
-        .{ .text = "  Home/End      Jump to start/end", .style = n },
-        .{ .text = "  Enter  Save   Esc  Cancel", .style = d },
+    // Column layout: col1_key(12) col1_desc(14) gap(2) col2_key(12) col2_desc(rest)
+    // For single-column rows: key(12) desc(rest)
+    const K: u16 = 12; // key column width
+    const D: u16 = 14; // description column width (first pair)
+    const G: u16 = 2; // gap between pairs
+    const C2: u16 = K + D + G; // start of second pair
+
+    const Line = struct {
+        kind: enum { title, section, blank, pair, single },
+        k1: []const u8 = "",
+        d1: []const u8 = "",
+        k2: []const u8 = "",
+        d2: []const u8 = "",
+        sec_text: []const u8 = "",
     };
 
-    for (lines, 0..) |line, i| {
-        _ = box.print(&.{.{ .text = line.text, .style = line.style }}, .{ .row_offset = @intCast(i + 1), .wrap = .none });
+    const lines = [_]Line{
+        .{ .kind = .title },
+        .{ .kind = .blank },
+        .{ .kind = .section, .sec_text = "Global" },
+        .{ .kind = .pair, .k1 = "1/2/3/4", .d1 = "Switch tabs", .k2 = "Tab", .d2 = "Next/prev tab" },
+        .{ .kind = .pair, .k1 = "Ctrl+R", .d1 = "Reload config", .k2 = "?", .d2 = "This help" },
+        .{ .kind = .pair, .k1 = "q", .d1 = "Quit session", .k2 = "Ctrl+C", .d2 = "Quit session" },
+        .{ .kind = .blank },
+        .{ .kind = .section, .sec_text = "Leases" },
+        .{ .kind = .pair, .k1 = "j/k", .d1 = "Navigate", .k2 = "/", .d2 = "Filter" },
+        .{ .kind = .pair, .k1 = "I/M/H/T/E/P", .d1 = "Sort column", .k2 = "y+i/m/h", .d2 = "Yank" },
+        .{ .kind = .pair, .k1 = "n", .d1 = "New reserv.", .k2 = "e", .d2 = "Edit" },
+        .{ .kind = .single, .k1 = "d", .d1 = "Delete / force-release lease" },
+        .{ .kind = .blank },
+        .{ .kind = .section, .sec_text = "Pools" },
+        .{ .kind = .pair, .k1 = "v / Enter", .d1 = "View pool", .k2 = "e", .d2 = "Edit pool" },
+        .{ .kind = .pair, .k1 = "n", .d1 = "New pool", .k2 = "d", .d2 = "Delete pool" },
+        .{ .kind = .single, .k1 = "/", .d1 = "Filter pools" },
+        .{ .kind = .blank },
+        .{ .kind = .section, .sec_text = "Forms" },
+        .{ .kind = .pair, .k1 = "Up/Down/Tab", .d1 = "Navigate", .k2 = "Left/Right", .d2 = "Move cursor" },
+        .{ .kind = .pair, .k1 = "Home/End", .d1 = "Start/end", .k2 = "Enter", .d2 = "Save" },
+        .{ .kind = .single, .k1 = "Esc", .d1 = "Cancel / close" },
+    };
+
+    const content_h = BOX_H -| 4; // border + title + hint + border
+    const total_lines: u16 = lines.len;
+
+    // Scroll: no state for help, just show what fits.
+    var row: u16 = 2; // inside border, below title
+    for (lines) |line| {
+        if (row >= BOX_H - 2) break; // leave room for hint + border
+
+        switch (line.kind) {
+            .title => {
+                _ = box.print(&.{.{ .text = " Keyboard Shortcuts", .style = title_style }}, .{ .col_offset = 1, .row_offset = 1, .wrap = .none });
+            },
+            .blank => {},
+            .section => {
+                _ = box.print(&.{.{ .text = " -- ", .style = sec }}, .{ .col_offset = 1, .row_offset = row, .wrap = .none });
+                _ = box.print(&.{.{ .text = line.sec_text, .style = sec }}, .{ .col_offset = 5, .row_offset = row, .wrap = .none });
+                _ = box.print(&.{.{ .text = " --", .style = sec }}, .{ .col_offset = 5 + @as(u16, @intCast(line.sec_text.len)), .row_offset = row, .wrap = .none });
+            },
+            .pair => {
+                _ = box.print(&.{.{ .text = line.k1, .style = key_style }}, .{ .col_offset = 2, .row_offset = row, .wrap = .none });
+                _ = box.print(&.{.{ .text = line.d1, .style = desc_style }}, .{ .col_offset = 2 + K, .row_offset = row, .wrap = .none });
+                if (2 + C2 + K < BOX_W - 1) {
+                    _ = box.print(&.{.{ .text = line.k2, .style = key_style }}, .{ .col_offset = 2 + C2, .row_offset = row, .wrap = .none });
+                    _ = box.print(&.{.{ .text = line.d2, .style = desc_style }}, .{ .col_offset = 2 + C2 + K, .row_offset = row, .wrap = .none });
+                }
+            },
+            .single => {
+                _ = box.print(&.{.{ .text = line.k1, .style = key_style }}, .{ .col_offset = 2, .row_offset = row, .wrap = .none });
+                _ = box.print(&.{.{ .text = line.d1, .style = desc_style }}, .{ .col_offset = 2 + K, .row_offset = row, .wrap = .none });
+            },
+        }
+        row += 1;
     }
+
+    // Bottom hint inside border.
+    _ = box.print(&.{.{ .text = " Press any key to close", .style = hint_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 2, .wrap = .none });
+    _ = &content_h;
+    _ = &total_lines;
 }
 
 // ---------------------------------------------------------------------------
