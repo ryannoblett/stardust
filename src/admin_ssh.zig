@@ -691,6 +691,7 @@ const TuiState = struct {
     sub_edit_field: u8 = 0, // 0=first column, 1=second column
     sub_edit_cursor: usize = 0,
     sub_modal_parent: TuiMode = .pool_form, // which form to return to on Esc
+    help_scroll: u16 = 0,
 };
 
 /// Replicate the vaxis Table dynamic_fill column-width calculation.
@@ -907,7 +908,13 @@ fn runTui(
                         continue :parse_loop;
                     }
                     if (state.mode == .help) {
-                        state.mode = .normal;
+                        if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
+                            state.help_scroll +|= 1;
+                        } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
+                            state.help_scroll -|= 1;
+                        } else {
+                            state.mode = .normal;
+                        }
                         continue :parse_loop;
                     }
                     if (state.mode == .res_option_edit) {
@@ -1025,7 +1032,10 @@ fn runTui(
                         if (key.matches('2', .{})) state.tab = .stats;
                         if (key.matches('3', .{})) state.tab = .pools;
                         if (key.matches('4', .{})) state.tab = .settings;
-                        if (key.matches('?', .{})) state.mode = .help;
+                        if (key.matches('?', .{})) {
+                            state.help_scroll = 0;
+                            state.mode = .help;
+                        }
                         if (key.matches(vaxis.Key.tab, .{})) {
                             state.tab = switch (state.tab) {
                                 .leases => .stats,
@@ -1226,7 +1236,8 @@ fn runTui(
                                 if (state.form.active_field > 0) state.form.active_field -= 1;
                             },
                             // All other modals: swallow scroll.
-                            .delete_confirm, .pool_delete_confirm, .help, .route_list, .route_edit, .option_list, .option_edit, .res_option_edit, .option_lookup => {},
+                            .help => state.help_scroll -|= 1,
+                            .delete_confirm, .pool_delete_confirm, .route_list, .route_edit, .option_list, .option_edit, .res_option_edit, .option_lookup => {},
                         },
                         .wheel_down => switch (state.mode) {
                             .pool_detail => state.pool_detail_scroll +|= 3,
@@ -1245,7 +1256,8 @@ fn runTui(
                             .reservation_form => {
                                 if (state.form.active_field + 1 < state.form.totalFields()) state.form.active_field += 1;
                             },
-                            .delete_confirm, .pool_delete_confirm, .help, .route_list, .route_edit, .option_list, .option_edit, .res_option_edit, .option_lookup => {},
+                            .help => state.help_scroll +|= 1,
+                            .delete_confirm, .pool_delete_confirm, .route_list, .route_edit, .option_list, .option_edit, .res_option_edit, .option_lookup => {},
                         },
                         else => {},
                     }
@@ -1346,7 +1358,7 @@ fn renderFrame(
         .pool_delete_confirm => try renderPoolDeleteConfirm(server, state, win, fa),
         .route_list, .route_edit => try renderRouteList(state, win, fa),
         .option_list, .option_edit => try renderOptionList(state, win, fa),
-        .help => renderHelp(win),
+        .help => renderHelp(state, win),
         .res_option_edit => try renderResOptionEdit(state, win, fa),
         .option_lookup => try renderOptionLookup(state, win, fa),
     }
@@ -3070,8 +3082,8 @@ fn modalDims(mode: TuiMode, win_w: u16, win_h: u16, state: *const TuiState) stru
             return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
         },
         .help => {
-            const w: u16 = 52;
-            const h: u16 = 28;
+            const w: u16 = @min(60, @max(30, win_w -| 4));
+            const h: u16 = @min(30, @max(10, win_h -| 2));
             return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
         },
         .res_option_edit => {
@@ -4275,7 +4287,7 @@ fn settingsSaveAndReload(server: *AdminServer, state: *TuiState) void {
 // Help screen
 // ---------------------------------------------------------------------------
 
-fn renderHelp(win: vaxis.Window) void {
+fn renderHelp(state: *TuiState, win: vaxis.Window) void {
     const bg: vaxis.Color = .{ .rgb = .{ 20, 20, 35 } };
     // Adapt size: prefer 60 wide for two-column, shrink to fit.
     const BOX_W: u16 = @min(60, @max(30, win.width -| 4));
@@ -4337,47 +4349,75 @@ fn renderHelp(win: vaxis.Window) void {
         .{ .kind = .single, .k1 = "Esc", .d1 = "Cancel / close" },
     };
 
-    // Two-column mode if box is wide enough (need ~56 inner cols).
+    // Two-column mode if box is wide enough.
     const two_col = (BOX_W >= 58);
 
-    var row: u16 = 2; // inside border, below title
+    // Compute total rendered rows for scroll clamping.
+    var total_rows: u16 = 0;
+    for (lines) |line| {
+        total_rows += 1;
+        if (line.kind == .pair and !two_col) total_rows += 1; // extra row in single-col
+    }
+
+    // Clamp scroll.
+    const content_h = BOX_H -| 4; // border + title row + hint row + border
+    const max_scroll: u16 = if (total_rows > content_h) total_rows - content_h else 0;
+    if (state.help_scroll > max_scroll) state.help_scroll = max_scroll;
+    const scroll = state.help_scroll;
+
+    // Render with scroll offset.
+    var logical_row: u16 = 0; // absolute row index (before scroll)
+    var row: u16 = 2; // screen row in box
     for (lines) |line| {
         if (row >= BOX_H - 2) break;
 
-        switch (line.kind) {
-            .title => {
-                _ = box.print(&.{.{ .text = " Keyboard Shortcuts", .style = title_style }}, .{ .col_offset = 1, .row_offset = 1, .wrap = .none });
-            },
-            .blank => {},
-            .section => {
-                _ = box.print(&.{.{ .text = " -- ", .style = sec }}, .{ .col_offset = 1, .row_offset = row, .wrap = .none });
-                _ = box.print(&.{.{ .text = line.sec_text, .style = sec }}, .{ .col_offset = 5, .row_offset = row, .wrap = .none });
-                _ = box.print(&.{.{ .text = " --", .style = sec }}, .{ .col_offset = 5 + @as(u16, @intCast(line.sec_text.len)), .row_offset = row, .wrap = .none });
-            },
-            .pair => {
-                _ = box.print(&.{.{ .text = line.k1, .style = key_style }}, .{ .col_offset = 2, .row_offset = row, .wrap = .none });
-                _ = box.print(&.{.{ .text = line.d1, .style = desc_style }}, .{ .col_offset = 2 + K, .row_offset = row, .wrap = .none });
-                if (two_col) {
-                    _ = box.print(&.{.{ .text = line.k2, .style = key_style }}, .{ .col_offset = 2 + C2, .row_offset = row, .wrap = .none });
-                    _ = box.print(&.{.{ .text = line.d2, .style = desc_style }}, .{ .col_offset = 2 + C2 + K, .row_offset = row, .wrap = .none });
-                } else {
-                    // Single-column fallback: render second pair on next row.
-                    row += 1;
-                    if (row >= BOX_H - 2) break;
-                    _ = box.print(&.{.{ .text = line.k2, .style = key_style }}, .{ .col_offset = 2, .row_offset = row, .wrap = .none });
-                    _ = box.print(&.{.{ .text = line.d2, .style = desc_style }}, .{ .col_offset = 2 + K, .row_offset = row, .wrap = .none });
-                }
-            },
-            .single => {
-                _ = box.print(&.{.{ .text = line.k1, .style = key_style }}, .{ .col_offset = 2, .row_offset = row, .wrap = .none });
-                _ = box.print(&.{.{ .text = line.d1, .style = desc_style }}, .{ .col_offset = 2 + K, .row_offset = row, .wrap = .none });
-            },
+        // First row of this entry.
+        if (logical_row >= scroll and row < BOX_H - 2) {
+            switch (line.kind) {
+                .title => {
+                    _ = box.print(&.{.{ .text = " Keyboard Shortcuts", .style = title_style }}, .{ .col_offset = 1, .row_offset = row, .wrap = .none });
+                },
+                .blank => {},
+                .section => {
+                    _ = box.print(&.{.{ .text = " -- ", .style = sec }}, .{ .col_offset = 1, .row_offset = row, .wrap = .none });
+                    _ = box.print(&.{.{ .text = line.sec_text, .style = sec }}, .{ .col_offset = 5, .row_offset = row, .wrap = .none });
+                    _ = box.print(&.{.{ .text = " --", .style = sec }}, .{ .col_offset = 5 + @as(u16, @intCast(line.sec_text.len)), .row_offset = row, .wrap = .none });
+                },
+                .pair => {
+                    _ = box.print(&.{.{ .text = line.k1, .style = key_style }}, .{ .col_offset = 2, .row_offset = row, .wrap = .none });
+                    _ = box.print(&.{.{ .text = line.d1, .style = desc_style }}, .{ .col_offset = 2 + K, .row_offset = row, .wrap = .none });
+                    if (two_col) {
+                        _ = box.print(&.{.{ .text = line.k2, .style = key_style }}, .{ .col_offset = 2 + C2, .row_offset = row, .wrap = .none });
+                        _ = box.print(&.{.{ .text = line.d2, .style = desc_style }}, .{ .col_offset = 2 + C2 + K, .row_offset = row, .wrap = .none });
+                    }
+                },
+                .single => {
+                    _ = box.print(&.{.{ .text = line.k1, .style = key_style }}, .{ .col_offset = 2, .row_offset = row, .wrap = .none });
+                    _ = box.print(&.{.{ .text = line.d1, .style = desc_style }}, .{ .col_offset = 2 + K, .row_offset = row, .wrap = .none });
+                },
+            }
+            row += 1;
+        } else if (logical_row >= scroll) {
+            row += 1; // past viewport but count
         }
-        row += 1;
+        logical_row += 1;
+
+        // Second row for pair in single-column mode.
+        if (line.kind == .pair and !two_col) {
+            if (logical_row >= scroll and row < BOX_H - 2) {
+                _ = box.print(&.{.{ .text = line.k2, .style = key_style }}, .{ .col_offset = 2, .row_offset = row, .wrap = .none });
+                _ = box.print(&.{.{ .text = line.d2, .style = desc_style }}, .{ .col_offset = 2 + K, .row_offset = row, .wrap = .none });
+                row += 1;
+            } else if (logical_row >= scroll) {
+                row += 1;
+            }
+            logical_row += 1;
+        }
     }
 
     // Bottom hint inside border.
-    _ = box.print(&.{.{ .text = " Press any key to close", .style = hint_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 2, .wrap = .none });
+    const hint_text = if (total_rows > content_h) " j/k to scroll, any other key to close" else " Press any key to close";
+    _ = box.print(&.{.{ .text = hint_text, .style = hint_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 2, .wrap = .none });
 }
 
 // ---------------------------------------------------------------------------
