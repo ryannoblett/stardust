@@ -154,6 +154,10 @@ pub const AdminServer = struct {
     }
 
     fn runInner(self: *Self) !void {
+        // Silence libssh's default stderr logging — it writes raw binary
+        // protocol data that shows up as "[NNB blob data]" in the journal.
+        _ = c.ssh_set_log_level(c.SSH_LOG_NONE);
+
         const bind = c.ssh_bind_new() orelse return error.SshBindFailed;
         defer c.ssh_bind_free(bind);
 
