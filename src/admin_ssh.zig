@@ -446,7 +446,7 @@ const LeaseRow = struct {
 
 const Tab = enum(u8) { leases = 0, stats = 1, pools = 2, settings = 3 };
 
-const TuiMode = enum { normal, reservation_form, delete_confirm, pool_detail, pool_form, pool_delete_confirm, pool_save_confirm, route_list, route_edit, option_list, option_edit, help };
+const TuiMode = enum { normal, reservation_form, delete_confirm, pool_detail, pool_form, pool_delete_confirm, pool_save_confirm, route_list, route_edit, option_list, option_edit, help, res_option_edit, option_lookup };
 
 const ReservationForm = struct {
     /// MAC of the lease being edited; empty string means "new reservation".
@@ -459,13 +459,25 @@ const ReservationForm = struct {
     mac_len: usize = 0,
     hostname_buf: [64]u8 = [_]u8{0} ** 64,
     hostname_len: usize = 0,
-    /// Index of the field currently receiving input: 0=ip  1=mac  2=hostname  3=options.
+    /// Active field: 0=ip, 1=mac, 2=hostname, 3=[+]add, 4..4+N-1=existing options.
     active_field: u8 = 0,
     /// Cursor position within the active field (byte offset).
     cursor: usize = 0,
-    /// Per-reservation DHCP option overrides.
+    /// Per-reservation DHCP option overrides (pending, applied on save).
     options: [32]OptionEntry = [_]OptionEntry{.{}} ** 32,
     option_count: usize = 0,
+    /// Option add/edit sub-modal state.
+    opt_edit_code: [4]u8 = [_]u8{0} ** 4,
+    opt_edit_code_len: usize = 0,
+    opt_edit_value: [128]u8 = [_]u8{0} ** 128,
+    opt_edit_value_len: usize = 0,
+    opt_edit_field: u8 = 0, // 0=code, 1=value
+    opt_edit_cursor: usize = 0,
+    opt_edit_index: ?usize = null, // null=adding, index=editing existing
+    /// Option lookup filter.
+    opt_lookup_filter: [32]u8 = [_]u8{0} ** 32,
+    opt_lookup_filter_len: usize = 0,
+    opt_lookup_row: u16 = 0,
     /// Inline error message (empty = no error).
     err_buf: [80]u8 = [_]u8{0} ** 80,
     err_len: usize = 0,
@@ -483,6 +495,10 @@ const ReservationForm = struct {
             2 => self.hostname_len,
             else => 0,
         };
+    }
+
+    fn totalFields(self: *const ReservationForm) u8 {
+        return @intCast(4 + self.option_count); // ip, mac, hostname, [+], N options
     }
 };
 
@@ -891,7 +907,15 @@ fn runTui(
                         continue :parse_loop;
                     }
                     if (state.mode == .help) {
-                        state.mode = .normal; // any key closes help
+                        state.mode = .normal;
+                        continue :parse_loop;
+                    }
+                    if (state.mode == .res_option_edit) {
+                        handleResOptionEditKey(&state, key);
+                        continue :parse_loop;
+                    }
+                    if (state.mode == .option_lookup) {
+                        handleOptionLookupKey(&state, key);
                         continue :parse_loop;
                     }
                     if (state.pool_filter_active) {
@@ -1192,7 +1216,7 @@ fn runTui(
                                 if (state.form.active_field > 0) state.form.active_field -= 1;
                             },
                             // All other modals: swallow scroll.
-                            .delete_confirm, .pool_delete_confirm, .help, .route_list, .route_edit, .option_list, .option_edit => {},
+                            .delete_confirm, .pool_delete_confirm, .help, .route_list, .route_edit, .option_list, .option_edit, .res_option_edit, .option_lookup => {},
                         },
                         .wheel_down => switch (state.mode) {
                             .pool_detail => state.pool_detail_scroll +|= 3,
@@ -1209,9 +1233,9 @@ fn runTui(
                                 .settings => state.settings_scroll +|= 1,
                             },
                             .reservation_form => {
-                                if (state.form.active_field < 3) state.form.active_field += 1;
+                                if (state.form.active_field + 1 < state.form.totalFields()) state.form.active_field += 1;
                             },
-                            .delete_confirm, .pool_delete_confirm, .help, .route_list, .route_edit, .option_list, .option_edit => {},
+                            .delete_confirm, .pool_delete_confirm, .help, .route_list, .route_edit, .option_list, .option_edit, .res_option_edit, .option_lookup => {},
                         },
                         else => {},
                     }
@@ -1313,6 +1337,8 @@ fn renderFrame(
         .route_list, .route_edit => try renderRouteList(state, win, fa),
         .option_list, .option_edit => try renderOptionList(state, win, fa),
         .help => renderHelp(win),
+        .res_option_edit => try renderResOptionEdit(state, win, fa),
+        .option_lookup => try renderOptionLookup(state, win, fa),
     }
 }
 
@@ -1995,10 +2021,12 @@ fn drawBox(win: vaxis.Window, row: u16, col: u16, w: u16, h: u16, style: vaxis.S
 
 /// Render the reservation add/edit form as a centered overlay.
 fn renderReservationForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
-    // Layout: border, title, blank, IP, MAC, Hostname, Options, saved/err, hints, border
+    const form = &state.form;
+    // Dynamic height: 3 fixed fields + blank + [+]add + N options + saved/hints + borders
+    const opt_rows: u16 = @intCast(form.option_count);
     const BOX_W: u16 = 58;
-    const BOX_H: u16 = 10;
-    if (win.width < BOX_W or win.height < BOX_H) return;
+    const BOX_H: u16 = @min(win.height -| 2, 10 + opt_rows); // min 10, grows with options
+    if (win.width < BOX_W or win.height < 10) return;
 
     const col: u16 = (win.width - BOX_W) / 2;
     const row: u16 = (win.height -| BOX_H) / 2;
@@ -2013,8 +2041,9 @@ fn renderReservationForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Alloca
     const hint_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 120, 120, 120 } }, .bg = bg_color };
     const err_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 80, 80 } }, .bg = bg_color, .bold = true };
     const close_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 80, 80 } }, .bg = bg_color, .bold = true };
+    const opt_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 180, 200 } }, .bg = .{ .rgb = .{ 30, 30, 42 } } };
 
-    // Fill box interior background.
+    // Fill + border.
     var r: u16 = 0;
     while (r < BOX_H) : (r += 1) {
         const fill = try fa.alloc(u8, BOX_W);
@@ -2023,54 +2052,84 @@ fn renderReservationForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Alloca
     }
     drawBox(win, row, col, BOX_W, BOX_H, border_style);
 
-    // Title + [X]
-    const title = if (state.form.isNew()) "  New Reservation" else "  Edit Reservation";
+    const title = if (form.isNew()) "  New Reservation" else "  Edit Reservation";
     _ = win.print(&.{.{ .text = title, .style = title_style }}, .{ .col_offset = col + 1, .row_offset = row + 1, .wrap = .none });
     _ = win.print(&.{.{ .text = "[X]", .style = close_style }}, .{ .col_offset = col + BOX_W -| 5, .row_offset = row, .wrap = .none });
 
-    // Field layout: label on left, value fills to right edge minus 2.
-    const LABEL_W: u16 = 17; // "  IP Address   : " = ~17
-    const FIELD_W: u16 = BOX_W -| LABEL_W -| 4; // 2 left margin + 2 right margin
+    const LABEL_W: u16 = 17;
+    const FIELD_W: u16 = BOX_W -| LABEL_W -| 4;
 
-    const fields = [4]struct { label: []const u8, buf: []const u8, len: usize, field_idx: u8 }{
-        .{ .label = "  IP Address   ", .buf = &state.form.ip_buf, .len = state.form.ip_len, .field_idx = 0 },
-        .{ .label = "  MAC Address  ", .buf = &state.form.mac_buf, .len = state.form.mac_len, .field_idx = 1 },
-        .{ .label = "  Hostname     ", .buf = &state.form.hostname_buf, .len = state.form.hostname_len, .field_idx = 2 },
-        .{ .label = "  DHCP Options ", .buf = "(Enter to edit)", .len = 15, .field_idx = 3 },
+    // Row 3: IP, Row 4: MAC, Row 5: Hostname
+    const text_fields = [3]struct { label: []const u8, buf: []const u8, len: usize, idx: u8 }{
+        .{ .label = "  IP Address   ", .buf = &form.ip_buf, .len = form.ip_len, .idx = 0 },
+        .{ .label = "  MAC Address  ", .buf = &form.mac_buf, .len = form.mac_len, .idx = 1 },
+        .{ .label = "  Hostname     ", .buf = &form.hostname_buf, .len = form.hostname_len, .idx = 2 },
     };
 
-    for (fields, 0..) |f, fi| {
+    for (text_fields, 0..) |f, fi| {
         const fr: u16 = row + 3 + @as(u16, @intCast(fi));
         _ = win.print(&.{.{ .text = f.label, .style = label_style }}, .{ .col_offset = col + 1, .row_offset = fr, .wrap = .none });
-        const is_active = state.form.active_field == f.field_idx;
+        const is_active = form.active_field == f.idx;
         const fs = if (is_active) active_style else field_style;
         const value = f.buf[0..f.len];
         const field_x = col + 1 + LABEL_W;
-        // Pad field to FIELD_W.
         const val_len = @as(u16, @intCast(@min(value.len, FIELD_W)));
         const pad = FIELD_W -| val_len;
         const padded = try fa.alloc(u8, pad);
         @memset(padded, ' ');
         _ = win.print(&.{.{ .text = value[0..val_len], .style = fs }}, .{ .col_offset = field_x, .row_offset = fr, .wrap = .none });
         _ = win.print(&.{.{ .text = padded, .style = fs }}, .{ .col_offset = field_x + val_len, .row_offset = fr, .wrap = .none });
-        if (is_active and f.field_idx < 3) { // text fields get cursor; options field doesn't
-            const cur_pos = @min(state.form.cursor, f.len);
+        if (is_active) {
+            const cur_pos = @min(form.cursor, f.len);
             const ch: []const u8 = if (cur_pos < f.len) f.buf[cur_pos..][0..1] else " ";
             _ = win.print(&.{.{ .text = ch, .style = cursor_style }}, .{ .col_offset = field_x + @as(u16, @intCast(cur_pos)), .row_offset = fr, .wrap = .none });
         }
     }
 
-    // Saved/error on the line above hints.
-    if (state.form.err_len > 0) {
-        _ = win.print(&.{.{ .text = state.form.err_buf[0..state.form.err_len], .style = err_style }}, .{ .col_offset = col + 2, .row_offset = row + BOX_H - 3, .wrap = .none });
-    } else if (state.form.saved) {
-        const saved_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 80, 220, 80 } }, .bg = bg_color, .bold = true };
-        const saved_x = col + BOX_W -| 9;
-        _ = win.print(&.{.{ .text = "Saved!", .style = saved_style }}, .{ .col_offset = saved_x, .row_offset = row + BOX_H - 3, .wrap = .none });
+    // Row 6: blank line
+    // Row 7: DHCP Options [+] add button
+    const add_row: u16 = row + 7;
+    const add_active = form.active_field == 3;
+    const add_fs = if (add_active) active_style else field_style;
+    _ = win.print(&.{.{ .text = "  DHCP Options ", .style = label_style }}, .{ .col_offset = col + 1, .row_offset = add_row, .wrap = .none });
+    const add_text = "[+] Add";
+    _ = win.print(&.{.{ .text = add_text, .style = add_fs }}, .{ .col_offset = col + 1 + LABEL_W, .row_offset = add_row, .wrap = .none });
+
+    // Rows 8+: existing options
+    var oi: usize = 0;
+    while (oi < form.option_count) : (oi += 1) {
+        const or_row = add_row + 1 + @as(u16, @intCast(oi));
+        if (or_row >= row + BOX_H - 3) break;
+        const o = &form.options[oi];
+        const is_sel = form.active_field == @as(u8, @intCast(4 + oi));
+        const os = if (is_sel) active_style else opt_style;
+        const code = o.code_buf[0..o.code_len];
+        const val = o.value_buf[0..o.value_len];
+        const opt_text = std.fmt.allocPrint(fa, "    {s:<6} {s}", .{
+            if (code.len > 0) code else "?",
+            if (val.len > 0) val else "?",
+        }) catch "";
+        // Pad to FIELD_W + LABEL_W.
+        const opt_w = LABEL_W + FIELD_W;
+        const opt_trunc = opt_text[0..@min(opt_text.len, opt_w)];
+        const opt_pad = opt_w -| @as(u16, @intCast(opt_trunc.len));
+        const opt_padded = try fa.alloc(u8, opt_pad);
+        @memset(opt_padded, ' ');
+        _ = win.print(&.{.{ .text = opt_trunc, .style = os }}, .{ .col_offset = col + 1, .row_offset = or_row, .wrap = .none });
+        _ = win.print(&.{.{ .text = opt_padded, .style = os }}, .{ .col_offset = col + 1 + @as(u16, @intCast(opt_trunc.len)), .row_offset = or_row, .wrap = .none });
     }
 
-    // Hints on the last content row (above bottom border).
-    _ = win.print(&.{.{ .text = "  Tab: next/prev  Enter: save  Esc: close", .style = hint_style }}, .{ .col_offset = col + 1, .row_offset = row + BOX_H - 2, .wrap = .none });
+    // Saved/error.
+    if (form.err_len > 0) {
+        _ = win.print(&.{.{ .text = form.err_buf[0..form.err_len], .style = err_style }}, .{ .col_offset = col + 2, .row_offset = row + BOX_H - 3, .wrap = .none });
+    } else if (form.saved) {
+        const saved_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 80, 220, 80 } }, .bg = bg_color, .bold = true };
+        _ = win.print(&.{.{ .text = "Saved!", .style = saved_style }}, .{ .col_offset = col + BOX_W -| 9, .row_offset = row + BOX_H - 3, .wrap = .none });
+    }
+
+    // Hints.
+    const hint = if (form.active_field >= 4) "  Enter:edit  d:delete  Esc:close" else "  Tab:next  Enter:save  Esc:close";
+    _ = win.print(&.{.{ .text = hint, .style = hint_style }}, .{ .col_offset = col + 1, .row_offset = row + BOX_H - 2, .wrap = .none });
 }
 
 /// Save the form: update StateStore + config.yaml. Returns an error message on failure.
@@ -2123,14 +2182,33 @@ fn handleFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) void {
     }
 
     if (key.matches(vaxis.Key.enter, .{})) {
-        // Field 3 = DHCP Options: open sub-modal.
+        // Field 3 = [+] Add new DHCP option.
         if (form.active_field == 3) {
-            state.sub_list_row = 0;
-            state.sub_modal_parent = .reservation_form;
-            state.mode = .option_list;
+            form.opt_edit_code_len = 0;
+            form.opt_edit_value_len = 0;
+            form.opt_edit_field = 0;
+            form.opt_edit_cursor = 0;
+            form.opt_edit_index = null; // adding
+            state.mode = .res_option_edit;
             return;
         }
-        // Save on Enter for text fields.
+        // Field 4+ = edit existing DHCP option.
+        if (form.active_field >= 4) {
+            const oi = form.active_field - 4;
+            if (oi < form.option_count) {
+                const o = &form.options[oi];
+                @memcpy(form.opt_edit_code[0..o.code_len], o.code_buf[0..o.code_len]);
+                form.opt_edit_code_len = o.code_len;
+                @memcpy(form.opt_edit_value[0..o.value_len], o.value_buf[0..o.value_len]);
+                form.opt_edit_value_len = o.value_len;
+                form.opt_edit_field = 0;
+                form.opt_edit_cursor = o.code_len;
+                form.opt_edit_index = oi;
+                state.mode = .res_option_edit;
+            }
+            return;
+        }
+        // Fields 0-2: save reservation.
         if (server.cfg.admin_ssh.read_only) {
             const msg = "read-only mode — changes not permitted";
             form.err_len = @min(msg.len, form.err_buf.len);
@@ -2146,20 +2224,37 @@ fn handleFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) void {
         return;
     }
 
-    // Field navigation (0=ip, 1=mac, 2=hostname, 3=options).
+    // 'd' deletes selected DHCP option (field 4+).
+    if (key.matches('d', .{}) and form.active_field >= 4) {
+        const oi = form.active_field - 4;
+        if (oi < form.option_count) {
+            var i: usize = oi;
+            while (i + 1 < form.option_count) : (i += 1) {
+                form.options[i] = form.options[i + 1];
+            }
+            form.option_count -= 1;
+            if (form.active_field > 3 and form.active_field >= form.totalFields()) {
+                form.active_field -= 1;
+            }
+        }
+        return;
+    }
+
+    // Field navigation: wraps through 0..totalFields()-1.
+    const total = form.totalFields();
     if (key.matches(vaxis.Key.tab, .{}) or key.matches(vaxis.Key.down, .{})) {
-        form.active_field = (form.active_field + 1) % 4;
+        form.active_field = if (form.active_field + 1 >= total) 0 else form.active_field + 1;
         form.cursor = form.activeLen();
         return;
     }
     if (key.matches(vaxis.Key.tab, .{ .shift = true }) or key.matches(vaxis.Key.up, .{})) {
-        form.active_field = if (form.active_field == 0) 3 else form.active_field - 1;
+        form.active_field = if (form.active_field == 0) total - 1 else form.active_field - 1;
         form.cursor = form.activeLen();
         return;
     }
 
-    // Field 3 is not a text field — skip cursor/text input.
-    if (form.active_field == 3) return;
+    // Fields 3+ are not text fields.
+    if (form.active_field >= 3) return;
 
     // Cursor movement.
     if (key.matches(vaxis.Key.left, .{})) {
@@ -2883,7 +2978,7 @@ fn modalDims(mode: TuiMode, win_w: u16, win_h: u16) struct { x: u16, y: u16, w: 
         },
         .reservation_form => {
             const w: u16 = 58;
-            const h: u16 = 10;
+            const h: u16 = @min(win_h -| 2, 20); // dynamic in renderReservationForm
             return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
         },
         .delete_confirm => {
@@ -2914,6 +3009,16 @@ fn modalDims(mode: TuiMode, win_w: u16, win_h: u16) struct { x: u16, y: u16, w: 
         .help => {
             const w: u16 = 52;
             const h: u16 = 28;
+            return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
+        },
+        .res_option_edit => {
+            const w: u16 = 48;
+            const h: u16 = 8;
+            return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
+        },
+        .option_lookup => {
+            const w: u16 = 40;
+            const h: u16 = @min(win_h -| 2, 22);
             return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
         },
         .normal => return .{ .x = 0, .y = 0, .w = 0, .h = 0 },
@@ -3738,6 +3843,29 @@ fn handlePoolDeleteConfirmKey(server: *AdminServer, state: *TuiState, key: vaxis
 // Settings tab
 // ---------------------------------------------------------------------------
 
+/// Known DHCP option codes for the lookup modal.
+const KnownOption = struct { code: []const u8, name: []const u8 };
+const known_dhcp_options = [_]KnownOption{
+    .{ .code = "1", .name = "Subnet Mask" },
+    .{ .code = "2", .name = "Time Offset" },
+    .{ .code = "3", .name = "Router" },
+    .{ .code = "4", .name = "Time Server" },
+    .{ .code = "6", .name = "DNS Servers" },
+    .{ .code = "7", .name = "Log Server" },
+    .{ .code = "12", .name = "Hostname" },
+    .{ .code = "15", .name = "Domain Name" },
+    .{ .code = "33", .name = "Static Routes" },
+    .{ .code = "42", .name = "NTP Servers" },
+    .{ .code = "51", .name = "Lease Time" },
+    .{ .code = "60", .name = "Vendor Class ID" },
+    .{ .code = "66", .name = "TFTP Server" },
+    .{ .code = "67", .name = "Boot Filename" },
+    .{ .code = "119", .name = "Domain Search" },
+    .{ .code = "121", .name = "Classless Static Routes" },
+    .{ .code = "150", .name = "TFTP Server (Cisco)" },
+    .{ .code = "252", .name = "WPAD URL" },
+};
+
 const SETTINGS_EDITABLE_COUNT: u8 = 6;
 
 fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
@@ -4368,6 +4496,252 @@ fn handleOptionListKey(_: *AdminServer, state: *TuiState, key: vaxis.Key) void {
             if (state.sub_list_row > 0 and state.sub_list_row >= ao.count.*) {
                 state.sub_list_row -= 1;
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Reservation option add/edit modal
+// ---------------------------------------------------------------------------
+
+fn renderResOptionEdit(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
+    const form = &state.form;
+    const BOX_W: u16 = 48;
+    const BOX_H: u16 = 8;
+    if (win.width < BOX_W or win.height < BOX_H) return;
+    const x = (win.width - BOX_W) / 2;
+    const y = (win.height -| BOX_H) / 2;
+    const box = win.child(.{ .x_off = x, .y_off = y, .width = BOX_W, .height = BOX_H });
+    box.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = .{ .rgb = .{ 20, 20, 30 } } } });
+    const border_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 160, 255 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+    drawBox(box, 0, 0, BOX_W, BOX_H, border_style);
+    const title_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 200, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
+    const label_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 160, 160, 190 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+    const field_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 200, 200, 200 } }, .bg = .{ .rgb = .{ 30, 30, 45 } } };
+    const active_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 255, 255 } }, .bg = .{ .rgb = .{ 50, 80, 140 } } };
+    const cursor_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 20, 20, 30 } }, .bg = .{ .rgb = .{ 100, 160, 255 } } };
+    const hint_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 100, 130 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+    const close_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 80, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
+
+    const title = if (form.opt_edit_index == null) "  Add DHCP Option" else "  Edit DHCP Option";
+    _ = box.print(&.{.{ .text = title, .style = title_style }}, .{ .col_offset = 1, .row_offset = 1, .wrap = .none });
+    _ = box.print(&.{.{ .text = "[X]", .style = close_style }}, .{ .col_offset = BOX_W -| 4, .row_offset = 0, .wrap = .none });
+
+    // Option number field.
+    const code_active = form.opt_edit_field == 0;
+    _ = box.print(&.{.{ .text = "  Option #  ", .style = label_style }}, .{ .col_offset = 1, .row_offset = 3, .wrap = .none });
+    const code_val = form.opt_edit_code[0..form.opt_edit_code_len];
+    const code_style = if (code_active) active_style else field_style;
+    const code_pad = try fa.alloc(u8, 6 -| code_val.len);
+    @memset(code_pad, ' ');
+    _ = box.print(&.{.{ .text = code_val, .style = code_style }}, .{ .col_offset = 13, .row_offset = 3, .wrap = .none });
+    _ = box.print(&.{.{ .text = code_pad, .style = code_style }}, .{ .col_offset = 13 + @as(u16, @intCast(code_val.len)), .row_offset = 3, .wrap = .none });
+    if (code_active) {
+        const cur = @min(form.opt_edit_cursor, code_val.len);
+        const ch: []const u8 = if (cur < code_val.len) code_val[cur..][0..1] else " ";
+        _ = box.print(&.{.{ .text = ch, .style = cursor_style }}, .{ .col_offset = 13 + @as(u16, @intCast(cur)), .row_offset = 3, .wrap = .none });
+    }
+    // Lookup hint.
+    if (code_active) {
+        _ = box.print(&.{.{ .text = "  l: lookup", .style = hint_style }}, .{ .col_offset = 20, .row_offset = 3, .wrap = .none });
+    }
+
+    // Value field.
+    const val_active = form.opt_edit_field == 1;
+    _ = box.print(&.{.{ .text = "  Value     ", .style = label_style }}, .{ .col_offset = 1, .row_offset = 4, .wrap = .none });
+    const val_text = form.opt_edit_value[0..form.opt_edit_value_len];
+    const val_fw: u16 = BOX_W -| 16;
+    const val_style = if (val_active) active_style else field_style;
+    const val_trunc = val_text[0..@min(val_text.len, val_fw)];
+    const val_pad = try fa.alloc(u8, val_fw -| @as(u16, @intCast(val_trunc.len)));
+    @memset(val_pad, ' ');
+    _ = box.print(&.{.{ .text = val_trunc, .style = val_style }}, .{ .col_offset = 13, .row_offset = 4, .wrap = .none });
+    _ = box.print(&.{.{ .text = val_pad, .style = val_style }}, .{ .col_offset = 13 + @as(u16, @intCast(val_trunc.len)), .row_offset = 4, .wrap = .none });
+    if (val_active) {
+        const cur = @min(form.opt_edit_cursor, val_text.len);
+        const ch: []const u8 = if (cur < val_text.len) val_text[cur..][0..1] else " ";
+        _ = box.print(&.{.{ .text = ch, .style = cursor_style }}, .{ .col_offset = 13 + @as(u16, @intCast(cur)), .row_offset = 4, .wrap = .none });
+    }
+
+    _ = box.print(&.{.{ .text = "  Tab: switch  Enter: save  Esc: cancel", .style = hint_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 2, .wrap = .none });
+}
+
+fn handleResOptionEditKey(state: *TuiState, key: vaxis.Key) void {
+    var form = &state.form;
+
+    if (key.matches(vaxis.Key.escape, .{})) {
+        state.mode = .reservation_form;
+        return;
+    }
+    if (key.matches(vaxis.Key.enter, .{})) {
+        // Save the option.
+        if (form.opt_edit_code_len == 0) return; // need at least a code
+        if (form.opt_edit_index) |idx| {
+            // Editing existing.
+            if (idx < form.option_count) {
+                @memcpy(form.options[idx].code_buf[0..form.opt_edit_code_len], form.opt_edit_code[0..form.opt_edit_code_len]);
+                form.options[idx].code_len = form.opt_edit_code_len;
+                @memcpy(form.options[idx].value_buf[0..form.opt_edit_value_len], form.opt_edit_value[0..form.opt_edit_value_len]);
+                form.options[idx].value_len = form.opt_edit_value_len;
+            }
+        } else {
+            // Adding new.
+            if (form.option_count < form.options.len) {
+                var new_opt = &form.options[form.option_count];
+                new_opt.* = .{};
+                @memcpy(new_opt.code_buf[0..form.opt_edit_code_len], form.opt_edit_code[0..form.opt_edit_code_len]);
+                new_opt.code_len = form.opt_edit_code_len;
+                @memcpy(new_opt.value_buf[0..form.opt_edit_value_len], form.opt_edit_value[0..form.opt_edit_value_len]);
+                new_opt.value_len = form.opt_edit_value_len;
+                form.option_count += 1;
+            }
+        }
+        state.mode = .reservation_form;
+        return;
+    }
+    if (key.matches(vaxis.Key.tab, .{}) or key.matches(vaxis.Key.tab, .{ .shift = true })) {
+        form.opt_edit_field = if (form.opt_edit_field == 0) 1 else 0;
+        form.opt_edit_cursor = if (form.opt_edit_field == 0) form.opt_edit_code_len else form.opt_edit_value_len;
+        return;
+    }
+
+    // 'l' on the code field opens lookup.
+    if (form.opt_edit_field == 0 and key.matches('l', .{})) {
+        form.opt_lookup_filter_len = 0;
+        form.opt_lookup_row = 0;
+        state.mode = .option_lookup;
+        return;
+    }
+
+    // Text editing.
+    const buf: []u8 = if (form.opt_edit_field == 0) &form.opt_edit_code else &form.opt_edit_value;
+    const len: *usize = if (form.opt_edit_field == 0) &form.opt_edit_code_len else &form.opt_edit_value_len;
+    const max_len = buf.len;
+
+    if (key.matches(vaxis.Key.backspace, .{})) {
+        if (form.opt_edit_cursor > 0 and len.* > 0) {
+            const pos = form.opt_edit_cursor;
+            if (pos < len.*) std.mem.copyForwards(u8, buf[pos - 1 ..], buf[pos..len.*]);
+            len.* -= 1;
+            form.opt_edit_cursor -= 1;
+        }
+    } else if (key.matches(vaxis.Key.left, .{})) {
+        if (form.opt_edit_cursor > 0) form.opt_edit_cursor -= 1;
+    } else if (key.matches(vaxis.Key.right, .{})) {
+        if (form.opt_edit_cursor < len.*) form.opt_edit_cursor += 1;
+    } else if (key.matches(vaxis.Key.home, .{})) {
+        form.opt_edit_cursor = 0;
+    } else if (key.matches(vaxis.Key.end, .{})) {
+        form.opt_edit_cursor = len.*;
+    } else if (key.codepoint >= 0x20 and key.codepoint <= 0x7E) {
+        // Code field: numbers only.
+        if (form.opt_edit_field == 0 and (key.codepoint < '0' or key.codepoint > '9')) return;
+        if (len.* < max_len) {
+            const pos = form.opt_edit_cursor;
+            if (pos < len.*) std.mem.copyBackwards(u8, buf[pos + 1 ..], buf[pos..len.*]);
+            buf[pos] = @intCast(key.codepoint);
+            len.* += 1;
+            form.opt_edit_cursor += 1;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Option lookup modal
+// ---------------------------------------------------------------------------
+
+fn renderOptionLookup(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
+    const form = &state.form;
+    const BOX_W: u16 = 40;
+    const BOX_H: u16 = @min(win.height -| 2, 22);
+    if (win.width < BOX_W or win.height < 8) return;
+    const x = (win.width - BOX_W) / 2;
+    const y = (win.height -| BOX_H) / 2;
+    const box = win.child(.{ .x_off = x, .y_off = y, .width = BOX_W, .height = BOX_H });
+    box.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = .{ .rgb = .{ 20, 20, 30 } } } });
+    const border_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 160, 255 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+    drawBox(box, 0, 0, BOX_W, BOX_H, border_style);
+    const title_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 200, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
+    const sel_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 255, 255 } }, .bg = .{ .rgb = .{ 50, 80, 140 } } };
+    const norm_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 200, 200, 200 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+    const hint_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 100, 130 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+    const filter_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 220, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+    const close_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 80, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
+
+    _ = box.print(&.{.{ .text = "  DHCP Options", .style = title_style }}, .{ .col_offset = 1, .row_offset = 1, .wrap = .none });
+    _ = box.print(&.{.{ .text = "[X]", .style = close_style }}, .{ .col_offset = BOX_W -| 4, .row_offset = 0, .wrap = .none });
+
+    // Filter bar.
+    if (form.opt_lookup_filter_len > 0) {
+        const filter_text = try std.fmt.allocPrint(fa, "  / {s}", .{form.opt_lookup_filter[0..form.opt_lookup_filter_len]});
+        _ = box.print(&.{.{ .text = filter_text, .style = filter_style }}, .{ .col_offset = 1, .row_offset = 2, .wrap = .none });
+    }
+
+    // List filtered options.
+    const filter = form.opt_lookup_filter[0..form.opt_lookup_filter_len];
+    var visible_idx: u16 = 0;
+    const start_row: u16 = 3;
+    for (known_dhcp_options) |ko| {
+        if (filter.len > 0) {
+            if (!containsIgnoreCase(ko.code, filter) and !containsIgnoreCase(ko.name, filter)) continue;
+        }
+        if (start_row + visible_idx >= BOX_H - 2) break;
+        const is_sel = visible_idx == form.opt_lookup_row;
+        const style = if (is_sel) sel_style else norm_style;
+        const line = try std.fmt.allocPrint(fa, "  {s:<5} {s}", .{ ko.code, ko.name });
+        _ = box.print(&.{.{ .text = line, .style = style }}, .{ .col_offset = 1, .row_offset = start_row + visible_idx, .wrap = .none });
+        visible_idx += 1;
+    }
+
+    _ = box.print(&.{.{ .text = "  /:filter  Enter:select  Esc:back", .style = hint_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 2, .wrap = .none });
+}
+
+fn handleOptionLookupKey(state: *TuiState, key: vaxis.Key) void {
+    var form = &state.form;
+
+    if (key.matches(vaxis.Key.escape, .{})) {
+        state.mode = .res_option_edit;
+        return;
+    }
+    if (key.matches(vaxis.Key.enter, .{})) {
+        // Select the option at the current row.
+        const filter = form.opt_lookup_filter[0..form.opt_lookup_filter_len];
+        var idx: u16 = 0;
+        for (known_dhcp_options) |ko| {
+            if (filter.len > 0) {
+                if (!containsIgnoreCase(ko.code, filter) and !containsIgnoreCase(ko.name, filter)) continue;
+            }
+            if (idx == form.opt_lookup_row) {
+                // Populate the code field.
+                const n = @min(ko.code.len, form.opt_edit_code.len);
+                @memcpy(form.opt_edit_code[0..n], ko.code[0..n]);
+                form.opt_edit_code_len = n;
+                form.opt_edit_cursor = n;
+                state.mode = .res_option_edit;
+                return;
+            }
+            idx += 1;
+        }
+        state.mode = .res_option_edit;
+        return;
+    }
+    if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
+        form.opt_lookup_row +|= 1;
+    } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
+        form.opt_lookup_row -|= 1;
+    } else if (key.matches('/', .{})) {
+        // Already in filter mode — just keep typing.
+    } else if (key.matches(vaxis.Key.backspace, .{})) {
+        if (form.opt_lookup_filter_len > 0) {
+            form.opt_lookup_filter_len -= 1;
+            form.opt_lookup_row = 0;
+        }
+    } else if (key.codepoint >= 0x20 and key.codepoint <= 0x7E) {
+        if (form.opt_lookup_filter_len < form.opt_lookup_filter.len) {
+            form.opt_lookup_filter[form.opt_lookup_filter_len] = @intCast(key.codepoint);
+            form.opt_lookup_filter_len += 1;
+            form.opt_lookup_row = 0;
         }
     }
 }
