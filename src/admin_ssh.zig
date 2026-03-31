@@ -459,10 +459,13 @@ const ReservationForm = struct {
     mac_len: usize = 0,
     hostname_buf: [64]u8 = [_]u8{0} ** 64,
     hostname_len: usize = 0,
-    /// Index of the field currently receiving input: 0=ip  1=mac  2=hostname.
+    /// Index of the field currently receiving input: 0=ip  1=mac  2=hostname  3=options.
     active_field: u8 = 0,
     /// Cursor position within the active field (byte offset).
     cursor: usize = 0,
+    /// Per-reservation DHCP option overrides.
+    options: [32]OptionEntry = [_]OptionEntry{.{}} ** 32,
+    option_count: usize = 0,
     /// Inline error message (empty = no error).
     err_buf: [80]u8 = [_]u8{0} ** 80,
     err_len: usize = 0,
@@ -660,6 +663,7 @@ const TuiState = struct {
     sub_list_row: u16 = 0,
     sub_edit_field: u8 = 0, // 0=first column, 1=second column
     sub_edit_cursor: usize = 0,
+    sub_modal_parent: TuiMode = .pool_form, // which form to return to on Esc
 };
 
 /// Replicate the vaxis Table dynamic_fill column-width calculation.
@@ -1341,12 +1345,16 @@ fn renderHeader(server: *AdminServer, state: *TuiState, win: vaxis.Window) void 
     }
 
     const hint: []const u8 = switch (state.tab) {
-        .leases => "  /:filter  n:new  e:edit  d:del/release  ?:help  q:quit",
-        .stats => "  ?:help  q:quit",
-        .pools => if (server.cfg.admin_ssh.read_only) "  /:filter  v:view  ?:help  q:quit" else "  /:filter  v:view  e:edit  n:new  d:del  ?:help  q:quit",
-        .settings => "  ?:help  q:quit",
+        .leases => "  /:filter  n:new  e:edit  d:delete",
+        .stats => "",
+        .pools => if (server.cfg.admin_ssh.read_only) "  /:filter  v:view" else "  /:filter  v:view  e:edit  n:new  d:del",
+        .settings => "",
     };
     _ = win.print(&.{.{ .text = hint, .style = hint_style }}, .{ .col_offset = col, .wrap = .none });
+    // Right-aligned global shortcuts.
+    const global_hint = "?:help  q:quit ";
+    const rhs_col: u16 = if (win.width > global_hint.len) win.width - @as(u16, @intCast(global_hint.len)) else 0;
+    _ = win.print(&.{.{ .text = global_hint, .style = hint_style }}, .{ .col_offset = rhs_col, .wrap = .none });
 }
 
 fn renderStatus(server: *AdminServer, state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
@@ -1950,11 +1958,15 @@ fn renderStatsTab(
 /// Box is `w` columns wide, `h` rows tall.
 fn drawBox(win: vaxis.Window, row: u16, col: u16, w: u16, h: u16, style: vaxis.Style) void {
     if (w < 2 or h < 2) return;
+    // Clamp to buffer capacity: (w-2) inner chars * 3 bytes + 6 for corners.
+    const max_inner: u16 = 254; // 254 * 3 + 6 = 768
+    const clamped_w = @min(w, max_inner + 2);
+    _ = &clamped_w; // suppress unused
 
     // Top and bottom border strings. Each inner cell is 3 bytes (UTF-8 box char).
     var top_buf: [768]u8 = undefined;
     var bot_buf: [768]u8 = undefined;
-    const inner = w - 2;
+    const inner = @min(w - 2, max_inner);
     top_buf[0] = '\xe2';
     top_buf[1] = '\x94';
     top_buf[2] = '\x8c'; // ┌
@@ -1991,75 +2003,83 @@ fn drawBox(win: vaxis.Window, row: u16, col: u16, w: u16, h: u16, style: vaxis.S
 
 /// Render the reservation add/edit form as a centered overlay.
 fn renderReservationForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
-    const BOX_W: u16 = 54;
-    const BOX_H: u16 = 11;
+    // Layout: title, blank, IP, MAC, Hostname, Options, blank, saved/err, hints, border
+    const BOX_W: u16 = 58;
+    const BOX_H: u16 = 13;
     if (win.width < BOX_W or win.height < BOX_H) return;
 
     const col: u16 = (win.width - BOX_W) / 2;
     const row: u16 = (win.height -| BOX_H) / 2;
 
-    const border_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 160, 255 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
-    const title_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 200, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
-    const label_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 180, 180 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+    const bg_color: vaxis.Color = .{ .rgb = .{ 20, 20, 30 } };
+    const border_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 160, 255 } }, .bg = bg_color };
+    const title_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 200, 80 } }, .bg = bg_color, .bold = true };
+    const label_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 180, 180 } }, .bg = bg_color };
     const field_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 220, 220, 220 } }, .bg = .{ .rgb = .{ 40, 40, 55 } } };
     const active_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 255, 255 } }, .bg = .{ .rgb = .{ 50, 80, 140 } } };
     const cursor_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 0, 0, 0 } }, .bg = .{ .rgb = .{ 100, 180, 255 } } };
-    const hint_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 120, 120, 120 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
-    const err_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 80, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
-    const ro_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 160, 0 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
+    const hint_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 120, 120, 120 } }, .bg = bg_color };
+    const err_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 80, 80 } }, .bg = bg_color, .bold = true };
+    const close_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 80, 80 } }, .bg = bg_color, .bold = true };
 
     // Fill box interior background.
     var r: u16 = 0;
     while (r < BOX_H) : (r += 1) {
         const fill = try fa.alloc(u8, BOX_W);
         @memset(fill, ' ');
-        _ = win.print(&.{.{ .text = fill, .style = .{ .bg = .{ .rgb = .{ 20, 20, 30 } } } }}, .{ .col_offset = col, .row_offset = row + r, .wrap = .none });
+        _ = win.print(&.{.{ .text = fill, .style = .{ .bg = bg_color } }}, .{ .col_offset = col, .row_offset = row + r, .wrap = .none });
     }
     drawBox(win, row, col, BOX_W, BOX_H, border_style);
 
-    const close_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 80, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
+    // Title + [X]
     const title = if (state.form.isNew()) "  New Reservation" else "  Edit Reservation";
     _ = win.print(&.{.{ .text = title, .style = title_style }}, .{ .col_offset = col + 1, .row_offset = row + 1, .wrap = .none });
     _ = win.print(&.{.{ .text = "[X]", .style = close_style }}, .{ .col_offset = col + BOX_W -| 5, .row_offset = row, .wrap = .none });
 
-    const fields = [3]struct { label: []const u8, buf: []const u8, len: usize }{
-        .{ .label = "  IP Address : ", .buf = &state.form.ip_buf, .len = state.form.ip_len },
-        .{ .label = "  MAC Address: ", .buf = &state.form.mac_buf, .len = state.form.mac_len },
-        .{ .label = "  Hostname   : ", .buf = &state.form.hostname_buf, .len = state.form.hostname_len },
+    // Field layout: label on left, value fills to right edge minus 2.
+    const LABEL_W: u16 = 17; // "  IP Address   : " = ~17
+    const FIELD_W: u16 = BOX_W -| LABEL_W -| 4; // 2 left margin + 2 right margin
+
+    const fields = [4]struct { label: []const u8, buf: []const u8, len: usize, field_idx: u8 }{
+        .{ .label = "  IP Address   ", .buf = &state.form.ip_buf, .len = state.form.ip_len, .field_idx = 0 },
+        .{ .label = "  MAC Address  ", .buf = &state.form.mac_buf, .len = state.form.mac_len, .field_idx = 1 },
+        .{ .label = "  Hostname     ", .buf = &state.form.hostname_buf, .len = state.form.hostname_len, .field_idx = 2 },
+        .{ .label = "  DHCP Options ", .buf = "(Enter to edit)", .len = 15, .field_idx = 3 },
     };
-    const FIELD_W: u16 = 22;
 
     for (fields, 0..) |f, fi| {
-        const fr: u16 = row + 3 + @as(u16, @intCast(fi)) * 2;
+        const fr: u16 = row + 3 + @as(u16, @intCast(fi));
         _ = win.print(&.{.{ .text = f.label, .style = label_style }}, .{ .col_offset = col + 1, .row_offset = fr, .wrap = .none });
-        const is_active = state.form.active_field == @as(u8, @intCast(fi));
+        const is_active = state.form.active_field == f.field_idx;
         const fs = if (is_active) active_style else field_style;
         const value = f.buf[0..f.len];
-        const lbl_len: u16 = @intCast(f.label.len);
-        const field_x = col + 1 + lbl_len;
+        const field_x = col + 1 + LABEL_W;
         // Pad field to FIELD_W.
-        const pad = if (value.len < FIELD_W) FIELD_W - @as(u16, @intCast(value.len)) else 0;
+        const val_len = @as(u16, @intCast(@min(value.len, FIELD_W)));
+        const pad = FIELD_W -| val_len;
         const padded = try fa.alloc(u8, pad);
         @memset(padded, ' ');
-        _ = win.print(&.{.{ .text = value, .style = fs }}, .{ .col_offset = field_x, .row_offset = fr, .wrap = .none });
-        _ = win.print(&.{.{ .text = padded, .style = fs }}, .{ .col_offset = field_x + @as(u16, @intCast(value.len)), .row_offset = fr, .wrap = .none });
-        if (is_active) {
+        _ = win.print(&.{.{ .text = value[0..val_len], .style = fs }}, .{ .col_offset = field_x, .row_offset = fr, .wrap = .none });
+        _ = win.print(&.{.{ .text = padded, .style = fs }}, .{ .col_offset = field_x + val_len, .row_offset = fr, .wrap = .none });
+        if (is_active and f.field_idx < 3) { // text fields get cursor; options field doesn't
             const cur_pos = @min(state.form.cursor, f.len);
             const ch: []const u8 = if (cur_pos < f.len) f.buf[cur_pos..][0..1] else " ";
             _ = win.print(&.{.{ .text = ch, .style = cursor_style }}, .{ .col_offset = field_x + @as(u16, @intCast(cur_pos)), .row_offset = fr, .wrap = .none });
         }
     }
 
-    _ = win.print(&.{.{ .text = "  Tab/Shift-Tab: next/prev  Enter: save  Esc: close", .style = hint_style }}, .{ .col_offset = col + 1, .row_offset = row + BOX_H - 3, .wrap = .none });
-
+    // Row 8 (row + BOX_H - 5): blank line
+    // Row 9 (row + BOX_H - 4): saved/error message (right-aligned for saved)
     if (state.form.err_len > 0) {
-        _ = win.print(&.{.{ .text = state.form.err_buf[0..state.form.err_len], .style = err_style }}, .{ .col_offset = col + 1, .row_offset = row + BOX_H - 2, .wrap = .none });
+        _ = win.print(&.{.{ .text = state.form.err_buf[0..state.form.err_len], .style = err_style }}, .{ .col_offset = col + 2, .row_offset = row + BOX_H - 4, .wrap = .none });
     } else if (state.form.saved) {
-        const saved_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 80, 220, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
-        _ = win.print(&.{.{ .text = "  Saved!", .style = saved_style }}, .{ .col_offset = col + 1, .row_offset = row + BOX_H - 2, .wrap = .none });
-    } else {
-        _ = win.print(&.{.{ .text = "  (hostname optional)", .style = ro_style }}, .{ .col_offset = col + 1, .row_offset = row + BOX_H - 2, .wrap = .none });
+        const saved_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 80, 220, 80 } }, .bg = bg_color, .bold = true };
+        const saved_x = col + BOX_W -| 9; // "Saved! " right-aligned
+        _ = win.print(&.{.{ .text = "Saved!", .style = saved_style }}, .{ .col_offset = saved_x, .row_offset = row + BOX_H - 4, .wrap = .none });
     }
+
+    // Row 10 (row + BOX_H - 3): hints
+    _ = win.print(&.{.{ .text = "  Tab: next/prev  Enter: save  Esc: close", .style = hint_style }}, .{ .col_offset = col + 1, .row_offset = row + BOX_H - 3, .wrap = .none });
 }
 
 /// Save the form: update StateStore + config.yaml. Returns an error message on failure.
@@ -2112,7 +2132,14 @@ fn handleFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) void {
     }
 
     if (key.matches(vaxis.Key.enter, .{})) {
-        // Save on Enter only.
+        // Field 3 = DHCP Options: open sub-modal.
+        if (form.active_field == 3) {
+            state.sub_list_row = 0;
+            state.sub_modal_parent = .reservation_form;
+            state.mode = .option_list;
+            return;
+        }
+        // Save on Enter for text fields.
         if (server.cfg.admin_ssh.read_only) {
             const msg = "read-only mode — changes not permitted";
             form.err_len = @min(msg.len, form.err_buf.len);
@@ -2128,17 +2155,20 @@ fn handleFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) void {
         return;
     }
 
-    // Field navigation.
+    // Field navigation (0=ip, 1=mac, 2=hostname, 3=options).
     if (key.matches(vaxis.Key.tab, .{}) or key.matches(vaxis.Key.down, .{})) {
-        form.active_field = (form.active_field + 1) % 3;
+        form.active_field = (form.active_field + 1) % 4;
         form.cursor = form.activeLen();
         return;
     }
     if (key.matches(vaxis.Key.tab, .{ .shift = true }) or key.matches(vaxis.Key.up, .{})) {
-        form.active_field = if (form.active_field == 0) 2 else form.active_field - 1;
+        form.active_field = if (form.active_field == 0) 3 else form.active_field - 1;
         form.cursor = form.activeLen();
         return;
     }
+
+    // Field 3 is not a text field — skip cursor/text input.
+    if (form.active_field == 3) return;
 
     // Cursor movement.
     if (key.matches(vaxis.Key.left, .{})) {
@@ -2857,8 +2887,8 @@ fn modalDims(mode: TuiMode, win_w: u16, win_h: u16) struct { x: u16, y: u16, w: 
             return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
         },
         .reservation_form => {
-            const w: u16 = 54;
-            const h: u16 = 11;
+            const w: u16 = 58;
+            const h: u16 = 13;
             return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
         },
         .delete_confirm => {
@@ -3067,11 +3097,13 @@ fn handlePoolFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
         // Fields 20/21 open sub-modals instead of saving.
         if (form.active_field == 20) {
             state.sub_list_row = 0;
+            state.sub_modal_parent = .pool_form;
             state.mode = .route_list;
             return;
         }
         if (form.active_field == 21) {
             state.sub_list_row = 0;
+            state.sub_modal_parent = .pool_form;
             state.mode = .option_list;
             return;
         }
@@ -3903,7 +3935,7 @@ fn handleRouteListKey(_: *AdminServer, state: *TuiState, key: vaxis.Key) void {
 
     // List mode.
     if (key.matches(vaxis.Key.escape, .{})) {
-        state.mode = .pool_form;
+        state.mode = state.sub_modal_parent;
         return;
     }
     if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
@@ -3942,9 +3974,9 @@ fn handleRouteListKey(_: *AdminServer, state: *TuiState, key: vaxis.Key) void {
 // ---------------------------------------------------------------------------
 
 fn renderOptionList(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
-    const form = &state.pool_form;
+    const ao = activeOptions(state);
     const BOX_W: u16 = 56;
-    const BOX_H: u16 = @min(win.height -| 2, @as(u16, @intCast(@min(form.option_count + 5, 20))));
+    const BOX_H: u16 = @min(win.height -| 2, @as(u16, @intCast(@min(ao.count.* + 5, 20))));
     if (win.width < BOX_W or win.height < 6) return;
     const x = (win.width - BOX_W) / 2;
     const y = (win.height -| BOX_H) / 2;
@@ -3960,13 +3992,13 @@ fn renderOptionList(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) 
     const norm_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 200, 200, 200 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
     const hint_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 100, 130 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
 
-    if (form.option_count == 0) {
+    if (ao.count.* == 0) {
         _ = box.print(&.{.{ .text = "  (no options)", .style = hint_style }}, .{ .row_offset = 1, .wrap = .none });
     }
     var row: u16 = 1;
-    for (0..form.option_count) |oi| {
+    for (0..ao.count.*) |oi| {
         if (row >= BOX_H - 2) break;
-        const o = &form.options[oi];
+        const o = &ao.opts[oi];
         const is_sel = oi == state.sub_list_row;
         const style = if (is_sel) sel_style else norm_style;
         const code = o.code_buf[0..o.code_len];
@@ -3981,8 +4013,15 @@ fn renderOptionList(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) 
     _ = box.print(&.{.{ .text = "  n:add  e:edit  d:del  Esc:back", .style = hint_style }}, .{ .row_offset = BOX_H - 1, .wrap = .none });
 }
 
+fn activeOptions(state: *TuiState) struct { opts: *[32]OptionEntry, count: *usize } {
+    if (state.sub_modal_parent == .reservation_form) {
+        return .{ .opts = &state.form.options, .count = &state.form.option_count };
+    }
+    return .{ .opts = &state.pool_form.options, .count = &state.pool_form.option_count };
+}
+
 fn handleOptionListKey(_: *AdminServer, state: *TuiState, key: vaxis.Key) void {
-    var form = &state.pool_form;
+    const ao = activeOptions(state);
 
     if (state.mode == .option_edit) {
         if (key.matches(vaxis.Key.escape, .{})) {
@@ -3998,8 +4037,8 @@ fn handleOptionListKey(_: *AdminServer, state: *TuiState, key: vaxis.Key) void {
             return;
         }
         const oi = state.sub_list_row;
-        if (oi >= form.option_count) return;
-        const o = &form.options[oi];
+        if (oi >= ao.count.*) return;
+        const o = &ao.opts[oi];
         const buf: []u8 = if (state.sub_edit_field == 0) &o.code_buf else &o.value_buf;
         const len: *usize = if (state.sub_edit_field == 0) &o.code_len else &o.value_len;
         if (key.matches(vaxis.Key.backspace, .{})) {
@@ -4015,33 +4054,33 @@ fn handleOptionListKey(_: *AdminServer, state: *TuiState, key: vaxis.Key) void {
 
     // List mode.
     if (key.matches(vaxis.Key.escape, .{})) {
-        state.mode = .pool_form;
+        state.mode = state.sub_modal_parent;
         return;
     }
     if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
-        if (form.option_count > 0 and state.sub_list_row + 1 < form.option_count) state.sub_list_row += 1;
+        if (ao.count.* > 0 and state.sub_list_row + 1 < ao.count.*) state.sub_list_row += 1;
     } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
         state.sub_list_row -|= 1;
     } else if (key.matches('n', .{})) {
-        if (form.option_count < form.options.len) {
-            form.options[form.option_count] = .{};
-            form.option_count += 1;
-            state.sub_list_row = @intCast(form.option_count - 1);
+        if (ao.count.* < ao.opts.len) {
+            ao.opts[ao.count.*] = .{};
+            ao.count.* += 1;
+            state.sub_list_row = @intCast(ao.count.* - 1);
             state.sub_edit_field = 0;
             state.mode = .option_edit;
         }
-    } else if (key.matches('e', .{}) and form.option_count > 0) {
+    } else if (key.matches('e', .{}) and ao.count.* > 0) {
         state.sub_edit_field = 0;
         state.mode = .option_edit;
-    } else if (key.matches('d', .{}) and form.option_count > 0) {
+    } else if (key.matches('d', .{}) and ao.count.* > 0) {
         const oi = state.sub_list_row;
-        if (oi < form.option_count) {
+        if (oi < ao.count.*) {
             var i: usize = oi;
-            while (i + 1 < form.option_count) : (i += 1) {
-                form.options[i] = form.options[i + 1];
+            while (i + 1 < ao.count.*) : (i += 1) {
+                ao.opts[i] = ao.opts[i + 1];
             }
-            form.option_count -= 1;
-            if (state.sub_list_row > 0 and state.sub_list_row >= form.option_count) {
+            ao.count.* -= 1;
+            if (state.sub_list_row > 0 and state.sub_list_row >= ao.count.*) {
                 state.sub_list_row -= 1;
             }
         }
