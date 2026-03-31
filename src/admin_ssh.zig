@@ -3127,12 +3127,13 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
             form.scroll_offset += 1;
         }
 
-        // Clamp: don't scroll past the last field + 1 blank line.
+        // Clamp: don't scroll past the last field + 1 blank line below it.
         const last_field_row = field_rows[PoolForm.FIELD_COUNT - 1];
-        // Find max scroll_offset where last_field_row - scroll_row < field_h - 1.
+        // Find max scroll_offset where last_field_row - scroll_row < field_h - 2
+        // (field_h - 2 leaves room for the last field + 1 blank line).
         var max_so: u8 = 0;
         for (0..PoolForm.FIELD_COUNT) |fj| {
-            if (last_field_row -| field_rows[fj] < field_h -| 1) {
+            if (last_field_row -| field_rows[fj] < field_h -| 2) {
                 max_so = @intCast(fj);
                 break;
             }
