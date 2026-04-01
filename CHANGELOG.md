@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.2-alpha2 (2026-04-01)
+
+### New DHCP Options
+
+- **Option 26 — Interface MTU**: first-class `mtu` pool config field (68-65535)
+- **Option 28 — Broadcast Address**: auto-derived from subnet, no config needed
+- **Option 44 — WINS/NetBIOS Name Servers**: first-class `wins_servers` pool config field
+- **Option 150 — Cisco TFTP**: first-class `cisco_tftp_servers` pool config field
+
+All four options respect the override system (pool → MAC class → reservation).
+
+### TUI Improvements
+
+- **Inline editing for pool routes, DHCP options, and domain search**: replaced "(Enter to edit)" sub-list modals with inline [+] Add buttons and editable rows directly in the pool form
+- **Static route edit modal**: two-field modal (Network / Gateway) with CIDR and subnet validation
+- **Domain search edit modal**: single-field modal with domain name validation
+- **DHCP option edit modal**: two-field modal (Option # / Value) with lookup
+- **Comprehensive pool form validation**: subnet (CIDR), router/start/end (valid IPs in subnet, start <= end), domain name (auto-lowercase, valid chars), DNS servers (valid IPs), lease time (max 2 weeks), MTU (68-65535), HTTP Boot URL (scheme + domain + path), all IP lists validated
+- **Reservation form validation**: IP (valid IPv4), MAC (auto-normalize dashes to colons, lowercase, xx:xx:xx:xx:xx:xx format), hostname (auto-lowercase, alphanumeric + dashes)
+- **Settings tab**: reordered (Metrics before Admin SSH), fixed click handler, sequential navigation, HTTP port (1-65535) and bind (valid IP) validation
+- **Double-click [+] Add buttons** opens add modals in both pool and reservation forms
+- **Config parse errors**: YAML syntax errors now show exact line, column, and underline
+
+### Bug Fixes
+
+- **Pool detail view crash**: field indices and buffer size not updated after adding new DHCP option fields
+- **Pool form scroll clamp**: rewrote scroll as row-based offset instead of field-index approximation
+- **Pool diff missed routes/options**: computePoolDiff now detects changes to static routes, DHCP options, and domain search entries
+- **Settings tab broken input**: click handler had wrong line positions after Metrics/SSH section swap; edit indices didn't match visual order
+- **applyFormToPool missing fields**: mtu, wins_servers, cisco_tftp_servers silently lost when editing existing pools
+- **splitCommaDupe leak**: partial string allocations leaked on error
+- **parseSyncConfig peers uninitialized**: errdefer freed garbage pointers on partial allocation failure
+- **parseMacClasses top-level errdefer**: previously-built MacClass entries leaked when a later entry failed
+- **Test discovery**: added comptime import block in main.zig; fixed 26 compilation errors and 6 test failures in previously-undiscovered tests across admin_ssh, metrics, dns, sync modules
+
+### Other
+
+- Migrated repository to driftlevel GitHub organization
+- Updated all org references in README, Dockerfile, git remotes
+
+---
+
 ## v0.2-alpha1 (2026-04-01)
 
 ### SSH Admin TUI
