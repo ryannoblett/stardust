@@ -3590,6 +3590,7 @@ fn handlePoolFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
     if (key.matches(vaxis.Key.enter, .{})) {
         // [+] Add Route button.
         if (form.active_field == form.addRouteField()) {
+            form.err_len = 0;
             form.route_edit_dest_len = 0;
             form.route_edit_router_len = 0;
             form.route_edit_field = 0;
@@ -3602,6 +3603,7 @@ fn handlePoolFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
         if (form.active_field >= form.firstRouteField() and form.active_field < form.addOptionField()) {
             const ri = form.active_field - form.firstRouteField();
             if (ri < form.route_count) {
+                form.err_len = 0;
                 const r = &form.routes[ri];
                 @memcpy(form.route_edit_dest[0..r.dest_len], r.dest_buf[0..r.dest_len]);
                 form.route_edit_dest_len = r.dest_len;
@@ -3616,6 +3618,7 @@ fn handlePoolFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
         }
         // [+] Add Option button.
         if (form.active_field == form.addOptionField()) {
+            form.err_len = 0;
             form.opt_edit_code_len = 0;
             form.opt_edit_value_len = 0;
             form.opt_edit_field = 0;
@@ -3628,6 +3631,7 @@ fn handlePoolFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
         if (form.active_field >= form.firstOptionField()) {
             const oi = form.active_field - form.firstOptionField();
             if (oi < form.option_count) {
+                form.err_len = 0;
                 const o = &form.options[oi];
                 @memcpy(form.opt_edit_code[0..o.code_len], o.code_buf[0..o.code_len]);
                 form.opt_edit_code_len = o.code_len;
@@ -3640,12 +3644,13 @@ fn handlePoolFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
             }
             return;
         }
-        // Regular fields: validate and go to review.
+        // Validate all fields before going to review.
         if (validatePoolForm(form)) |err_msg| {
             form.err_len = @min(err_msg.len, form.err_buf.len);
             @memcpy(form.err_buf[0..form.err_len], err_msg[0..form.err_len]);
             return;
         }
+        form.err_len = 0;
         computePoolDiff(server, state);
         state.mode = .pool_save_confirm;
         return;
