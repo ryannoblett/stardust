@@ -99,8 +99,8 @@ mac_classes:
   - name: "IP Phones"
     match: "64:16:7f"            # Polycom OUI
     dhcp_options:
-      "66": "tftp.phones.local"
-      "150": "10.0.0.5"
+      66: "tftp.phones.local"
+      150: "10.0.0.5"
 
 pools:
   - subnet: "192.168.1.0/24"
@@ -108,7 +108,7 @@ pools:
       - mac: "64:16:7f:aa:bb:cc"
         ip: "192.168.1.50"
         dhcp_options:              # overrides the MAC class
-          "66": "tftp.lobby.local"
+          66: "tftp.lobby.local"
 ```
 
 MAC class patterns support prefix matching (`"64:16:7f"` matches any MAC
