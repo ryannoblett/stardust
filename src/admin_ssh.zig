@@ -1160,7 +1160,24 @@ fn runTui(
                                         else => .normal,
                                     };
                                 } else {
+                                    // Double-click detection for modals.
+                                    const modal_now = std.time.milliTimestamp();
+                                    const modal_dbl = (modal_now - state.last_click_ms < 400 and mr == state.last_click_row);
+                                    state.last_click_ms = modal_now;
+                                    state.last_click_row = mr;
                                     handleModalFieldClick(&state, vwin.width, vwin.height, mr);
+                                    // Double-click on [+] Add buttons triggers the add action.
+                                    if (modal_dbl) {
+                                        if (state.mode == .reservation_form and state.form.active_field == 3) {
+                                            // Simulate Enter on [+] Add for reservation options.
+                                            handleFormKey(server, &state, .{ .codepoint = vaxis.Key.enter });
+                                        } else if (state.mode == .pool_form) {
+                                            const pf = &state.pool_form;
+                                            if (pf.active_field == pf.addRouteField() or pf.active_field == pf.addOptionField()) {
+                                                handlePoolFormKey(server, &state, .{ .codepoint = vaxis.Key.enter });
+                                            }
+                                        }
+                                    }
                                 }
                                 break;
                             }
@@ -2212,15 +2229,55 @@ fn renderReservationForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Alloca
     _ = win.print(&.{.{ .text = hint, .style = hint_style }}, .{ .col_offset = col + 1, .row_offset = row + BOX_H - 2, .wrap = .none });
 }
 
+/// Normalize and validate reservation form fields. Returns error message or null.
+fn validateReservationForm(form: *ReservationForm) ?[]const u8 {
+    // IP: required, must be valid IPv4.
+    if (form.ip_len == 0) return "IP address is required";
+    _ = config_mod.parseIpv4(form.ip_buf[0..form.ip_len]) catch return "Invalid IP address";
+
+    // MAC: required, normalize dashes to colons and lowercase.
+    if (form.mac_len == 0) return "MAC address is required";
+    for (form.mac_buf[0..form.mac_len]) |*ch| {
+        if (ch.* == '-') ch.* = ':';
+        if (ch.* >= 'A' and ch.* <= 'F') ch.* = ch.* - 'A' + 'a';
+    }
+    // Validate format: xx:xx:xx:xx:xx:xx (17 chars, hex pairs with colons).
+    const mac = form.mac_buf[0..form.mac_len];
+    if (mac.len != 17) return "MAC must be xx:xx:xx:xx:xx:xx";
+    for (mac, 0..) |ch, i| {
+        if (i % 3 == 2) {
+            if (ch != ':') return "MAC must be xx:xx:xx:xx:xx:xx";
+        } else {
+            if (!((ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f')))
+                return "MAC must be hex (0-9, a-f)";
+        }
+    }
+
+    // Hostname: optional, auto-lowercase, alphanumeric + dashes.
+    if (form.hostname_len > 0) {
+        for (form.hostname_buf[0..form.hostname_len]) |*ch| {
+            if (ch.* >= 'A' and ch.* <= 'Z') ch.* = ch.* - 'A' + 'a';
+        }
+        const hn = form.hostname_buf[0..form.hostname_len];
+        if (!((hn[0] >= 'a' and hn[0] <= 'z') or (hn[0] >= '0' and hn[0] <= '9')))
+            return "Hostname must start with alphanumeric";
+        for (hn) |ch| {
+            if (!((ch >= 'a' and ch <= 'z') or (ch >= '0' and ch <= '9') or ch == '-'))
+                return "Hostname: only a-z, 0-9, dashes";
+        }
+    }
+
+    return null;
+}
+
 /// Save the form: update StateStore + config.yaml. Returns an error message on failure.
-fn saveReservation(server: *AdminServer, form: *const ReservationForm) ?[]const u8 {
+fn saveReservation(server: *AdminServer, form: *ReservationForm) ?[]const u8 {
+    if (validateReservationForm(form)) |err| return err;
+
     const ip = form.ip_buf[0..form.ip_len];
     const mac = form.mac_buf[0..form.mac_len];
     const hostname_raw = form.hostname_buf[0..form.hostname_len];
     const hostname: ?[]const u8 = if (hostname_raw.len > 0) hostname_raw else null;
-
-    if (ip.len == 0) return "IP address is required";
-    if (mac.len == 0) return "MAC address is required";
 
     // If editing (has orig_mac) and MAC changed, remove old entry first.
     const orig_mac = form.orig_mac[0..form.orig_mac_len];
