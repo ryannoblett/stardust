@@ -446,7 +446,7 @@ const LeaseRow = struct {
 
 const Tab = enum(u8) { leases = 0, stats = 1, pools = 2, settings = 3 };
 
-const TuiMode = enum { normal, reservation_form, delete_confirm, pool_detail, pool_form, pool_delete_confirm, pool_save_confirm, route_list, route_edit, option_list, option_edit, help, res_option_edit, option_lookup };
+const TuiMode = enum { normal, reservation_form, delete_confirm, pool_detail, pool_form, pool_delete_confirm, pool_save_confirm, pool_route_edit, pool_option_edit, help, res_option_edit, option_lookup, pool_option_lookup };
 
 const ReservationForm = struct {
     /// MAC of the lease being edited; empty string means "new reservation".
@@ -582,18 +582,64 @@ const PoolForm = struct {
     dns_update_key_file_buf: [128]u8 = [_]u8{0} ** 128,
     dns_update_key_file_len: usize = 0,
 
-    // --- Static Routes & DHCP Options (edited via sub-modals) ---
+    // --- Static Routes & DHCP Options (inline, with edit modals) ---
     routes: [32]RouteEntry = [_]RouteEntry{.{}} ** 32,
     route_count: usize = 0,
     options: [32]OptionEntry = [_]OptionEntry{.{}} ** 32,
     option_count: usize = 0,
+
+    // Route edit modal state.
+    route_edit_dest: [18]u8 = [_]u8{0} ** 18,
+    route_edit_dest_len: usize = 0,
+    route_edit_router: [16]u8 = [_]u8{0} ** 16,
+    route_edit_router_len: usize = 0,
+    route_edit_field: u8 = 0, // 0=dest, 1=router
+    route_edit_cursor: usize = 0,
+    route_edit_index: ?usize = null, // null=adding, index=editing existing
+
+    // Option edit modal state.
+    opt_edit_code: [4]u8 = [_]u8{0} ** 4,
+    opt_edit_code_len: usize = 0,
+    opt_edit_value: [128]u8 = [_]u8{0} ** 128,
+    opt_edit_value_len: usize = 0,
+    opt_edit_field: u8 = 0, // 0=code, 1=value
+    opt_edit_cursor: usize = 0,
+    opt_edit_index: ?usize = null, // null=adding, index=editing existing
+
+    // Option lookup filter (shared with pool option edit).
+    opt_lookup_filter: [32]u8 = [_]u8{0} ** 32,
+    opt_lookup_filter_len: usize = 0,
+    opt_lookup_row: u16 = 0,
 
     // --- Cursor & Status ---
     cursor: usize = 0, // cursor position within the active field
     err_buf: [120]u8 = [_]u8{0} ** 120,
     err_len: usize = 0,
 
-    const FIELD_COUNT: u8 = pool_field_meta.len;
+    const REGULAR_FIELD_COUNT: u8 = pool_field_meta.len;
+
+    fn totalFields(self: *const PoolForm) u8 {
+        // regular fields + [+]AddRoute + route_count routes + [+]AddOption + option_count options
+        return @intCast(pool_field_meta.len + 1 + self.route_count + 1 + self.option_count);
+    }
+
+    fn addRouteField(self: *const PoolForm) u8 {
+        _ = self;
+        return REGULAR_FIELD_COUNT; // first field after the regular text fields
+    }
+
+    fn firstRouteField(self: *const PoolForm) u8 {
+        _ = self;
+        return REGULAR_FIELD_COUNT + 1;
+    }
+
+    fn addOptionField(self: *const PoolForm) u8 {
+        return @intCast(REGULAR_FIELD_COUNT + 1 + self.route_count);
+    }
+
+    fn firstOptionField(self: *const PoolForm) u8 {
+        return @intCast(REGULAR_FIELD_COUNT + 2 + self.route_count);
+    }
 
     fn isNew(self: *const PoolForm) bool {
         return self.editing_index == null;
@@ -693,11 +739,6 @@ const TuiState = struct {
     settings_pending_bind_len: usize = 0,
     settings_pending_random_alloc: bool = false,
     settings_needs_scroll: bool = false, // set by key handler, cleared after auto-scroll
-    // Route/option list sub-modals.
-    sub_list_row: u16 = 0,
-    sub_edit_field: u8 = 0, // 0=first column, 1=second column
-    sub_edit_cursor: usize = 0,
-    sub_modal_parent: TuiMode = .pool_form, // which form to return to on Esc
     help_scroll: u16 = 0,
 };
 
@@ -906,12 +947,16 @@ fn runTui(
                         handlePoolDeleteConfirmKey(server, &state, key);
                         continue :parse_loop;
                     }
-                    if (state.mode == .route_list or state.mode == .route_edit) {
-                        handleRouteListKey(server, &state, key);
+                    if (state.mode == .pool_route_edit) {
+                        handlePoolRouteEditKey(&state, key);
                         continue :parse_loop;
                     }
-                    if (state.mode == .option_list or state.mode == .option_edit) {
-                        handleOptionListKey(server, &state, key);
+                    if (state.mode == .pool_option_edit) {
+                        handlePoolOptionEditKey(&state, key);
+                        continue :parse_loop;
+                    }
+                    if (state.mode == .pool_option_lookup) {
+                        handlePoolOptionLookupKey(&state, key);
                         continue :parse_loop;
                     }
                     if (state.mode == .help) {
@@ -1110,8 +1155,8 @@ fn runTui(
                                     state.mode = switch (state.mode) {
                                         .res_option_edit => .reservation_form,
                                         .option_lookup => .res_option_edit,
-                                        .route_list, .route_edit => state.sub_modal_parent,
-                                        .option_list, .option_edit => state.sub_modal_parent,
+                                        .pool_route_edit, .pool_option_edit => .pool_form,
+                                        .pool_option_lookup => .pool_option_edit,
                                         else => .normal,
                                     };
                                 } else {
@@ -1232,6 +1277,7 @@ fn runTui(
                             .pool_save_confirm => state.pool_confirm.scroll -|= 3,
                             .pool_form => if (state.pool_form.active_field > 0) {
                                 state.pool_form.active_field -= 1;
+                                state.pool_form.cursor = poolFormFieldLen(&state.pool_form, state.pool_form.active_field);
                             },
                             .normal => switch (state.tab) {
                                 .leases => table_ctx.row -|= 1,
@@ -1244,13 +1290,14 @@ fn runTui(
                             },
                             // All other modals: swallow scroll.
                             .help => state.help_scroll -|= 1,
-                            .delete_confirm, .pool_delete_confirm, .route_list, .route_edit, .option_list, .option_edit, .res_option_edit, .option_lookup => {},
+                            .delete_confirm, .pool_delete_confirm, .pool_route_edit, .pool_option_edit, .pool_option_lookup, .res_option_edit, .option_lookup => {},
                         },
                         .wheel_down => switch (state.mode) {
                             .pool_detail => state.pool_detail_scroll +|= 3,
                             .pool_save_confirm => state.pool_confirm.scroll +|= 3,
-                            .pool_form => if (state.pool_form.active_field + 1 < PoolForm.FIELD_COUNT) {
+                            .pool_form => if (state.pool_form.active_field + 1 < state.pool_form.totalFields()) {
                                 state.pool_form.active_field += 1;
+                                state.pool_form.cursor = poolFormFieldLen(&state.pool_form, state.pool_form.active_field);
                             },
                             .normal => switch (state.tab) {
                                 .leases => table_ctx.row +|= 1,
@@ -1264,7 +1311,7 @@ fn runTui(
                                 if (state.form.active_field + 1 < state.form.totalFields()) state.form.active_field += 1;
                             },
                             .help => state.help_scroll +|= 1,
-                            .delete_confirm, .pool_delete_confirm, .route_list, .route_edit, .option_list, .option_edit, .res_option_edit, .option_lookup => {},
+                            .delete_confirm, .pool_delete_confirm, .pool_route_edit, .pool_option_edit, .pool_option_lookup, .res_option_edit, .option_lookup => {},
                         },
                         else => {},
                     }
@@ -1363,8 +1410,9 @@ fn renderFrame(
         .pool_form => try renderPoolForm(state, win, fa),
         .pool_save_confirm => try renderPoolSaveConfirm(server, state, win, fa),
         .pool_delete_confirm => try renderPoolDeleteConfirm(server, state, win, fa),
-        .route_list, .route_edit => try renderRouteList(state, win, fa),
-        .option_list, .option_edit => try renderOptionList(state, win, fa),
+        .pool_route_edit => try renderPoolRouteEdit(state, win, fa),
+        .pool_option_edit => try renderPoolOptionEdit(state, win, fa),
+        .pool_option_lookup => try renderPoolOptionLookup(state, win, fa),
         .help => renderHelp(state, win),
         .res_option_edit => try renderResOptionEdit(state, win, fa),
         .option_lookup => try renderOptionLookup(state, win, fa),
@@ -2479,8 +2527,6 @@ const pool_field_meta = [_]PoolFieldMeta{
     .{ .label = "DNS Upd Zone" },
     .{ .label = "DNS Upd Key Name", .sensitive = true },
     .{ .label = "DNS Upd Key File", .sensitive = true },
-    .{ .label = "Static Routes", .section = "Lists" },
-    .{ .label = "DHCP Options" },
 };
 
 /// Return the string value of a pool form field by index.
@@ -2508,8 +2554,6 @@ fn poolFormFieldVal(form: *const PoolForm, idx: u8) []const u8 {
         19 => form.dns_update_zone_buf[0..form.dns_update_zone_len],
         20 => form.dns_update_key_name_buf[0..form.dns_update_key_name_len],
         21 => form.dns_update_key_file_buf[0..form.dns_update_key_file_len],
-        22 => "(Enter to edit)",
-        23 => "(Enter to edit)",
         else => "",
     };
 }
@@ -3059,16 +3103,25 @@ fn handleModalFieldClick(state: *TuiState, win_w: u16, win_h: u16, click_row: u1
             if (rel < 2) return; // title area
             // The clicked absolute row = scroll_row + (rel - 2).
             const clicked_abs = state.pool_form.scroll_row + (rel - 2);
-            // Walk through fields to find which one matches.
+            // Walk through all fields (regular + inline routes/options) to find which one matches.
             var abs: u16 = 0;
+            const form = &state.pool_form;
+            const total = form.totalFields();
             var fi: u8 = 0;
-            while (fi < PoolForm.FIELD_COUNT) : (fi += 1) {
-                if (pool_field_meta[fi].section != null) {
-                    abs += 2; // blank line + section header
+            while (fi < total) : (fi += 1) {
+                // Section headers for regular fields.
+                if (fi < PoolForm.REGULAR_FIELD_COUNT) {
+                    if (pool_field_meta[fi].section != null) {
+                        abs += 2; // blank line + section header
+                    }
+                } else if (fi == form.addRouteField()) {
+                    abs += 2; // blank line + "Routes" section header
+                } else if (fi == form.addOptionField()) {
+                    abs += 2; // blank line + "Options" section header
                 }
                 if (abs == clicked_abs) {
-                    state.pool_form.active_field = fi;
-                    state.pool_form.cursor = poolFormFieldLen(&state.pool_form, fi);
+                    form.active_field = fi;
+                    form.cursor = poolFormFieldLen(form, fi);
                     return;
                 }
                 abs += 1;
@@ -3082,6 +3135,26 @@ fn handleModalFieldClick(state: *TuiState, win_w: u16, win_h: u16, click_row: u1
             } else if (rel == 4) {
                 state.form.opt_edit_field = 1;
                 state.form.opt_edit_cursor = state.form.opt_edit_value_len;
+            }
+        },
+        .pool_route_edit => {
+            const rel = click_row -| modal_y;
+            if (rel == 3) {
+                state.pool_form.route_edit_field = 0;
+                state.pool_form.route_edit_cursor = state.pool_form.route_edit_dest_len;
+            } else if (rel == 4) {
+                state.pool_form.route_edit_field = 1;
+                state.pool_form.route_edit_cursor = state.pool_form.route_edit_router_len;
+            }
+        },
+        .pool_option_edit => {
+            const rel = click_row -| modal_y;
+            if (rel == 3) {
+                state.pool_form.opt_edit_field = 0;
+                state.pool_form.opt_edit_cursor = state.pool_form.opt_edit_code_len;
+            } else if (rel == 4) {
+                state.pool_form.opt_edit_field = 1;
+                state.pool_form.opt_edit_cursor = state.pool_form.opt_edit_value_len;
             }
         },
         else => {},
@@ -3130,14 +3203,19 @@ fn modalDims(mode: TuiMode, win_w: u16, win_h: u16, state: *const TuiState) stru
             const h: u16 = 16;
             return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
         },
-        .route_list, .route_edit => {
-            const w: u16 = 56;
-            const h: u16 = 16;
+        .pool_route_edit => {
+            const w: u16 = 48;
+            const h: u16 = 8;
             return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
         },
-        .option_list, .option_edit => {
-            const w: u16 = 56;
-            const h: u16 = 16;
+        .pool_option_edit => {
+            const w: u16 = 48;
+            const h: u16 = 8;
+            return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
+        },
+        .pool_option_lookup => {
+            const w: u16 = 40;
+            const h: u16 = @min(win_h -| 2, 22);
             return .{ .x = (win_w -| w) / 2, .y = (win_h -| h) / 2, .w = w, .h = h };
         },
         .help => {
@@ -3211,16 +3289,31 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
     const LABEL_W: u16 = 19;
     const FIELD_W: u16 = BOX_W -| LABEL_W -| 3; // 1 left border + 2 right margin
 
-    // Compute absolute rendered row for each field (accounting for section headers
-    // and blank lines), then scroll to center the active field.
-    var field_rows: [PoolForm.FIELD_COUNT]u16 = undefined;
+    const opt_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 180, 200 } }, .bg = .{ .rgb = .{ 30, 30, 42 } } };
+
+    // Compute absolute rendered row for each field (accounting for section headers,
+    // blank lines, and inline route/option entries).
+    const total_field_count = form.totalFields();
+    // Max possible rows: each regular field can have a 2-row section header, plus
+    // route/option sections each have a 2-row header, plus all entries.
+    const MAX_FIELD_ROWS = pool_field_meta.len * 3 + 6 + 32 + 32;
+    var field_rows: [MAX_FIELD_ROWS]u16 = undefined;
     var total_rows: u16 = 0;
     {
         var r: u16 = 0;
-        for (0..PoolForm.FIELD_COUNT) |fi| {
-            if (pool_field_meta[fi].section != null) {
-                r += 1; // blank line before section
-                r += 1; // section header
+        var fi: u8 = 0;
+        while (fi < total_field_count) : (fi += 1) {
+            if (fi < PoolForm.REGULAR_FIELD_COUNT) {
+                if (pool_field_meta[fi].section != null) {
+                    r += 1; // blank line before section
+                    r += 1; // section header
+                }
+            } else if (fi == form.addRouteField()) {
+                r += 1; // blank line
+                r += 1; // "Routes" section header
+            } else if (fi == form.addOptionField()) {
+                r += 1; // blank line
+                r += 1; // "Options" section header
             }
             field_rows[fi] = r;
             r += 1;
@@ -3243,19 +3336,37 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
     var abs_row: u16 = 0; // absolute row in the virtual content
     var draw_row: u16 = 2; // screen row (starts below border + title)
     var fi: u8 = 0;
-    while (fi < PoolForm.FIELD_COUNT and draw_row < BOX_H - 2) : (fi += 1) {
-        const meta = pool_field_meta[fi];
-        // Blank line + section header before each group.
-        if (meta.section) |sec| {
-            // blank line
+    while (fi < total_field_count and draw_row < BOX_H - 2) : (fi += 1) {
+        // Section headers.
+        if (fi < PoolForm.REGULAR_FIELD_COUNT) {
+            const meta = pool_field_meta[fi];
+            if (meta.section) |sec| {
+                if (abs_row >= scroll_row and draw_row < BOX_H - 2) draw_row += 1;
+                abs_row += 1;
+                if (abs_row >= scroll_row and draw_row < BOX_H - 2) {
+                    const sec_text = std.fmt.allocPrint(fa, "  -- {s} --", .{sec}) catch "";
+                    _ = box.print(&.{.{ .text = sec_text, .style = section_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
+                    draw_row += 1;
+                }
+                abs_row += 1;
+                if (draw_row >= BOX_H - 2) break;
+            }
+        } else if (fi == form.addRouteField()) {
+            // "Routes" section header.
+            if (abs_row >= scroll_row and draw_row < BOX_H - 2) draw_row += 1;
+            abs_row += 1;
             if (abs_row >= scroll_row and draw_row < BOX_H - 2) {
+                _ = box.print(&.{.{ .text = "  -- Routes --", .style = section_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
                 draw_row += 1;
             }
             abs_row += 1;
-            // section header
+            if (draw_row >= BOX_H - 2) break;
+        } else if (fi == form.addOptionField()) {
+            // "Options" section header.
+            if (abs_row >= scroll_row and draw_row < BOX_H - 2) draw_row += 1;
+            abs_row += 1;
             if (abs_row >= scroll_row and draw_row < BOX_H - 2) {
-                const sec_text = std.fmt.allocPrint(fa, "  -- {s} --", .{sec}) catch "";
-                _ = box.print(&.{.{ .text = sec_text, .style = section_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
+                _ = box.print(&.{.{ .text = "  -- DHCP Options --", .style = section_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
                 draw_row += 1;
             }
             abs_row += 1;
@@ -3269,36 +3380,85 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
         }
 
         const is_active = fi == form.active_field;
-        const style = if (is_active) active_style else field_style;
-        const val = poolFormFieldVal(form, fi);
-        const label_text = std.fmt.allocPrint(fa, "  {s:<17}", .{meta.label}) catch "";
-        _ = box.print(&.{.{ .text = label_text, .style = label_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
 
-        // Value field with horizontal scrolling for active field.
-        const fw = @as(usize, FIELD_W);
-        var vis_start: usize = 0;
-        var cursor_vis: usize = 0;
-        if (is_active and fi != 17) {
-            const cur = @min(form.cursor, val.len);
-            if (cur >= fw) {
-                vis_start = cur - fw + 1;
+        if (fi < PoolForm.REGULAR_FIELD_COUNT) {
+            // Regular text field.
+            const meta = pool_field_meta[fi];
+            const style = if (is_active) active_style else field_style;
+            const val = poolFormFieldVal(form, fi);
+            const label_text = std.fmt.allocPrint(fa, "  {s:<17}", .{meta.label}) catch "";
+            _ = box.print(&.{.{ .text = label_text, .style = label_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
+
+            // Value field with horizontal scrolling for active field.
+            const fw = @as(usize, FIELD_W);
+            var vis_start: usize = 0;
+            var cursor_vis: usize = 0;
+            if (is_active and fi != 17) {
+                const cur = @min(form.cursor, val.len);
+                if (cur >= fw) {
+                    vis_start = cur - fw + 1;
+                }
+                cursor_vis = cur - vis_start;
             }
-            cursor_vis = cur - vis_start;
-        }
-        const vis_end = @min(val.len, vis_start + fw);
-        const vis_text = val[vis_start..vis_end];
-        const pad_len = fw - vis_text.len;
-        const padded = std.fmt.allocPrint(fa, "{s}{s}", .{ vis_text, spaces(fa, @intCast(pad_len)) catch "" }) catch vis_text;
-        _ = box.print(&.{.{ .text = padded, .style = style }}, .{ .col_offset = LABEL_W + 1, .row_offset = draw_row, .wrap = .none });
+            const vis_end = @min(val.len, vis_start + fw);
+            const vis_text = val[vis_start..vis_end];
+            const pad_len = fw - vis_text.len;
+            const padded = std.fmt.allocPrint(fa, "{s}{s}", .{ vis_text, spaces(fa, @intCast(pad_len)) catch "" }) catch vis_text;
+            _ = box.print(&.{.{ .text = padded, .style = style }}, .{ .col_offset = LABEL_W + 1, .row_offset = draw_row, .wrap = .none });
 
-        // Cursor block: show character under cursor with inverted colors.
-        if (is_active and fi != 17) {
-            const cursor_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 20, 20, 30 } }, .bg = .{ .rgb = .{ 100, 160, 255 } } };
-            const cursor_col = LABEL_W + 1 + @as(u16, @intCast(cursor_vis));
-            if (cursor_col < BOX_W -| 1) {
-                const cur_abs = vis_start + cursor_vis;
-                const ch: []const u8 = if (cur_abs < val.len) val[cur_abs..][0..1] else " ";
-                _ = box.print(&.{.{ .text = ch, .style = cursor_style }}, .{ .col_offset = cursor_col, .row_offset = draw_row, .wrap = .none });
+            // Cursor block: show character under cursor with inverted colors.
+            if (is_active and fi != 17) {
+                const cursor_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 20, 20, 30 } }, .bg = .{ .rgb = .{ 100, 160, 255 } } };
+                const cursor_col = LABEL_W + 1 + @as(u16, @intCast(cursor_vis));
+                if (cursor_col < BOX_W -| 1) {
+                    const cur_abs = vis_start + cursor_vis;
+                    const ch: []const u8 = if (cur_abs < val.len) val[cur_abs..][0..1] else " ";
+                    _ = box.print(&.{.{ .text = ch, .style = cursor_style }}, .{ .col_offset = cursor_col, .row_offset = draw_row, .wrap = .none });
+                }
+            }
+        } else if (fi == form.addRouteField() or fi == form.addOptionField()) {
+            // [+] Add button.
+            const add_label = if (fi == form.addRouteField()) "  Routes         " else "  DHCP Options   ";
+            _ = box.print(&.{.{ .text = add_label, .style = label_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
+            const add_fs = if (is_active) active_style else field_style;
+            _ = box.print(&.{.{ .text = "[+] Add", .style = add_fs }}, .{ .col_offset = LABEL_W + 1, .row_offset = draw_row, .wrap = .none });
+        } else if (fi >= form.firstRouteField() and fi < form.addOptionField()) {
+            // Existing route entry.
+            const ri = fi - form.firstRouteField();
+            const r = &form.routes[ri];
+            const dest = r.dest_buf[0..r.dest_len];
+            const router = r.router_buf[0..r.router_len];
+            const line = std.fmt.allocPrint(fa, "    {s:<18} via {s}", .{
+                if (dest.len > 0) dest else "...",
+                if (router.len > 0) router else "...",
+            }) catch "";
+            const os = if (is_active) active_style else opt_style;
+            const opt_w = LABEL_W + FIELD_W;
+            const opt_trunc = line[0..@min(line.len, opt_w)];
+            const opt_pad = opt_w -| @as(u16, @intCast(opt_trunc.len));
+            const opt_padded = try fa.alloc(u8, opt_pad);
+            @memset(opt_padded, ' ');
+            _ = box.print(&.{.{ .text = opt_trunc, .style = os }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
+            _ = box.print(&.{.{ .text = opt_padded, .style = os }}, .{ .col_offset = 1 + @as(u16, @intCast(opt_trunc.len)), .row_offset = draw_row, .wrap = .none });
+        } else if (fi >= form.firstOptionField()) {
+            // Existing option entry.
+            const oi = fi - form.firstOptionField();
+            if (oi < form.option_count) {
+                const o = &form.options[oi];
+                const code = o.code_buf[0..o.code_len];
+                const val = o.value_buf[0..o.value_len];
+                const line = std.fmt.allocPrint(fa, "    {s:<6} {s}", .{
+                    if (code.len > 0) code else "?",
+                    if (val.len > 0) val else "?",
+                }) catch "";
+                const os = if (is_active) active_style else opt_style;
+                const opt_w = LABEL_W + FIELD_W;
+                const opt_trunc = line[0..@min(line.len, opt_w)];
+                const opt_pad = opt_w -| @as(u16, @intCast(opt_trunc.len));
+                const opt_padded = try fa.alloc(u8, opt_pad);
+                @memset(opt_padded, ' ');
+                _ = box.print(&.{.{ .text = opt_trunc, .style = os }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
+                _ = box.print(&.{.{ .text = opt_padded, .style = os }}, .{ .col_offset = 1 + @as(u16, @intCast(opt_trunc.len)), .row_offset = draw_row, .wrap = .none });
             }
         }
         abs_row += 1;
@@ -3306,7 +3466,13 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
     }
 
     // Hint + error (inside border).
-    _ = box.print(&.{.{ .text = "  Tab: next  Shift-Tab: prev  Enter: review  Esc: cancel", .style = hint_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 2, .wrap = .none });
+    const is_inline = form.active_field >= PoolForm.REGULAR_FIELD_COUNT and
+        form.active_field != form.addRouteField() and form.active_field != form.addOptionField();
+    const hint_text = if (is_inline)
+        "  Enter:edit  d:delete  Tab:next  Esc:cancel"
+    else
+        "  Tab:next  Shift-Tab:prev  Enter:review  Esc:cancel";
+    _ = box.print(&.{.{ .text = hint_text, .style = hint_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 2, .wrap = .none });
     if (form.err_len > 0) {
         _ = box.print(&.{.{ .text = form.err_buf[0..form.err_len], .style = err_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 3, .wrap = .none });
     }
@@ -3327,20 +3493,95 @@ fn handlePoolFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
         state.mode = .normal;
         return;
     }
+
+    // 'd' deletes selected inline route or option entry.
+    if (key.matches('d', .{}) and form.active_field >= PoolForm.REGULAR_FIELD_COUNT) {
+        if (form.active_field >= form.firstRouteField() and form.active_field < form.addOptionField()) {
+            // Delete a route.
+            const ri = form.active_field - form.firstRouteField();
+            if (ri < form.route_count) {
+                var i: usize = ri;
+                while (i + 1 < form.route_count) : (i += 1) {
+                    form.routes[i] = form.routes[i + 1];
+                }
+                form.route_count -= 1;
+                if (form.active_field >= form.totalFields()) {
+                    form.active_field -|= 1;
+                }
+            }
+            return;
+        }
+        if (form.active_field >= form.firstOptionField()) {
+            // Delete an option.
+            const oi = form.active_field - form.firstOptionField();
+            if (oi < form.option_count) {
+                var i: usize = oi;
+                while (i + 1 < form.option_count) : (i += 1) {
+                    form.options[i] = form.options[i + 1];
+                }
+                form.option_count -= 1;
+                if (form.active_field >= form.totalFields()) {
+                    form.active_field -|= 1;
+                }
+            }
+            return;
+        }
+    }
+
     if (key.matches(vaxis.Key.enter, .{})) {
-        // Fields 22/23 open sub-modals instead of saving.
-        if (form.active_field == 22) {
-            state.sub_list_row = 0;
-            state.sub_modal_parent = .pool_form;
-            state.mode = .route_list;
+        // [+] Add Route button.
+        if (form.active_field == form.addRouteField()) {
+            form.route_edit_dest_len = 0;
+            form.route_edit_router_len = 0;
+            form.route_edit_field = 0;
+            form.route_edit_cursor = 0;
+            form.route_edit_index = null;
+            state.mode = .pool_route_edit;
             return;
         }
-        if (form.active_field == 23) {
-            state.sub_list_row = 0;
-            state.sub_modal_parent = .pool_form;
-            state.mode = .option_list;
+        // Existing route entry -> edit.
+        if (form.active_field >= form.firstRouteField() and form.active_field < form.addOptionField()) {
+            const ri = form.active_field - form.firstRouteField();
+            if (ri < form.route_count) {
+                const r = &form.routes[ri];
+                @memcpy(form.route_edit_dest[0..r.dest_len], r.dest_buf[0..r.dest_len]);
+                form.route_edit_dest_len = r.dest_len;
+                @memcpy(form.route_edit_router[0..r.router_len], r.router_buf[0..r.router_len]);
+                form.route_edit_router_len = r.router_len;
+                form.route_edit_field = 0;
+                form.route_edit_cursor = r.dest_len;
+                form.route_edit_index = ri;
+                state.mode = .pool_route_edit;
+            }
             return;
         }
+        // [+] Add Option button.
+        if (form.active_field == form.addOptionField()) {
+            form.opt_edit_code_len = 0;
+            form.opt_edit_value_len = 0;
+            form.opt_edit_field = 0;
+            form.opt_edit_cursor = 0;
+            form.opt_edit_index = null;
+            state.mode = .pool_option_edit;
+            return;
+        }
+        // Existing option entry -> edit.
+        if (form.active_field >= form.firstOptionField()) {
+            const oi = form.active_field - form.firstOptionField();
+            if (oi < form.option_count) {
+                const o = &form.options[oi];
+                @memcpy(form.opt_edit_code[0..o.code_len], o.code_buf[0..o.code_len]);
+                form.opt_edit_code_len = o.code_len;
+                @memcpy(form.opt_edit_value[0..o.value_len], o.value_buf[0..o.value_len]);
+                form.opt_edit_value_len = o.value_len;
+                form.opt_edit_field = 0;
+                form.opt_edit_cursor = o.code_len;
+                form.opt_edit_index = oi;
+                state.mode = .pool_option_edit;
+            }
+            return;
+        }
+        // Regular fields: validate and go to review.
         if (validatePoolForm(form)) |err_msg| {
             form.err_len = @min(err_msg.len, form.err_buf.len);
             @memcpy(form.err_buf[0..form.err_len], err_msg[0..form.err_len]);
@@ -3360,12 +3601,15 @@ fn handlePoolFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
         return;
     }
     if (key.matches(vaxis.Key.tab, .{}) or key.matches(vaxis.Key.down, .{})) {
-        if (form.active_field + 1 < PoolForm.FIELD_COUNT) {
+        if (form.active_field + 1 < form.totalFields()) {
             form.active_field += 1;
             form.cursor = poolFormFieldLen(form, form.active_field);
         }
         return;
     }
+
+    // Non-text fields: [+] buttons, route entries, option entries.
+    if (form.active_field >= PoolForm.REGULAR_FIELD_COUNT) return;
 
     // Field 17 = dns_update_enable: toggle on space or any printable
     if (form.active_field == 17) {
@@ -3513,7 +3757,7 @@ fn computePoolDiff(server: *AdminServer, state: *TuiState) void {
         confirm.has_sync_break = true; // adding a pool always breaks sync (pool count changes)
         // For new pools, list all non-empty fields as changes.
         var fi: u8 = 0;
-        while (fi < PoolForm.FIELD_COUNT) : (fi += 1) {
+        while (fi < PoolForm.REGULAR_FIELD_COUNT) : (fi += 1) {
             const val = poolFormFieldVal(form, fi);
             if (val.len > 0) {
                 if (confirm.change_count < confirm.changes.len) {
@@ -3539,7 +3783,7 @@ fn computePoolDiff(server: *AdminServer, state: *TuiState) void {
     const sync_fields = [_]u8{ 0, 2, 3, 7 };
 
     var fi: u8 = 0;
-    while (fi < PoolForm.FIELD_COUNT) : (fi += 1) {
+    while (fi < PoolForm.REGULAR_FIELD_COUNT) : (fi += 1) {
         const old_val = poolFormFieldVal(&tmp_form, fi);
         const new_val = poolFormFieldVal(form, fi);
         if (!std.mem.eql(u8, old_val, new_val)) {
@@ -4518,238 +4762,379 @@ fn renderHelp(state: *TuiState, win: vaxis.Window) void {
 }
 
 // ---------------------------------------------------------------------------
-// Route list sub-modal
+// Pool route edit modal
 // ---------------------------------------------------------------------------
 
-fn renderRouteList(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
+fn renderPoolRouteEdit(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
     const form = &state.pool_form;
-    const BOX_W: u16 = 56;
-    const BOX_H: u16 = @min(win.height -| 2, @as(u16, @intCast(@min(form.route_count + 5, 20))));
-    if (win.width < BOX_W or win.height < 6) return;
+    const BOX_W: u16 = 48;
+    const BOX_H: u16 = 8;
+    if (win.width < BOX_W or win.height < BOX_H) return;
     const x = (win.width - BOX_W) / 2;
     const y = (win.height -| BOX_H) / 2;
     const box = win.child(.{ .x_off = x, .y_off = y, .width = BOX_W, .height = BOX_H });
     box.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = .{ .rgb = .{ 20, 20, 30 } } } });
     const border_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 160, 255 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
     drawBox(box, 0, 0, BOX_W, BOX_H, border_style);
+    const title_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 200, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
+    const label_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 160, 160, 190 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+    const field_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 200, 200, 200 } }, .bg = .{ .rgb = .{ 30, 30, 45 } } };
+    const active_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 255, 255 } }, .bg = .{ .rgb = .{ 50, 80, 140 } } };
+    const cursor_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 20, 20, 30 } }, .bg = .{ .rgb = .{ 100, 160, 255 } } };
+    const hint_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 100, 130 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
     const close_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 80, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
-    _ = box.print(&.{.{ .text = " Static Routes ", .style = border_style }}, .{ .row_offset = 0, .col_offset = 1, .wrap = .none });
+
+    const title = if (form.route_edit_index == null) "  Add Static Route" else "  Edit Static Route";
+    _ = box.print(&.{.{ .text = title, .style = title_style }}, .{ .col_offset = 1, .row_offset = 1, .wrap = .none });
     _ = box.print(&.{.{ .text = "[X]", .style = close_style }}, .{ .col_offset = BOX_W -| 4, .row_offset = 0, .wrap = .none });
 
-    const sel_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 255, 255 } }, .bg = .{ .rgb = .{ 50, 80, 140 } } };
-    const norm_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 200, 200, 200 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
-    const edit_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 255, 255 } }, .bg = .{ .rgb = .{ 50, 80, 140 } } };
-    const hint_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 100, 130 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+    // Network field.
+    const dest_active = form.route_edit_field == 0;
+    _ = box.print(&.{.{ .text = "  Network   ", .style = label_style }}, .{ .col_offset = 1, .row_offset = 3, .wrap = .none });
+    const dest_val = form.route_edit_dest[0..form.route_edit_dest_len];
+    const dest_style = if (dest_active) active_style else field_style;
+    const dest_fw: u16 = BOX_W -| 16;
+    const dest_trunc = dest_val[0..@min(dest_val.len, dest_fw)];
+    const dest_pad = try fa.alloc(u8, dest_fw -| @as(u16, @intCast(dest_trunc.len)));
+    @memset(dest_pad, ' ');
+    _ = box.print(&.{.{ .text = dest_trunc, .style = dest_style }}, .{ .col_offset = 13, .row_offset = 3, .wrap = .none });
+    _ = box.print(&.{.{ .text = dest_pad, .style = dest_style }}, .{ .col_offset = 13 + @as(u16, @intCast(dest_trunc.len)), .row_offset = 3, .wrap = .none });
+    if (dest_active) {
+        const cur = @min(form.route_edit_cursor, dest_val.len);
+        const ch: []const u8 = if (cur < dest_val.len) dest_val[cur..][0..1] else " ";
+        _ = box.print(&.{.{ .text = ch, .style = cursor_style }}, .{ .col_offset = 13 + @as(u16, @intCast(cur)), .row_offset = 3, .wrap = .none });
+    }
 
-    if (form.route_count == 0) {
-        _ = box.print(&.{.{ .text = "  (no routes)", .style = hint_style }}, .{ .row_offset = 1, .wrap = .none });
+    // Gateway field.
+    const router_active = form.route_edit_field == 1;
+    _ = box.print(&.{.{ .text = "  Gateway   ", .style = label_style }}, .{ .col_offset = 1, .row_offset = 4, .wrap = .none });
+    const router_val = form.route_edit_router[0..form.route_edit_router_len];
+    const router_style = if (router_active) active_style else field_style;
+    const router_trunc = router_val[0..@min(router_val.len, dest_fw)];
+    const router_pad = try fa.alloc(u8, dest_fw -| @as(u16, @intCast(router_trunc.len)));
+    @memset(router_pad, ' ');
+    _ = box.print(&.{.{ .text = router_trunc, .style = router_style }}, .{ .col_offset = 13, .row_offset = 4, .wrap = .none });
+    _ = box.print(&.{.{ .text = router_pad, .style = router_style }}, .{ .col_offset = 13 + @as(u16, @intCast(router_trunc.len)), .row_offset = 4, .wrap = .none });
+    if (router_active) {
+        const cur = @min(form.route_edit_cursor, router_val.len);
+        const ch: []const u8 = if (cur < router_val.len) router_val[cur..][0..1] else " ";
+        _ = box.print(&.{.{ .text = ch, .style = cursor_style }}, .{ .col_offset = 13 + @as(u16, @intCast(cur)), .row_offset = 4, .wrap = .none });
     }
-    var row: u16 = 1;
-    for (0..form.route_count) |ri| {
-        if (row >= BOX_H - 2) break;
-        const r = &form.routes[ri];
-        const is_sel = ri == state.sub_list_row;
-        const is_editing = is_sel and state.mode == .route_edit;
-        const style = if (is_sel) sel_style else norm_style;
-        const dest = r.dest_buf[0..r.dest_len];
-        const router = r.router_buf[0..r.router_len];
-        const line = std.fmt.allocPrint(fa, "  {s:<20} via {s}", .{
-            if (dest.len > 0) dest else "...",
-            if (router.len > 0) router else "...",
-        }) catch "";
-        if (is_editing) {
-            _ = box.print(&.{.{ .text = line, .style = edit_style }}, .{ .row_offset = row, .wrap = .none });
-        } else {
-            _ = box.print(&.{.{ .text = line, .style = style }}, .{ .row_offset = row, .wrap = .none });
-        }
-        row += 1;
-    }
-    _ = box.print(&.{.{ .text = "  n:add  e:edit  d:del  Esc:back", .style = hint_style }}, .{ .row_offset = BOX_H - 1, .wrap = .none });
+
+    _ = box.print(&.{.{ .text = "  Tab: switch  Enter: save  Esc: cancel", .style = hint_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 2, .wrap = .none });
 }
 
-fn handleRouteListKey(_: *AdminServer, state: *TuiState, key: vaxis.Key) void {
+fn handlePoolRouteEditKey(state: *TuiState, key: vaxis.Key) void {
     var form = &state.pool_form;
 
-    if (state.mode == .route_edit) {
-        // Editing a route entry inline.
-        if (key.matches(vaxis.Key.escape, .{})) {
-            state.mode = .route_list;
-            return;
-        }
-        if (key.matches(vaxis.Key.enter, .{})) {
-            state.mode = .route_list;
-            return;
-        }
-        if (key.matches(vaxis.Key.tab, .{}) or key.matches(vaxis.Key.tab, .{ .shift = true })) {
-            state.sub_edit_field = if (state.sub_edit_field == 0) 1 else 0;
-            return;
-        }
-        const ri = state.sub_list_row;
-        if (ri >= form.route_count) return;
-        const r = &form.routes[ri];
-        const buf: []u8 = if (state.sub_edit_field == 0) &r.dest_buf else &r.router_buf;
-        const len: *usize = if (state.sub_edit_field == 0) &r.dest_len else &r.router_len;
-        if (key.matches(vaxis.Key.backspace, .{})) {
-            if (len.* > 0) len.* -= 1;
-        } else if (key.codepoint >= 0x20 and key.codepoint <= 0x7E) {
-            if (len.* < buf.len) {
-                buf[len.*] = @intCast(key.codepoint);
-                len.* += 1;
+    if (key.matches(vaxis.Key.escape, .{})) {
+        state.mode = .pool_form;
+        return;
+    }
+    if (key.matches(vaxis.Key.enter, .{})) {
+        // Save the route.
+        if (form.route_edit_dest_len == 0) return; // need at least a network
+        if (form.route_edit_index) |idx| {
+            // Editing existing.
+            if (idx < form.route_count) {
+                @memcpy(form.routes[idx].dest_buf[0..form.route_edit_dest_len], form.route_edit_dest[0..form.route_edit_dest_len]);
+                form.routes[idx].dest_len = form.route_edit_dest_len;
+                @memcpy(form.routes[idx].router_buf[0..form.route_edit_router_len], form.route_edit_router[0..form.route_edit_router_len]);
+                form.routes[idx].router_len = form.route_edit_router_len;
+            }
+        } else {
+            // Adding new.
+            if (form.route_count < form.routes.len) {
+                var new_route = &form.routes[form.route_count];
+                new_route.* = .{};
+                @memcpy(new_route.dest_buf[0..form.route_edit_dest_len], form.route_edit_dest[0..form.route_edit_dest_len]);
+                new_route.dest_len = form.route_edit_dest_len;
+                @memcpy(new_route.router_buf[0..form.route_edit_router_len], form.route_edit_router[0..form.route_edit_router_len]);
+                new_route.router_len = form.route_edit_router_len;
+                form.route_count += 1;
             }
         }
+        state.mode = .pool_form;
+        return;
+    }
+    if (key.matches(vaxis.Key.tab, .{}) or key.matches(vaxis.Key.tab, .{ .shift = true })) {
+        form.route_edit_field = if (form.route_edit_field == 0) 1 else 0;
+        form.route_edit_cursor = if (form.route_edit_field == 0) form.route_edit_dest_len else form.route_edit_router_len;
         return;
     }
 
-    // List mode.
-    if (key.matches(vaxis.Key.escape, .{})) {
-        state.mode = state.sub_modal_parent;
-        return;
-    }
-    if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
-        if (form.route_count > 0 and state.sub_list_row + 1 < form.route_count) state.sub_list_row += 1;
-    } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
-        state.sub_list_row -|= 1;
-    } else if (key.matches('n', .{})) {
-        if (form.route_count < form.routes.len) {
-            form.routes[form.route_count] = .{};
-            form.route_count += 1;
-            state.sub_list_row = @intCast(form.route_count - 1);
-            state.sub_edit_field = 0;
-            state.mode = .route_edit;
+    // Text editing.
+    const buf: []u8 = if (form.route_edit_field == 0) &form.route_edit_dest else &form.route_edit_router;
+    const len: *usize = if (form.route_edit_field == 0) &form.route_edit_dest_len else &form.route_edit_router_len;
+    const max_len = buf.len;
+
+    if (key.matches(vaxis.Key.backspace, .{})) {
+        if (form.route_edit_cursor > 0 and len.* > 0) {
+            const pos = form.route_edit_cursor;
+            if (pos < len.*) std.mem.copyForwards(u8, buf[pos - 1 ..], buf[pos..len.*]);
+            len.* -= 1;
+            form.route_edit_cursor -= 1;
         }
-    } else if (key.matches('e', .{}) and form.route_count > 0) {
-        state.sub_edit_field = 0;
-        state.mode = .route_edit;
-    } else if (key.matches('d', .{}) and form.route_count > 0) {
-        const ri = state.sub_list_row;
-        if (ri < form.route_count) {
-            // Shift remaining entries down.
-            var i: usize = ri;
-            while (i + 1 < form.route_count) : (i += 1) {
-                form.routes[i] = form.routes[i + 1];
-            }
-            form.route_count -= 1;
-            if (state.sub_list_row > 0 and state.sub_list_row >= form.route_count) {
-                state.sub_list_row -= 1;
-            }
+    } else if (key.matches(vaxis.Key.left, .{})) {
+        if (form.route_edit_cursor > 0) form.route_edit_cursor -= 1;
+    } else if (key.matches(vaxis.Key.right, .{})) {
+        if (form.route_edit_cursor < len.*) form.route_edit_cursor += 1;
+    } else if (key.matches(vaxis.Key.home, .{})) {
+        form.route_edit_cursor = 0;
+    } else if (key.matches(vaxis.Key.end, .{})) {
+        form.route_edit_cursor = len.*;
+    } else if (key.codepoint >= 0x20 and key.codepoint <= 0x7E) {
+        if (len.* < max_len) {
+            const pos = form.route_edit_cursor;
+            if (pos < len.*) std.mem.copyBackwards(u8, buf[pos + 1 ..], buf[pos..len.*]);
+            buf[pos] = @intCast(key.codepoint);
+            len.* += 1;
+            form.route_edit_cursor += 1;
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Option list sub-modal
+// Pool option edit modal
 // ---------------------------------------------------------------------------
 
-fn renderOptionList(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
-    const ao = activeOptions(state);
-    const BOX_W: u16 = 56;
-    const BOX_H: u16 = @min(win.height -| 2, @as(u16, @intCast(@min(ao.count.* + 5, 20))));
-    if (win.width < BOX_W or win.height < 6) return;
+fn renderPoolOptionEdit(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
+    const form = &state.pool_form;
+    const BOX_W: u16 = 48;
+    const BOX_H: u16 = 8;
+    if (win.width < BOX_W or win.height < BOX_H) return;
     const x = (win.width - BOX_W) / 2;
     const y = (win.height -| BOX_H) / 2;
     const box = win.child(.{ .x_off = x, .y_off = y, .width = BOX_W, .height = BOX_H });
     box.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = .{ .rgb = .{ 20, 20, 30 } } } });
     const border_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 160, 255 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
     drawBox(box, 0, 0, BOX_W, BOX_H, border_style);
+    const title_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 200, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
+    const label_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 160, 160, 190 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+    const field_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 200, 200, 200 } }, .bg = .{ .rgb = .{ 30, 30, 45 } } };
+    const active_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 255, 255 } }, .bg = .{ .rgb = .{ 50, 80, 140 } } };
+    const cursor_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 20, 20, 30 } }, .bg = .{ .rgb = .{ 100, 160, 255 } } };
+    const hint_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 100, 130 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
     const close_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 80, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
-    _ = box.print(&.{.{ .text = " DHCP Options ", .style = border_style }}, .{ .row_offset = 0, .col_offset = 1, .wrap = .none });
+
+    const title = if (form.opt_edit_index == null) "  Add DHCP Option" else "  Edit DHCP Option";
+    _ = box.print(&.{.{ .text = title, .style = title_style }}, .{ .col_offset = 1, .row_offset = 1, .wrap = .none });
     _ = box.print(&.{.{ .text = "[X]", .style = close_style }}, .{ .col_offset = BOX_W -| 4, .row_offset = 0, .wrap = .none });
 
+    // Option number field.
+    const code_active = form.opt_edit_field == 0;
+    _ = box.print(&.{.{ .text = "  Option #  ", .style = label_style }}, .{ .col_offset = 1, .row_offset = 3, .wrap = .none });
+    const code_val = form.opt_edit_code[0..form.opt_edit_code_len];
+    const code_style = if (code_active) active_style else field_style;
+    const code_pad = try fa.alloc(u8, 6 -| code_val.len);
+    @memset(code_pad, ' ');
+    _ = box.print(&.{.{ .text = code_val, .style = code_style }}, .{ .col_offset = 13, .row_offset = 3, .wrap = .none });
+    _ = box.print(&.{.{ .text = code_pad, .style = code_style }}, .{ .col_offset = 13 + @as(u16, @intCast(code_val.len)), .row_offset = 3, .wrap = .none });
+    if (code_active) {
+        const cur = @min(form.opt_edit_cursor, code_val.len);
+        const ch: []const u8 = if (cur < code_val.len) code_val[cur..][0..1] else " ";
+        _ = box.print(&.{.{ .text = ch, .style = cursor_style }}, .{ .col_offset = 13 + @as(u16, @intCast(cur)), .row_offset = 3, .wrap = .none });
+    }
+    // Lookup hint.
+    if (code_active) {
+        _ = box.print(&.{.{ .text = "  l: lookup", .style = hint_style }}, .{ .col_offset = 20, .row_offset = 3, .wrap = .none });
+    }
+
+    // Value field.
+    const val_active = form.opt_edit_field == 1;
+    _ = box.print(&.{.{ .text = "  Value     ", .style = label_style }}, .{ .col_offset = 1, .row_offset = 4, .wrap = .none });
+    const val_text = form.opt_edit_value[0..form.opt_edit_value_len];
+    const val_fw: u16 = BOX_W -| 16;
+    const val_style = if (val_active) active_style else field_style;
+    const val_trunc = val_text[0..@min(val_text.len, val_fw)];
+    const val_pad = try fa.alloc(u8, val_fw -| @as(u16, @intCast(val_trunc.len)));
+    @memset(val_pad, ' ');
+    _ = box.print(&.{.{ .text = val_trunc, .style = val_style }}, .{ .col_offset = 13, .row_offset = 4, .wrap = .none });
+    _ = box.print(&.{.{ .text = val_pad, .style = val_style }}, .{ .col_offset = 13 + @as(u16, @intCast(val_trunc.len)), .row_offset = 4, .wrap = .none });
+    if (val_active) {
+        const cur = @min(form.opt_edit_cursor, val_text.len);
+        const ch: []const u8 = if (cur < val_text.len) val_text[cur..][0..1] else " ";
+        _ = box.print(&.{.{ .text = ch, .style = cursor_style }}, .{ .col_offset = 13 + @as(u16, @intCast(cur)), .row_offset = 4, .wrap = .none });
+    }
+
+    _ = box.print(&.{.{ .text = "  Tab: switch  Enter: save  Esc: cancel", .style = hint_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 2, .wrap = .none });
+}
+
+fn handlePoolOptionEditKey(state: *TuiState, key: vaxis.Key) void {
+    var form = &state.pool_form;
+
+    if (key.matches(vaxis.Key.escape, .{})) {
+        state.mode = .pool_form;
+        return;
+    }
+    if (key.matches(vaxis.Key.enter, .{})) {
+        // Save the option.
+        if (form.opt_edit_code_len == 0) return; // need at least a code
+        if (form.opt_edit_index) |idx| {
+            // Editing existing.
+            if (idx < form.option_count) {
+                @memcpy(form.options[idx].code_buf[0..form.opt_edit_code_len], form.opt_edit_code[0..form.opt_edit_code_len]);
+                form.options[idx].code_len = form.opt_edit_code_len;
+                @memcpy(form.options[idx].value_buf[0..form.opt_edit_value_len], form.opt_edit_value[0..form.opt_edit_value_len]);
+                form.options[idx].value_len = form.opt_edit_value_len;
+            }
+        } else {
+            // Adding new.
+            if (form.option_count < form.options.len) {
+                var new_opt = &form.options[form.option_count];
+                new_opt.* = .{};
+                @memcpy(new_opt.code_buf[0..form.opt_edit_code_len], form.opt_edit_code[0..form.opt_edit_code_len]);
+                new_opt.code_len = form.opt_edit_code_len;
+                @memcpy(new_opt.value_buf[0..form.opt_edit_value_len], form.opt_edit_value[0..form.opt_edit_value_len]);
+                new_opt.value_len = form.opt_edit_value_len;
+                form.option_count += 1;
+            }
+        }
+        state.mode = .pool_form;
+        return;
+    }
+    if (key.matches(vaxis.Key.tab, .{}) or key.matches(vaxis.Key.tab, .{ .shift = true })) {
+        form.opt_edit_field = if (form.opt_edit_field == 0) 1 else 0;
+        form.opt_edit_cursor = if (form.opt_edit_field == 0) form.opt_edit_code_len else form.opt_edit_value_len;
+        return;
+    }
+
+    // 'l' on the code field opens lookup.
+    if (form.opt_edit_field == 0 and key.matches('l', .{})) {
+        form.opt_lookup_filter_len = 0;
+        form.opt_lookup_row = 0;
+        state.mode = .pool_option_lookup;
+        return;
+    }
+
+    // Text editing.
+    const buf: []u8 = if (form.opt_edit_field == 0) &form.opt_edit_code else &form.opt_edit_value;
+    const len: *usize = if (form.opt_edit_field == 0) &form.opt_edit_code_len else &form.opt_edit_value_len;
+    const max_len = buf.len;
+
+    if (key.matches(vaxis.Key.backspace, .{})) {
+        if (form.opt_edit_cursor > 0 and len.* > 0) {
+            const pos = form.opt_edit_cursor;
+            if (pos < len.*) std.mem.copyForwards(u8, buf[pos - 1 ..], buf[pos..len.*]);
+            len.* -= 1;
+            form.opt_edit_cursor -= 1;
+        }
+    } else if (key.matches(vaxis.Key.left, .{})) {
+        if (form.opt_edit_cursor > 0) form.opt_edit_cursor -= 1;
+    } else if (key.matches(vaxis.Key.right, .{})) {
+        if (form.opt_edit_cursor < len.*) form.opt_edit_cursor += 1;
+    } else if (key.matches(vaxis.Key.home, .{})) {
+        form.opt_edit_cursor = 0;
+    } else if (key.matches(vaxis.Key.end, .{})) {
+        form.opt_edit_cursor = len.*;
+    } else if (key.codepoint >= 0x20 and key.codepoint <= 0x7E) {
+        // Code field: numbers only.
+        if (form.opt_edit_field == 0 and (key.codepoint < '0' or key.codepoint > '9')) return;
+        if (len.* < max_len) {
+            const pos = form.opt_edit_cursor;
+            if (pos < len.*) std.mem.copyBackwards(u8, buf[pos + 1 ..], buf[pos..len.*]);
+            buf[pos] = @intCast(key.codepoint);
+            len.* += 1;
+            form.opt_edit_cursor += 1;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pool option lookup modal
+// ---------------------------------------------------------------------------
+
+fn renderPoolOptionLookup(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !void {
+    const form = &state.pool_form;
+    const BOX_W: u16 = 40;
+    const BOX_H: u16 = @min(win.height -| 2, 22);
+    if (win.width < BOX_W or win.height < 8) return;
+    const x = (win.width - BOX_W) / 2;
+    const y = (win.height -| BOX_H) / 2;
+    const box = win.child(.{ .x_off = x, .y_off = y, .width = BOX_W, .height = BOX_H });
+    box.fill(.{ .char = .{ .grapheme = " ", .width = 1 }, .style = .{ .bg = .{ .rgb = .{ 20, 20, 30 } } } });
+    const border_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 160, 255 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+    drawBox(box, 0, 0, BOX_W, BOX_H, border_style);
+    const title_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 200, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
     const sel_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 255, 255 } }, .bg = .{ .rgb = .{ 50, 80, 140 } } };
     const norm_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 200, 200, 200 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
     const hint_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 100, 130 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+    const filter_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 220, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } } };
+    const close_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 80, 80 } }, .bg = .{ .rgb = .{ 20, 20, 30 } }, .bold = true };
 
-    if (ao.count.* == 0) {
-        _ = box.print(&.{.{ .text = "  (no options)", .style = hint_style }}, .{ .row_offset = 1, .wrap = .none });
+    _ = box.print(&.{.{ .text = "  DHCP Options", .style = title_style }}, .{ .col_offset = 1, .row_offset = 1, .wrap = .none });
+    _ = box.print(&.{.{ .text = "[X]", .style = close_style }}, .{ .col_offset = BOX_W -| 4, .row_offset = 0, .wrap = .none });
+
+    // Filter bar.
+    if (form.opt_lookup_filter_len > 0) {
+        const filter_text = try std.fmt.allocPrint(fa, "  / {s}", .{form.opt_lookup_filter[0..form.opt_lookup_filter_len]});
+        _ = box.print(&.{.{ .text = filter_text, .style = filter_style }}, .{ .col_offset = 1, .row_offset = 2, .wrap = .none });
     }
-    var row: u16 = 1;
-    for (0..ao.count.*) |oi| {
-        if (row >= BOX_H - 2) break;
-        const o = &ao.opts[oi];
-        const is_sel = oi == state.sub_list_row;
+
+    // List filtered options.
+    const filter = form.opt_lookup_filter[0..form.opt_lookup_filter_len];
+    var visible_idx: u16 = 0;
+    const start_row: u16 = 3;
+    for (known_dhcp_options) |ko| {
+        if (filter.len > 0) {
+            if (!containsIgnoreCase(ko.code, filter) and !containsIgnoreCase(ko.name, filter)) continue;
+        }
+        if (start_row + visible_idx >= BOX_H - 2) break;
+        const is_sel = visible_idx == form.opt_lookup_row;
         const style = if (is_sel) sel_style else norm_style;
-        const code = o.code_buf[0..o.code_len];
-        const val = o.value_buf[0..o.value_len];
-        const line = std.fmt.allocPrint(fa, "  {s:<6} {s}", .{
-            if (code.len > 0) code else "...",
-            if (val.len > 0) val else "...",
-        }) catch "";
-        _ = box.print(&.{.{ .text = line, .style = style }}, .{ .row_offset = row, .wrap = .none });
-        row += 1;
+        const line = try std.fmt.allocPrint(fa, "  {s:<5} {s}", .{ ko.code, ko.name });
+        _ = box.print(&.{.{ .text = line, .style = style }}, .{ .col_offset = 1, .row_offset = start_row + visible_idx, .wrap = .none });
+        visible_idx += 1;
     }
-    _ = box.print(&.{.{ .text = "  n:add  e:edit  d:del  Esc:back", .style = hint_style }}, .{ .row_offset = BOX_H - 1, .wrap = .none });
+
+    _ = box.print(&.{.{ .text = "  /:filter  Enter:select  Esc:back", .style = hint_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 2, .wrap = .none });
 }
 
-fn activeOptions(state: *TuiState) struct { opts: *[32]OptionEntry, count: *usize } {
-    if (state.sub_modal_parent == .reservation_form) {
-        return .{ .opts = &state.form.options, .count = &state.form.option_count };
-    }
-    return .{ .opts = &state.pool_form.options, .count = &state.pool_form.option_count };
-}
+fn handlePoolOptionLookupKey(state: *TuiState, key: vaxis.Key) void {
+    var form = &state.pool_form;
 
-fn handleOptionListKey(_: *AdminServer, state: *TuiState, key: vaxis.Key) void {
-    const ao = activeOptions(state);
-
-    if (state.mode == .option_edit) {
-        if (key.matches(vaxis.Key.escape, .{})) {
-            state.mode = .option_list;
-            return;
-        }
-        if (key.matches(vaxis.Key.enter, .{})) {
-            state.mode = .option_list;
-            return;
-        }
-        if (key.matches(vaxis.Key.tab, .{}) or key.matches(vaxis.Key.tab, .{ .shift = true })) {
-            state.sub_edit_field = if (state.sub_edit_field == 0) 1 else 0;
-            return;
-        }
-        const oi = state.sub_list_row;
-        if (oi >= ao.count.*) return;
-        const o = &ao.opts[oi];
-        const buf: []u8 = if (state.sub_edit_field == 0) &o.code_buf else &o.value_buf;
-        const len: *usize = if (state.sub_edit_field == 0) &o.code_len else &o.value_len;
-        if (key.matches(vaxis.Key.backspace, .{})) {
-            if (len.* > 0) len.* -= 1;
-        } else if (key.codepoint >= 0x20 and key.codepoint <= 0x7E) {
-            if (len.* < buf.len) {
-                buf[len.*] = @intCast(key.codepoint);
-                len.* += 1;
-            }
-        }
+    if (key.matches(vaxis.Key.escape, .{})) {
+        state.mode = .pool_option_edit;
         return;
     }
-
-    // List mode.
-    if (key.matches(vaxis.Key.escape, .{})) {
-        state.mode = state.sub_modal_parent;
+    if (key.matches(vaxis.Key.enter, .{})) {
+        // Select the option at the current row.
+        const filter = form.opt_lookup_filter[0..form.opt_lookup_filter_len];
+        var idx: u16 = 0;
+        for (known_dhcp_options) |ko| {
+            if (filter.len > 0) {
+                if (!containsIgnoreCase(ko.code, filter) and !containsIgnoreCase(ko.name, filter)) continue;
+            }
+            if (idx == form.opt_lookup_row) {
+                // Populate the code field.
+                const n = @min(ko.code.len, form.opt_edit_code.len);
+                @memcpy(form.opt_edit_code[0..n], ko.code[0..n]);
+                form.opt_edit_code_len = n;
+                form.opt_edit_cursor = n;
+                state.mode = .pool_option_edit;
+                return;
+            }
+            idx += 1;
+        }
+        state.mode = .pool_option_edit;
         return;
     }
     if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
-        if (ao.count.* > 0 and state.sub_list_row + 1 < ao.count.*) state.sub_list_row += 1;
+        form.opt_lookup_row +|= 1;
     } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
-        state.sub_list_row -|= 1;
-    } else if (key.matches('n', .{})) {
-        if (ao.count.* < ao.opts.len) {
-            ao.opts[ao.count.*] = .{};
-            ao.count.* += 1;
-            state.sub_list_row = @intCast(ao.count.* - 1);
-            state.sub_edit_field = 0;
-            state.mode = .option_edit;
+        form.opt_lookup_row -|= 1;
+    } else if (key.matches('/', .{})) {
+        // Already in filter mode -- just keep typing.
+    } else if (key.matches(vaxis.Key.backspace, .{})) {
+        if (form.opt_lookup_filter_len > 0) {
+            form.opt_lookup_filter_len -= 1;
+            form.opt_lookup_row = 0;
         }
-    } else if (key.matches('e', .{}) and ao.count.* > 0) {
-        state.sub_edit_field = 0;
-        state.mode = .option_edit;
-    } else if (key.matches('d', .{}) and ao.count.* > 0) {
-        const oi = state.sub_list_row;
-        if (oi < ao.count.*) {
-            var i: usize = oi;
-            while (i + 1 < ao.count.*) : (i += 1) {
-                ao.opts[i] = ao.opts[i + 1];
-            }
-            ao.count.* -= 1;
-            if (state.sub_list_row > 0 and state.sub_list_row >= ao.count.*) {
-                state.sub_list_row -= 1;
-            }
+    } else if (key.codepoint >= 0x20 and key.codepoint <= 0x7E) {
+        if (form.opt_lookup_filter_len < form.opt_lookup_filter.len) {
+            form.opt_lookup_filter[form.opt_lookup_filter_len] = @intCast(key.codepoint);
+            form.opt_lookup_filter_len += 1;
+            form.opt_lookup_row = 0;
         }
     }
 }
@@ -5838,14 +6223,28 @@ test "OptionEntry: default is empty" {
     try std.testing.expectEqual(@as(usize, 0), oe.value_len);
 }
 
-test "PoolForm: FIELD_COUNT matches pool_field_meta length" {
-    try std.testing.expectEqual(@as(usize, PoolForm.FIELD_COUNT), pool_field_meta.len);
+test "PoolForm: REGULAR_FIELD_COUNT matches pool_field_meta length" {
+    try std.testing.expectEqual(@as(usize, PoolForm.REGULAR_FIELD_COUNT), pool_field_meta.len);
 }
 
-test "poolFormFieldVal: fields 22-23 return edit prompt" {
-    const form = PoolForm{};
-    try std.testing.expectEqualStrings("(Enter to edit)", poolFormFieldVal(&form, 22));
-    try std.testing.expectEqualStrings("(Enter to edit)", poolFormFieldVal(&form, 23));
+test "PoolForm: totalFields accounts for inline routes and options" {
+    var form = PoolForm{};
+    // No routes or options: 22 regular + [+]Route + [+]Option = 24
+    try std.testing.expectEqual(@as(u8, 24), form.totalFields());
+    form.route_count = 2;
+    form.option_count = 3;
+    // 22 + 1 + 2 + 1 + 3 = 29
+    try std.testing.expectEqual(@as(u8, 29), form.totalFields());
+}
+
+test "PoolForm: field index helpers" {
+    var form = PoolForm{};
+    form.route_count = 2;
+    form.option_count = 1;
+    try std.testing.expectEqual(@as(u8, 22), form.addRouteField());
+    try std.testing.expectEqual(@as(u8, 23), form.firstRouteField());
+    try std.testing.expectEqual(@as(u8, 25), form.addOptionField());
+    try std.testing.expectEqual(@as(u8, 26), form.firstOptionField());
 }
 
 test "buildRoutesFromForm: empty routes" {
@@ -5873,38 +6272,75 @@ test "buildRoutesFromForm: valid route" {
     try std.testing.expectEqual([4]u8{ 10, 0, 0, 1 }, routes[0].router);
 }
 
-test "handleRouteListKey: add and delete route" {
-    // Use a mock server-like setup — we only need the state.
+test "handlePoolRouteEditKey: save new route" {
     var state = TuiState{};
-    state.mode = .route_list;
+    state.mode = .pool_route_edit;
     state.pool_form.route_count = 0;
+    state.pool_form.route_edit_index = null; // adding new
 
-    // Simulate 'n' to add.
-    handleRouteListKey(undefined, &state, vaxis.Key{ .codepoint = 'n', .mods = .{} });
+    // Type "10.0.0.0/24" into dest.
+    const dest = "10.0.0.0/24";
+    @memcpy(state.pool_form.route_edit_dest[0..dest.len], dest);
+    state.pool_form.route_edit_dest_len = dest.len;
+    const rtr = "10.0.0.1";
+    @memcpy(state.pool_form.route_edit_router[0..rtr.len], rtr);
+    state.pool_form.route_edit_router_len = rtr.len;
+
+    // Press Enter to save.
+    handlePoolRouteEditKey(&state, vaxis.Key{ .codepoint = vaxis.Key.enter, .mods = .{} });
     try std.testing.expectEqual(@as(usize, 1), state.pool_form.route_count);
-    try std.testing.expect(state.mode == .route_edit);
+    try std.testing.expect(state.mode == .pool_form);
+    try std.testing.expectEqualStrings("10.0.0.0/24", state.pool_form.routes[0].dest_buf[0..state.pool_form.routes[0].dest_len]);
+}
 
-    // Back to list.
-    state.mode = .route_list;
+test "handlePoolFormKey: delete inline route" {
+    var state = TuiState{};
+    state.mode = .pool_form;
+    state.pool_form.route_count = 1;
+    const dest = "10.0.0.0/24";
+    @memcpy(state.pool_form.routes[0].dest_buf[0..dest.len], dest);
+    state.pool_form.routes[0].dest_len = dest.len;
 
-    // Simulate 'd' to delete.
-    state.sub_list_row = 0;
-    handleRouteListKey(undefined, &state, vaxis.Key{ .codepoint = 'd', .mods = .{} });
+    // Navigate to first route entry (field 23 = firstRouteField).
+    state.pool_form.active_field = state.pool_form.firstRouteField();
+
+    // Press 'd' to delete.
+    handlePoolFormKey(undefined, &state, vaxis.Key{ .codepoint = 'd', .mods = .{} });
     try std.testing.expectEqual(@as(usize, 0), state.pool_form.route_count);
 }
 
-test "handleOptionListKey: add and delete option" {
+test "handlePoolOptionEditKey: save new option" {
     var state = TuiState{};
-    state.mode = .option_list;
+    state.mode = .pool_option_edit;
     state.pool_form.option_count = 0;
+    state.pool_form.opt_edit_index = null; // adding new
 
-    handleOptionListKey(undefined, &state, vaxis.Key{ .codepoint = 'n', .mods = .{} });
+    const code = "150";
+    @memcpy(state.pool_form.opt_edit_code[0..code.len], code);
+    state.pool_form.opt_edit_code_len = code.len;
+    const val = "10.0.0.1";
+    @memcpy(state.pool_form.opt_edit_value[0..val.len], val);
+    state.pool_form.opt_edit_value_len = val.len;
+
+    handlePoolOptionEditKey(&state, vaxis.Key{ .codepoint = vaxis.Key.enter, .mods = .{} });
     try std.testing.expectEqual(@as(usize, 1), state.pool_form.option_count);
-    try std.testing.expect(state.mode == .option_edit);
+    try std.testing.expect(state.mode == .pool_form);
+    try std.testing.expectEqualStrings("150", state.pool_form.options[0].code_buf[0..state.pool_form.options[0].code_len]);
+}
 
-    state.mode = .option_list;
-    state.sub_list_row = 0;
-    handleOptionListKey(undefined, &state, vaxis.Key{ .codepoint = 'd', .mods = .{} });
+test "handlePoolFormKey: delete inline option" {
+    var state = TuiState{};
+    state.mode = .pool_form;
+    state.pool_form.option_count = 1;
+    const code = "150";
+    @memcpy(state.pool_form.options[0].code_buf[0..code.len], code);
+    state.pool_form.options[0].code_len = code.len;
+
+    // Navigate to first option entry.
+    state.pool_form.active_field = state.pool_form.firstOptionField();
+
+    // Press 'd' to delete.
+    handlePoolFormKey(undefined, &state, vaxis.Key{ .codepoint = 'd', .mods = .{} });
     try std.testing.expectEqual(@as(usize, 0), state.pool_form.option_count);
 }
 
