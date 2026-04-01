@@ -867,6 +867,7 @@ fn parseSyncConfig(allocator: std.mem.Allocator, sync_map: anytype) !?SyncConfig
     if (sync_map.get("peers")) |v| {
         if (v.asList()) |list| {
             peers = try allocator.realloc(peers, list.len);
+            for (peers) |*p| p.* = "";
             var count: usize = 0;
             for (list) |item| {
                 if (item.asScalar()) |s| {
@@ -892,6 +893,10 @@ fn parseSyncConfig(allocator: std.mem.Allocator, sync_map: anytype) !?SyncConfig
 fn parseMacClasses(allocator: std.mem.Allocator, list: anytype) ![]MacClass {
     var classes = try allocator.alloc(MacClass, list.len);
     var idx: usize = 0;
+    errdefer {
+        for (classes[0..idx]) |*mc| mc.deinit(allocator);
+        allocator.free(classes);
+    }
     for (list) |item| {
         const m = item.asMap() orelse continue;
         const name_str = if (m.get("name")) |v| (v.asScalar() orelse "") else "";

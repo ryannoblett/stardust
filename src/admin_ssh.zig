@@ -3840,8 +3840,12 @@ fn applyFormToPool(allocator: std.mem.Allocator, pool: *config_mod.PoolConfig, f
     replaceStrSlice(allocator, &pool.log_servers, form.log_servers_buf[0..form.log_servers_len]);
     replaceStrSlice(allocator, &pool.ntp_servers, form.ntp_servers_buf[0..form.ntp_servers_len]);
 
+    pool.mtu = if (form.mtu_len > 0) (std.fmt.parseInt(u16, form.mtu_buf[0..form.mtu_len], 10) catch null) else null;
+    replaceStrSlice(allocator, &pool.wins_servers, form.wins_servers_buf[0..form.wins_servers_len]);
+
     replaceStr(allocator, &pool.tftp_server_name, form.tftp_server_buf[0..form.tftp_server_len]);
     replaceStr(allocator, &pool.boot_filename, form.boot_filename_buf[0..form.boot_filename_len]);
+    replaceStrSlice(allocator, &pool.cisco_tftp_servers, form.cisco_tftp_buf[0..form.cisco_tftp_len]);
     replaceStr(allocator, &pool.http_boot_url, form.http_boot_url_buf[0..form.http_boot_url_len]);
 
     pool.dns_update.enable = form.dns_update_enable;

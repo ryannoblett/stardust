@@ -1111,3 +1111,62 @@ test "removeReservation frees dhcp_options" {
     try std.testing.expect(removed == true);
     try std.testing.expectEqual(@as(usize, 0), pool.reservations.len);
 }
+
+test "renderConfig includes mtu, wins_servers, and cisco_tftp_servers" {
+    const allocator = std.testing.allocator;
+
+    var wins = [_][]const u8{"10.0.0.5"};
+    var cisco = [_][]const u8{ "10.0.0.6", "10.0.0.7" };
+    var pool_opts = std.StringHashMap([]const u8).init(allocator);
+    var pools = [_]config_mod.PoolConfig{.{
+        .subnet = "10.0.0.0",
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = "10.0.0.1",
+        .pool_start = "",
+        .pool_end = "",
+        .dns_servers = &.{},
+        .domain_name = "",
+        .domain_search = &.{},
+        .lease_time = 3600,
+        .time_offset = null,
+        .time_servers = &.{},
+        .log_servers = &.{},
+        .ntp_servers = &.{},
+        .mtu = 9000,
+        .wins_servers = &wins,
+        .tftp_server_name = "",
+        .boot_filename = "",
+        .cisco_tftp_servers = &cisco,
+        .http_boot_url = "",
+        .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
+        .dhcp_options = pool_opts,
+        .reservations = &.{},
+        .static_routes = &.{},
+    }};
+
+    const cfg = config_mod.Config{
+        .allocator = allocator,
+        .listen_address = "0.0.0.0",
+        .state_dir = "/tmp",
+        .log_level = .info,
+        .pool_allocation_random = false,
+        .sync = null,
+        .pools = &pools,
+        .admin_ssh = .{ .enable = false, .port = 2267, .bind = "0.0.0.0", .read_only = false, .host_key = "", .authorized_keys = "" },
+        .metrics = .{ .collect = false, .http_enable = false, .http_port = 9167, .http_bind = "127.0.0.1" },
+    };
+    defer pool_opts.deinit();
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+    try renderConfig(buf.writer(allocator), &cfg);
+    const out = buf.items;
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "    mtu: 9000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "    wins_servers:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "      - 10.0.0.5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "    cisco_tftp_servers:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "      - 10.0.0.6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "      - 10.0.0.7") != null);
+}

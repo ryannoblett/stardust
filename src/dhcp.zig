@@ -4767,3 +4767,183 @@ test "collectOverrides: no matches returns pool options only" {
     try std.testing.expectEqualStrings("pool-tftp", overrides.get("66").?);
     try std.testing.expectEqual(@as(usize, 1), overrides.count());
 }
+
+test "OFFER includes MTU option 26 as big-endian u16" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    cfg.pools[0].mtu = 9000;
+
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    // DISCOVER with PRL requesting option 26
+    var buf = [_]u8{0} ** 512;
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+    hdr.op = 1;
+    hdr.htype = 1;
+    hdr.hlen = 6;
+    hdr.xid = 0x11223344;
+    hdr.magic = dhcp_magic_cookie;
+    @memcpy(hdr.chaddr[0..6], &[6]u8{ 0xAA, 0xBB, 0xCC, 0x01, 0x02, 0x03 });
+    var i: usize = dhcp_min_packet_size;
+    buf[i] = @intFromEnum(OptionCode.MessageType);
+    buf[i + 1] = 1;
+    buf[i + 2] = @intFromEnum(MessageType.DHCPDISCOVER);
+    i += 3;
+    buf[i] = @intFromEnum(OptionCode.ParameterRequestList);
+    buf[i + 1] = 1;
+    buf[i + 2] = 26; // request MTU
+    i += 3;
+    buf[i] = @intFromEnum(OptionCode.End);
+    i += 1;
+
+    const resp = try server.processPacket(buf[0..i]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+
+    // Find option 26 in response and verify encoding: 9000 = 0x2328
+    const opts = resp.?[dhcp_min_packet_size..];
+    var j: usize = 0;
+    var found = false;
+    while (j + 1 < opts.len) {
+        const code = opts[j];
+        if (code == @intFromEnum(OptionCode.End)) break;
+        if (code == 0) {
+            j += 1;
+            continue;
+        }
+        const olen = opts[j + 1];
+        if (code == 26 and olen == 2) {
+            try std.testing.expectEqualSlices(u8, &[2]u8{ 0x23, 0x28 }, opts[j + 2 .. j + 4]);
+            found = true;
+        }
+        j += 2 + olen;
+    }
+    try std.testing.expect(found);
+}
+
+test "OFFER includes broadcast address option 28 auto-derived from subnet" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    // Subnet is 192.168.1.0/24, broadcast should be 192.168.1.255
+
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    var buf = [_]u8{0} ** 512;
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+    hdr.op = 1;
+    hdr.htype = 1;
+    hdr.hlen = 6;
+    hdr.xid = 0x22334455;
+    hdr.magic = dhcp_magic_cookie;
+    @memcpy(hdr.chaddr[0..6], &[6]u8{ 0xAA, 0xBB, 0xCC, 0x04, 0x05, 0x06 });
+    var i: usize = dhcp_min_packet_size;
+    buf[i] = @intFromEnum(OptionCode.MessageType);
+    buf[i + 1] = 1;
+    buf[i + 2] = @intFromEnum(MessageType.DHCPDISCOVER);
+    i += 3;
+    buf[i] = @intFromEnum(OptionCode.ParameterRequestList);
+    buf[i + 1] = 1;
+    buf[i + 2] = 28; // request broadcast address
+    i += 3;
+    buf[i] = @intFromEnum(OptionCode.End);
+    i += 1;
+
+    const resp = try server.processPacket(buf[0..i]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+
+    // Find option 28: should be 192.168.1.255
+    const opts = resp.?[dhcp_min_packet_size..];
+    var j: usize = 0;
+    var found = false;
+    while (j + 1 < opts.len) {
+        const code = opts[j];
+        if (code == @intFromEnum(OptionCode.End)) break;
+        if (code == 0) {
+            j += 1;
+            continue;
+        }
+        const olen = opts[j + 1];
+        if (code == 28 and olen == 4) {
+            try std.testing.expectEqualSlices(u8, &[4]u8{ 192, 168, 1, 255 }, opts[j + 2 .. j + 6]);
+            found = true;
+        }
+        j += 2 + olen;
+    }
+    try std.testing.expect(found);
+}
+
+test "OFFER includes WINS option 44 and Cisco TFTP option 150" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+
+    // Set up WINS and Cisco TFTP servers
+    cfg.pools[0].wins_servers = try alloc.alloc([]const u8, 1);
+    cfg.pools[0].wins_servers[0] = try alloc.dupe(u8, "10.0.0.5");
+    cfg.pools[0].cisco_tftp_servers = try alloc.alloc([]const u8, 1);
+    cfg.pools[0].cisco_tftp_servers[0] = try alloc.dupe(u8, "10.0.0.6");
+
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    var buf = [_]u8{0} ** 512;
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+    hdr.op = 1;
+    hdr.htype = 1;
+    hdr.hlen = 6;
+    hdr.xid = 0x33445566;
+    hdr.magic = dhcp_magic_cookie;
+    @memcpy(hdr.chaddr[0..6], &[6]u8{ 0xAA, 0xBB, 0xCC, 0x07, 0x08, 0x09 });
+    var i: usize = dhcp_min_packet_size;
+    buf[i] = @intFromEnum(OptionCode.MessageType);
+    buf[i + 1] = 1;
+    buf[i + 2] = @intFromEnum(MessageType.DHCPDISCOVER);
+    i += 3;
+    buf[i] = @intFromEnum(OptionCode.ParameterRequestList);
+    buf[i + 1] = 2;
+    buf[i + 2] = 44; // WINS
+    buf[i + 3] = 150; // Cisco TFTP
+    i += 4;
+    buf[i] = @intFromEnum(OptionCode.End);
+    i += 1;
+
+    const resp = try server.processPacket(buf[0..i]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+
+    const opts = resp.?[dhcp_min_packet_size..];
+    var j: usize = 0;
+    var found_44 = false;
+    var found_150 = false;
+    while (j + 1 < opts.len) {
+        const code = opts[j];
+        if (code == @intFromEnum(OptionCode.End)) break;
+        if (code == 0) {
+            j += 1;
+            continue;
+        }
+        const olen = opts[j + 1];
+        if (code == 44 and olen == 4) {
+            try std.testing.expectEqualSlices(u8, &[4]u8{ 10, 0, 0, 5 }, opts[j + 2 .. j + 6]);
+            found_44 = true;
+        }
+        if (code == 150 and olen == 4) {
+            try std.testing.expectEqualSlices(u8, &[4]u8{ 10, 0, 0, 6 }, opts[j + 2 .. j + 6]);
+            found_150 = true;
+        }
+        j += 2 + olen;
+    }
+    try std.testing.expect(found_44);
+    try std.testing.expect(found_150);
+}
