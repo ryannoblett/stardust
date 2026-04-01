@@ -3773,6 +3773,18 @@ fn computePoolDiff(server: *AdminServer, state: *TuiState) void {
                 }
             }
         }
+        if (form.route_count > 0 and confirm.change_count < confirm.changes.len) {
+            var buf: [32]u8 = undefined;
+            const n = std.fmt.bufPrint(&buf, "{d} route(s)", .{form.route_count}) catch "routes";
+            confirm.changes[confirm.change_count] = .{ .label = "Static Routes", .old_val = "", .new_val = n, .kind = .sync_break };
+            confirm.change_count += 1;
+        }
+        if (form.option_count > 0 and confirm.change_count < confirm.changes.len) {
+            var buf: [32]u8 = undefined;
+            const n = std.fmt.bufPrint(&buf, "{d} option(s)", .{form.option_count}) catch "options";
+            confirm.changes[confirm.change_count] = .{ .label = "DHCP Options", .old_val = "", .new_val = n, .kind = .drift };
+            confirm.change_count += 1;
+        }
         return;
     }
 
@@ -3808,6 +3820,61 @@ fn computePoolDiff(server: *AdminServer, state: *TuiState) void {
             }
         }
         fi = fi; // suppress unused
+    }
+
+    // Compare static routes.
+    if (form.route_count != tmp_form.route_count) {
+        if (confirm.change_count < confirm.changes.len) {
+            var old_buf: [32]u8 = undefined;
+            var new_buf: [32]u8 = undefined;
+            const old_n = std.fmt.bufPrint(&old_buf, "{d} route(s)", .{tmp_form.route_count}) catch "?";
+            const new_n = std.fmt.bufPrint(&new_buf, "{d} route(s)", .{form.route_count}) catch "?";
+            confirm.has_sync_break = true;
+            confirm.changes[confirm.change_count] = .{ .label = "Static Routes", .old_val = old_n, .new_val = new_n, .kind = .sync_break };
+            confirm.change_count += 1;
+        }
+    } else {
+        // Same count — check if any route changed.
+        var routes_differ = false;
+        for (0..form.route_count) |ri| {
+            if (!std.mem.eql(u8, form.routes[ri].dest_buf[0..form.routes[ri].dest_len], tmp_form.routes[ri].dest_buf[0..tmp_form.routes[ri].dest_len]) or
+                !std.mem.eql(u8, form.routes[ri].router_buf[0..form.routes[ri].router_len], tmp_form.routes[ri].router_buf[0..tmp_form.routes[ri].router_len]))
+            {
+                routes_differ = true;
+                break;
+            }
+        }
+        if (routes_differ and confirm.change_count < confirm.changes.len) {
+            confirm.has_sync_break = true;
+            confirm.changes[confirm.change_count] = .{ .label = "Static Routes", .old_val = "(modified)", .new_val = "(modified)", .kind = .sync_break };
+            confirm.change_count += 1;
+        }
+    }
+
+    // Compare DHCP options.
+    if (form.option_count != tmp_form.option_count) {
+        if (confirm.change_count < confirm.changes.len) {
+            var old_buf: [32]u8 = undefined;
+            var new_buf: [32]u8 = undefined;
+            const old_n = std.fmt.bufPrint(&old_buf, "{d} option(s)", .{tmp_form.option_count}) catch "?";
+            const new_n = std.fmt.bufPrint(&new_buf, "{d} option(s)", .{form.option_count}) catch "?";
+            confirm.changes[confirm.change_count] = .{ .label = "DHCP Options", .old_val = old_n, .new_val = new_n, .kind = .drift };
+            confirm.change_count += 1;
+        }
+    } else {
+        var opts_differ = false;
+        for (0..form.option_count) |oi| {
+            if (!std.mem.eql(u8, form.options[oi].code_buf[0..form.options[oi].code_len], tmp_form.options[oi].code_buf[0..tmp_form.options[oi].code_len]) or
+                !std.mem.eql(u8, form.options[oi].value_buf[0..form.options[oi].value_len], tmp_form.options[oi].value_buf[0..tmp_form.options[oi].value_len]))
+            {
+                opts_differ = true;
+                break;
+            }
+        }
+        if (opts_differ and confirm.change_count < confirm.changes.len) {
+            confirm.changes[confirm.change_count] = .{ .label = "DHCP Options", .old_val = "(modified)", .new_val = "(modified)", .kind = .drift };
+            confirm.change_count += 1;
+        }
     }
 }
 
