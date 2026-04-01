@@ -378,6 +378,24 @@ The unit uses `DynamicUser=yes` with `ConfigurationDirectory=stardust`,
 `StateDirectory=stardust`, and `RuntimeDirectory=stardust` for filesystem
 isolation.
 
+**TUI write-back:** The SSH admin TUI saves pool and reservation changes
+back to `config.yaml`. For this to work with `DynamicUser=yes`, the
+configuration directory must be writable:
+
+```ini
+# In the [Service] section:
+ConfigurationDirectoryMode=0775
+```
+
+Then make the config file group-writable by a shared group (e.g.
+`stardust-secrets`) so the dynamic user can write to it:
+
+```bash
+sudo groupadd stardust-secrets
+sudo chgrp stardust-secrets /etc/stardust/config.yaml
+sudo chmod g+w /etc/stardust/config.yaml
+```
+
 ## OpenRC init script
 
 For Alpine Linux, Gentoo, and other OpenRC-based systems. Included in
