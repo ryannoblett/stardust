@@ -3952,20 +3952,32 @@ fn validatePoolForm(form: *PoolForm) ?[]const u8 {
         if (validateIpList(form.cisco_tftp_buf[0..form.cisco_tftp_len])) |e| return e;
     }
 
-    // HTTP Boot URL: optional, must start with http:// or https://.
+    // HTTP Boot URL: optional. Scheme + valid domain + optional path.
     if (form.http_boot_url_len > 0) {
         const url = form.http_boot_url_buf[0..form.http_boot_url_len];
-        const has_scheme = std.mem.startsWith(u8, url, "http://") or std.mem.startsWith(u8, url, "https://");
-        if (!has_scheme) return "HTTP Boot URL must start with http:// or https://";
-        // After scheme, must have at least a hostname character.
-        const after_scheme = if (std.mem.startsWith(u8, url, "https://")) url[8..] else url[7..];
-        if (after_scheme.len == 0) return "HTTP Boot URL missing hostname";
-        // Validate characters: alphanumeric, dots, dashes, slashes, colons, underscores, etc.
-        for (after_scheme) |ch| {
+        const has_https = std.mem.startsWith(u8, url, "https://");
+        const has_http = std.mem.startsWith(u8, url, "http://");
+        if (!has_https and !has_http) return "URL must start with http:// or https://";
+        const after_scheme = if (has_https) url[8..] else url[7..];
+        if (after_scheme.len == 0) return "URL missing hostname";
+        // Extract hostname (up to first / or end).
+        const host_end = std.mem.indexOfScalar(u8, after_scheme, '/') orelse after_scheme.len;
+        const hostname = after_scheme[0..host_end];
+        if (hostname.len == 0) return "URL missing hostname";
+        // Validate hostname as a domain: starts with alnum, a-z A-Z 0-9 . - only.
+        if (!((hostname[0] >= 'a' and hostname[0] <= 'z') or (hostname[0] >= 'A' and hostname[0] <= 'Z') or
+            (hostname[0] >= '0' and hostname[0] <= '9')))
+            return "URL hostname must start with alphanumeric";
+        for (hostname) |ch| {
             if (!((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or
-                ch == '.' or ch == '-' or ch == '/' or ch == ':' or ch == '_' or ch == '~' or
-                ch == '?' or ch == '&' or ch == '=' or ch == '%' or ch == '+' or ch == '#'))
-                return "HTTP Boot URL has invalid characters";
+                ch == '.' or ch == '-' or ch == ':'))
+                return "URL hostname has invalid characters";
+        }
+        // Path portion: any printable ASCII is allowed.
+        if (host_end < after_scheme.len) {
+            for (after_scheme[host_end..]) |ch| {
+                if (ch < 0x20 or ch > 0x7E) return "URL path has non-printable characters";
+            }
         }
     }
 
