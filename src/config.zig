@@ -207,13 +207,21 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
     _ = try file.readAll(source);
 
     var doc = yaml.Yaml{ .source = source };
-    try doc.load(allocator);
+    doc.load(allocator) catch |err| {
+        if (err == error.ParseFailure) {
+            doc.parse_errors.renderToStdErr(.{ .ttyconf = .no_color });
+        }
+        return err;
+    };
     defer doc.deinit(allocator);
 
     var parse_arena = std.heap.ArenaAllocator.init(allocator);
     defer parse_arena.deinit();
 
-    const raw = try doc.parse(parse_arena.allocator(), RawConfig);
+    const raw = doc.parse(parse_arena.allocator(), RawConfig) catch |err| {
+        std.log.err("config: failed to parse '{s}': {s}", .{ path, @errorName(err) });
+        return err;
+    };
 
     var cfg = Config{
         .allocator = allocator,
