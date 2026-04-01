@@ -20,6 +20,7 @@ pub const StateStore = struct {
     allocator: std.mem.Allocator,
     dir: []const u8,
     leases: std.StringHashMap(Lease),
+    lock: std.Thread.RwLock = .{},
 
     pub fn init(allocator: std.mem.Allocator, dir: []const u8) !*StateStore {
         const self = try allocator.create(StateStore);
@@ -33,6 +34,7 @@ pub const StateStore = struct {
         // Create the state directory (no-op if it already exists).
         try std.fs.cwd().makePath(dir);
 
+        // load() is called before any concurrent access so no lock needed.
         self.load() catch |err| switch (err) {
             error.FileNotFound => {},
             else => std.log.warn("Could not load lease state ({s}), starting fresh", .{@errorName(err)}),
@@ -55,6 +57,171 @@ pub const StateStore = struct {
 
     /// Add or update a lease. The store dupes all strings; caller need not keep them alive.
     pub fn addLease(store: *StateStore, lease: Lease) !void {
+        store.lock.lock();
+        defer store.lock.unlock();
+        try store.addLeaseUnlocked(lease);
+        store.saveUnlocked() catch |err| {
+            std.log.warn("Failed to persist lease state ({s})", .{@errorName(err)});
+        };
+    }
+
+    /// Unconditionally delete a lease entry regardless of its reserved flag.
+    /// Used when syncing config reservations: a MAC removed from config must be
+    /// fully purged even if it currently has reserved=true.
+    pub fn forceRemoveLease(store: *StateStore, mac: []const u8) void {
+        store.lock.lock();
+        defer store.lock.unlock();
+        if (store.forceRemoveLeaseUnlocked(mac)) {
+            store.saveUnlocked() catch |err| {
+                std.log.warn("Failed to persist lease state ({s})", .{@errorName(err)});
+            };
+        }
+    }
+
+    /// Remove the lease for the given MAC. No-op if not found.
+    /// For reserved leases, sets expires=0 (inactive) instead of deleting.
+    pub fn removeLease(store: *StateStore, mac: []const u8) void {
+        store.lock.lock();
+        defer store.lock.unlock();
+        if (store.removeLeaseUnlocked(mac)) {
+            store.saveUnlocked() catch |err| {
+                std.log.warn("Failed to persist lease state ({s})", .{@errorName(err)});
+            };
+        }
+    }
+
+    /// Look up a lease by MAC address. Returns null if not found or expired.
+    pub fn getLeaseByMac(store: *StateStore, mac: []const u8) ?Lease {
+        store.lock.lockShared();
+        defer store.lock.unlockShared();
+        const lease = store.leases.get(mac) orelse return null;
+        if (lease.expires <= std.time.timestamp()) return null;
+        return lease;
+    }
+
+    /// Look up a lease by client identifier (option 61, hex-encoded). Returns null if not found or expired.
+    pub fn getLeaseByClientId(store: *StateStore, client_id: []const u8) ?Lease {
+        store.lock.lockShared();
+        defer store.lock.unlockShared();
+        const now = std.time.timestamp();
+        var it = store.leases.valueIterator();
+        while (it.next()) |lease| {
+            if (lease.expires <= now) continue;
+            if (lease.client_id) |cid| {
+                if (std.mem.eql(u8, cid, client_id)) return lease.*;
+            }
+        }
+        return null;
+    }
+
+    /// Look up a lease by IP address. Returns null if not found or expired.
+    pub fn getLeaseByIp(store: *StateStore, ip: []const u8) ?Lease {
+        store.lock.lockShared();
+        defer store.lock.unlockShared();
+        const now = std.time.timestamp();
+        var it = store.leases.valueIterator();
+        while (it.next()) |lease| {
+            if (lease.expires <= now) continue;
+            if (std.mem.eql(u8, lease.ip, ip)) return lease.*;
+        }
+        return null;
+    }
+
+    /// Remove all expired leases from memory and persist.
+    pub fn pruneExpired(store: *StateStore) void {
+        store.lock.lock();
+        defer store.lock.unlock();
+        const now = std.time.timestamp();
+        var to_remove: [64][]const u8 = undefined;
+        var count: usize = 0;
+        var it = store.leases.keyIterator();
+        while (it.next()) |key| {
+            const lease = store.leases.get(key.*).?;
+            if (lease.reserved) continue;
+            if (lease.expires <= now) {
+                if (count < to_remove.len) {
+                    to_remove[count] = key.*;
+                    count += 1;
+                }
+            }
+        }
+        var removed: usize = 0;
+        for (to_remove[0..count]) |mac| {
+            if (store.removeLeaseUnlocked(mac)) removed += 1;
+        }
+        if (removed > 0) {
+            store.saveUnlocked() catch |err| {
+                std.log.warn("Failed to persist lease state ({s})", .{@errorName(err)});
+            };
+        }
+    }
+
+    /// Returns a slice of all leases. Caller owns the slice (free it) but not the string fields.
+    pub fn listLeases(store: *StateStore) ![]Lease {
+        store.lock.lockShared();
+        defer store.lock.unlockShared();
+        return store.listLeasesUnlocked();
+    }
+
+    /// Returns a reservation (reserved=true) for this MAC regardless of expiry.
+    pub fn getReservationByMac(store: *StateStore, mac: []const u8) ?Lease {
+        store.lock.lockShared();
+        defer store.lock.unlockShared();
+        const lease = store.leases.get(mac) orelse return null;
+        if (!lease.reserved) return null;
+        return lease;
+    }
+
+    /// Returns a reservation matching this hex-encoded client_id regardless of expiry.
+    pub fn getReservationByClientId(store: *StateStore, client_id: []const u8) ?Lease {
+        store.lock.lockShared();
+        defer store.lock.unlockShared();
+        var it = store.leases.valueIterator();
+        while (it.next()) |lease| {
+            if (!lease.reserved) continue;
+            if (lease.client_id) |cid| {
+                if (std.mem.eql(u8, cid, client_id)) return lease.*;
+            }
+        }
+        return null;
+    }
+
+    /// Returns a reservation holding this IP regardless of expiry.
+    pub fn getReservationByIp(store: *StateStore, ip: []const u8) ?Lease {
+        store.lock.lockShared();
+        defer store.lock.unlockShared();
+        var it = store.leases.valueIterator();
+        while (it.next()) |lease| {
+            if (!lease.reserved) continue;
+            if (std.mem.eql(u8, lease.ip, ip)) return lease.*;
+        }
+        return null;
+    }
+
+    /// Seed a reservation. Preserves expiry if a lease for this MAC already exists.
+    pub fn addReservation(store: *StateStore, mac: []const u8, ip: []const u8, hostname: ?[]const u8, client_id: ?[]const u8) !void {
+        store.lock.lock();
+        defer store.lock.unlock();
+        const existing_expires: i64 = if (store.leases.get(mac)) |existing| existing.expires else 0;
+        try store.addLeaseUnlocked(.{
+            .mac = mac,
+            .ip = ip,
+            .hostname = hostname,
+            .expires = existing_expires,
+            .client_id = client_id,
+            .reserved = true,
+        });
+        store.saveUnlocked() catch |err| {
+            std.log.warn("Failed to persist lease state ({s})", .{@errorName(err)});
+        };
+    }
+
+    // -----------------------------------------------------------------------
+    // Internal: unlocked implementations (caller must hold appropriate lock)
+    // -----------------------------------------------------------------------
+
+    /// Add or update a lease without acquiring a lock or saving. Caller must hold write lock.
+    fn addLeaseUnlocked(store: *StateStore, lease: Lease) !void {
         // Remove old entry for this MAC if present.
         if (store.leases.fetchRemove(lease.mac)) |kv| {
             store.allocator.free(kv.value.mac);
@@ -83,38 +250,16 @@ pub const StateStore = struct {
             // Sync peers supply the original timestamp so lease hashes stay in sync.
             .last_modified = if (lease.last_modified != 0) lease.last_modified else std.time.timestamp(),
         });
-
-        store.save() catch |err| {
-            std.log.warn("Failed to persist lease state ({s})", .{@errorName(err)});
-        };
     }
 
-    /// Unconditionally delete a lease entry regardless of its reserved flag.
-    /// Used when syncing config reservations: a MAC removed from config must be
-    /// fully purged even if it currently has reserved=true.
-    pub fn forceRemoveLease(store: *StateStore, mac: []const u8) void {
-        if (store.leases.fetchRemove(mac)) |kv| {
-            store.allocator.free(kv.value.mac);
-            store.allocator.free(kv.value.ip);
-            if (kv.value.hostname) |h| store.allocator.free(h);
-            if (kv.value.client_id) |c| store.allocator.free(c);
-            store.save() catch |err| {
-                std.log.warn("Failed to persist lease state ({s})", .{@errorName(err)});
-            };
-        }
-    }
-
-    /// Remove the lease for the given MAC. No-op if not found.
-    /// For reserved leases, sets expires=0 (inactive) instead of deleting.
-    pub fn removeLease(store: *StateStore, mac: []const u8) void {
+    /// Remove a lease (reserved: deactivate; non-reserved: delete). Returns true if any change.
+    /// Caller must hold write lock. Does NOT save.
+    fn removeLeaseUnlocked(store: *StateStore, mac: []const u8) bool {
         if (store.leases.getPtr(mac)) |lease_ptr| {
             if (lease_ptr.reserved) {
                 lease_ptr.expires = 0;
                 lease_ptr.last_modified = std.time.timestamp();
-                store.save() catch |err| {
-                    std.log.warn("Failed to persist lease state ({s})", .{@errorName(err)});
-                };
-                return;
+                return true;
             }
         }
         if (store.leases.fetchRemove(mac)) |kv| {
@@ -122,66 +267,26 @@ pub const StateStore = struct {
             store.allocator.free(kv.value.ip);
             if (kv.value.hostname) |h| store.allocator.free(h);
             if (kv.value.client_id) |c| store.allocator.free(c);
-            store.save() catch |err| {
-                std.log.warn("Failed to persist lease state ({s})", .{@errorName(err)});
-            };
+            return true;
         }
+        return false;
     }
 
-    /// Look up a lease by MAC address. Returns null if not found or expired.
-    pub fn getLeaseByMac(store: *StateStore, mac: []const u8) ?Lease {
-        const lease = store.leases.get(mac) orelse return null;
-        if (lease.expires <= std.time.timestamp()) return null;
-        return lease;
+    /// Unconditionally remove a lease. Returns true if something was removed.
+    /// Caller must hold write lock. Does NOT save.
+    fn forceRemoveLeaseUnlocked(store: *StateStore, mac: []const u8) bool {
+        if (store.leases.fetchRemove(mac)) |kv| {
+            store.allocator.free(kv.value.mac);
+            store.allocator.free(kv.value.ip);
+            if (kv.value.hostname) |h| store.allocator.free(h);
+            if (kv.value.client_id) |c| store.allocator.free(c);
+            return true;
+        }
+        return false;
     }
 
-    /// Look up a lease by client identifier (option 61, hex-encoded). Returns null if not found or expired.
-    pub fn getLeaseByClientId(store: *StateStore, client_id: []const u8) ?Lease {
-        const now = std.time.timestamp();
-        var it = store.leases.valueIterator();
-        while (it.next()) |lease| {
-            if (lease.expires <= now) continue;
-            if (lease.client_id) |cid| {
-                if (std.mem.eql(u8, cid, client_id)) return lease.*;
-            }
-        }
-        return null;
-    }
-
-    /// Look up a lease by IP address. Returns null if not found or expired.
-    pub fn getLeaseByIp(store: *StateStore, ip: []const u8) ?Lease {
-        const now = std.time.timestamp();
-        var it = store.leases.valueIterator();
-        while (it.next()) |lease| {
-            if (lease.expires <= now) continue;
-            if (std.mem.eql(u8, lease.ip, ip)) return lease.*;
-        }
-        return null;
-    }
-
-    /// Remove all expired leases from memory and persist.
-    pub fn pruneExpired(store: *StateStore) void {
-        const now = std.time.timestamp();
-        var to_remove: [64][]const u8 = undefined;
-        var count: usize = 0;
-        var it = store.leases.keyIterator();
-        while (it.next()) |key| {
-            const lease = store.leases.get(key.*).?;
-            if (lease.reserved) continue;
-            if (lease.expires <= now) {
-                if (count < to_remove.len) {
-                    to_remove[count] = key.*;
-                    count += 1;
-                }
-            }
-        }
-        for (to_remove[0..count]) |mac| {
-            store.removeLease(mac);
-        }
-    }
-
-    /// Returns a slice of all leases. Caller owns the slice (free it) but not the string fields.
-    pub fn listLeases(store: *StateStore) ![]Lease {
+    /// Collect all leases into an allocated slice. Caller must hold at least a read lock.
+    fn listLeasesUnlocked(store: *StateStore) ![]Lease {
         const list = try store.allocator.alloc(Lease, store.leases.count());
         var it = store.leases.valueIterator();
         var i: usize = 0;
@@ -192,60 +297,19 @@ pub const StateStore = struct {
         return list;
     }
 
-    /// Returns a reservation (reserved=true) for this MAC regardless of expiry.
-    pub fn getReservationByMac(store: *StateStore, mac: []const u8) ?Lease {
-        const lease = store.leases.get(mac) orelse return null;
-        if (!lease.reserved) return null;
-        return lease;
-    }
-
-    /// Returns a reservation matching this hex-encoded client_id regardless of expiry.
-    pub fn getReservationByClientId(store: *StateStore, client_id: []const u8) ?Lease {
-        var it = store.leases.valueIterator();
-        while (it.next()) |lease| {
-            if (!lease.reserved) continue;
-            if (lease.client_id) |cid| {
-                if (std.mem.eql(u8, cid, client_id)) return lease.*;
-            }
-        }
-        return null;
-    }
-
-    /// Returns a reservation holding this IP regardless of expiry.
-    pub fn getReservationByIp(store: *StateStore, ip: []const u8) ?Lease {
-        var it = store.leases.valueIterator();
-        while (it.next()) |lease| {
-            if (!lease.reserved) continue;
-            if (std.mem.eql(u8, lease.ip, ip)) return lease.*;
-        }
-        return null;
-    }
-
-    /// Seed a reservation. Preserves expiry if a lease for this MAC already exists.
-    pub fn addReservation(store: *StateStore, mac: []const u8, ip: []const u8, hostname: ?[]const u8, client_id: ?[]const u8) !void {
-        const existing_expires: i64 = if (store.leases.get(mac)) |existing| existing.expires else 0;
-        try store.addLease(.{
-            .mac = mac,
-            .ip = ip,
-            .hostname = hostname,
-            .expires = existing_expires,
-            .client_id = client_id,
-            .reserved = true,
-        });
-    }
-
     fn leasesPath(store: *StateStore) ![]u8 {
         return std.fs.path.join(store.allocator, &.{ store.dir, "leases.json" });
     }
 
-    fn save(store: *StateStore) !void {
+    /// Persist leases to disk. Caller must hold write lock (or be in single-threaded init).
+    fn saveUnlocked(store: *StateStore) !void {
         const path = try store.leasesPath();
         defer store.allocator.free(path);
 
         const tmp_path = try std.fmt.allocPrint(store.allocator, "{s}.tmp", .{path});
         defer store.allocator.free(tmp_path);
 
-        const list = try store.listLeases();
+        const list = try store.listLeasesUnlocked();
         defer store.allocator.free(list);
 
         const json_str = try std.json.Stringify.valueAlloc(store.allocator, list, .{});
@@ -666,7 +730,7 @@ test "save/load round-trip preserves active lease fields" {
             .expires = std.time.timestamp() + 3600,
             .client_id = "01aabbccddeeff",
         });
-        try store.save();
+        try store.saveUnlocked();
     }
 
     // Load phase
@@ -696,7 +760,7 @@ test "save/load: expired lease is skipped on load" {
 
         try putLease(store, "aa:bb:cc:dd:ee:01", "192.168.1.10", std.time.timestamp() - 1); // expired
         try putLease(store, "aa:bb:cc:dd:ee:02", "192.168.1.11", std.time.timestamp() + 3600); // active
-        try store.save();
+        try store.saveUnlocked();
     }
 
     {
@@ -722,7 +786,7 @@ test "save/load: reserved lease loads regardless of expiry" {
         defer store.deinit();
 
         try putReservation(store, "aa:bb:cc:dd:ee:ff", "192.168.1.50", 0, null); // expires=0
-        try store.save();
+        try store.saveUnlocked();
     }
 
     {

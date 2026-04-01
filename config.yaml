@@ -3,11 +3,35 @@
 # Global settings
 listen_address: "0.0.0.0"
 state_dir: "/var/lib/stardust"
-log_level: "info"   # debug | info | warn | error
+log_level: "info"   # err | warn | info | verbose | debug
 
+# Randomize IP allocation order (reduces split-brain collision risk with sync enabled).
+# false (default) = sequential from pool_start; true = random starting offset.
+# pool_allocation_random: false
+
+# ---------------------------------------------------------------------------
+# MAC class rules — override DHCP options for clients matching a MAC prefix.
+# Applied after pool defaults, before per-reservation overrides.
+# Multiple rules may match the same client; they are applied in specificity
+# order (shortest prefix first), so the most specific match wins.
+# ---------------------------------------------------------------------------
+# mac_classes:
+#   - name: "IP Phones"
+#     match: "64:16:7f"           # Polycom OUI — matches any MAC starting with 64:16:7f:
+#     dhcp_options:
+#       "66": "tftp.phones.local"  # TFTP server
+#       "150": "10.0.0.5"          # Cisco TFTP alternative
+#
+#   - name: "PXE Boot Clients"
+#     match: "00:25:90:*"          # trailing :* is optional (same as prefix)
+#     dhcp_options:
+#       "66": "10.0.0.10"
+#       "67": "pxelinux.0"
+
+# ---------------------------------------------------------------------------
 # Pool definitions — each pool is one subnet served by this daemon.
 # Multiple pools may be defined for multi-subnet deployments.
-# Use CIDR notation for subnet: (host bits are automatically zeroed).
+# ---------------------------------------------------------------------------
 pools:
   - subnet: "192.168.1.0/24"     # CIDR notation; must match the actual network prefix
     router: "192.168.1.1"
@@ -30,10 +54,10 @@ pools:
 
     # Time configuration
     # time_offset: 3600     # seconds east of UTC (option 2); e.g. -18000=UTC-5, 3600=UTC+1
-    # time_servers:         # RFC 868 time servers (option 4)
+    # ntp_servers:          # NTP servers (option 42); also serves option 4 (Time Servers)
     #   - "192.168.1.1"
-    # ntp_servers:          # NTP servers (option 42)
-    #   - "192.168.1.1"
+    # time_servers:         # RFC 868 time servers (option 4); overrides ntp_servers for option 4 only
+    #   - "192.168.1.1"    # usually not needed — ntp_servers is preferred
     # log_servers:          # syslog servers (option 7)
     #   - "192.168.1.1"
 
@@ -41,21 +65,35 @@ pools:
     # tftp_server_name: "192.168.1.1"
     # boot_filename: "pxelinux.0"
 
+    # UEFI HTTP boot — when a client sends option 60 = "HTTPClient",
+    # the server echoes option 60 and provides this URL as option 67.
+    # Standard TFTP options (66/67) are sent to all other clients.
+    # http_boot_url: "http://boot.example.com/uefi/bootx64.efi"
+
     # Static routes (options 33 and 121) — use router: for the default gateway
     # static_routes:
     #   - destination: "10.10.10.0/24"
     #     router: "192.168.1.1"
 
-    # Static reservations — pin a MAC or client_id to a fixed IP
+    # Static reservations — pin a MAC or client_id to a fixed IP.
+    # Reservations survive lease expiry and DHCPRELEASE.
     # reservations:
     #   - mac: "aa:bb:cc:dd:ee:ff"
     #     ip: "192.168.1.50"
     #     hostname: "printer"           # optional; sent via option 12
     #     client_id: "01aabbccddeeff"  # optional; hex string matching option 61
+    #     # Per-reservation DHCP option overrides — highest priority, trumps
+    #     # both pool defaults and mac_class rules.
+    #     # dhcp_options:
+    #     #   "66": "custom-tftp.local"
+    #     #   "67": "custom-boot.img"
 
-    # Additional DHCP options (numeric option codes as keys)
+    # Additional DHCP options (numeric option codes as keys).
+    # These override built-in pool settings for the same option code.
+    # Values containing only IPs are encoded as IPv4 addresses; others as raw strings.
     # dhcp_options:
-    #   "42": "192.168.1.1"   # NTP server (duplicates ntp_servers, but allows any option)
+    #   "150": "10.0.0.5,10.0.0.6"  # Cisco TFTP (IPs auto-encoded)
+    #   "252": "http://wpad.local/wpad.dat"  # WPAD URL (raw string)
 
     # Per-pool DNS dynamic update configuration (RFC 2136)
     dns_update:
@@ -66,7 +104,6 @@ pools:
       key_file: "dhcp-update.key"
 
 # Example second pool (uncomment to add another subnet):
-# pools:  <-- this would be a second entry in the list above, not a new key
 #   - subnet: "10.0.0.0/24"
 #     router: "10.0.0.1"
 #     pool_start: "10.0.0.100"
@@ -82,12 +119,41 @@ pools:
 #       key_name: "dhcp-update"
 #       key_file: "dhcp-update.key"
 
-# Randomize IP allocation order (reduces split-brain collision risk with sync enabled).
-# false (default) = sequential from pool_start; true = random starting offset.
-# pool_allocation_random: false
+# ---------------------------------------------------------------------------
+# Prometheus metrics HTTP exporter.
+# Counters are always collected in-process (used by the SSH stats page).
+# Set http_enable: true to also expose them via HTTP for Prometheus scraping.
+# ---------------------------------------------------------------------------
+# metrics:
+#   collect: true            # collect in-process counters (default true)
+#   http_enable: false       # expose GET /metrics via HTTP (default false)
+#   http_port: 9167          # port to listen on (default 9167)
+#   http_bind: "127.0.0.1"  # bind address (default 127.0.0.1)
 
+# ---------------------------------------------------------------------------
+# SSH admin TUI — interactive terminal interface over SSH.
+# Provides tabs for lease management, pool statistics, pool configuration,
+# and global settings. Supports mouse input, keyboard shortcuts, and
+# real-time updates.
+#
+# Generate a host key:  ssh-keygen -t ed25519 -f /etc/stardust/ssh_host_key -N ""
+# Add your public key:  cat ~/.ssh/id_ed25519.pub >> /etc/stardust/authorized_keys
+# Connect:              ssh -p 2267 admin@dhcp-server
+# ---------------------------------------------------------------------------
+# admin_ssh:
+#   enable: false
+#   port: 2267                                       # default 2267 (SSH=22, DHCP=67)
+#   bind: "0.0.0.0"                                 # bind address
+#   read_only: false                                 # true = view only, all writes blocked
+#   host_key: "/etc/stardust/ssh_host_key"          # Ed25519 private key path
+#   authorized_keys: "/etc/stardust/authorized_keys" # OpenSSH authorized_keys format
+
+# ---------------------------------------------------------------------------
 # Lease sync (redundant active-active server group).
 # All group members must have identical pool/subnet/reservation configuration.
+# Peers authenticate by comparing a SHA-256 hash of pool configs — servers
+# with mismatched settings are rejected and must be updated together.
+# ---------------------------------------------------------------------------
 # sync:
 #   enable: true
 #   group_name: "dhcp-cluster-1"

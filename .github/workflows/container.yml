@@ -20,18 +20,40 @@ jobs:
         with:
           version: "0.15.2"
 
-      # Cross-compile static musl binaries for each target platform.
-      # This avoids QEMU emulation entirely — the final image stages only
-      # COPY the pre-built binaries; no instructions execute under emulation.
-      - name: Build binaries
+      # Install Nix to build deterministic musl-linked libssh bundles for each
+      # target architecture.  Binary caches at cache.nixos.org supply pre-built
+      # derivations so no source compilation is needed in most cases.
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # Build static libssh bundles for all three target architectures.
+      # --print-out-paths prints the Nix store path; we capture it for later steps.
+      - name: Build libssh static bundles
         run: |
-          zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl
+          echo "LIBSSH_X86=$(nix build .#libssh-x86_64-musl  --no-link --print-out-paths)" >> "$GITHUB_ENV"
+          echo "LIBSSH_ARM=$(nix build .#libssh-aarch64-musl --no-link --print-out-paths)" >> "$GITHUB_ENV"
+          echo "LIBSSH_RISCV=$(nix build .#libssh-riscv64-musl --no-link --print-out-paths)" >> "$GITHUB_ENV"
+
+      # Cross-compile static musl binaries for each target platform.
+      # -Dlibssh_dir points to the Nix bundle with lib/ and include/ subdirs.
+      - name: Build x86_64 binary
+        run: |
+          zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl \
+            -Dlibssh_dir="${{ env.LIBSSH_X86 }}"
           cp zig-out/bin/stardust stardust-amd64
 
-          zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl
+      - name: Build arm64 binary
+        run: |
+          zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl \
+            -Dlibssh_dir="${{ env.LIBSSH_ARM }}"
           cp zig-out/bin/stardust stardust-arm64
 
-          zig build -Doptimize=ReleaseSafe -Dtarget=riscv64-linux-musl
+      - name: Build riscv64 binary
+        run: |
+          zig build -Doptimize=ReleaseSafe -Dtarget=riscv64-linux-musl \
+            -Dlibssh_dir="${{ env.LIBSSH_RISCV }}"
           cp zig-out/bin/stardust stardust-riscv64
 
       - uses: docker/setup-buildx-action@v3

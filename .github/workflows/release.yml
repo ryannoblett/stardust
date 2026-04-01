@@ -13,14 +13,17 @@ jobs:
       matrix:
         include:
           - zig_target: x86_64-linux-musl
+            nix_bundle: libssh-x86_64-musl
             arch_tag: x86_64
             deb_arch: amd64
             rpm_arch: x86_64
           - zig_target: aarch64-linux-musl
+            nix_bundle: libssh-aarch64-musl
             arch_tag: aarch64
             deb_arch: arm64
             rpm_arch: aarch64
           - zig_target: riscv64-linux-musl
+            nix_bundle: libssh-riscv64-musl
             arch_tag: riscv64
             deb_arch: riscv64
             rpm_arch: riscv64
@@ -38,8 +41,23 @@ jobs:
           sudo apt-get install -y ruby rpm
           sudo gem install fpm --no-document
 
+      # Install Nix to build a deterministic musl-linked libssh bundle for this
+      # matrix target.  Binary caches at cache.nixos.org supply pre-built
+      # derivations so no source compilation is needed in most cases.
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build libssh static bundle for ${{ matrix.zig_target }}
+        run: |
+          echo "LIBSSH_DIR=$(nix build .#${{ matrix.nix_bundle }} --no-link --print-out-paths)" >> "$GITHUB_ENV"
+
       - name: Build release binary
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.zig_target }}
+        run: |
+          zig build -Doptimize=ReleaseSafe \
+            -Dtarget=${{ matrix.zig_target }} \
+            -Dlibssh_dir="${{ env.LIBSSH_DIR }}"
 
       - name: Stage files
         run: |
@@ -68,7 +86,6 @@ jobs:
 
       - name: Build .deb package
         run: |
-          # Sanitize version: hyphens become tildes for deb pre-release ordering
           DEB_VERSION="${VERSION//-/\~}"
           fpm \
             --input-type dir \
@@ -87,7 +104,6 @@ jobs:
 
       - name: Build .rpm package
         run: |
-          # Sanitize version: hyphens not allowed in RPM version field
           RPM_VERSION="${VERSION//-/.}"
           fpm \
             --input-type dir \

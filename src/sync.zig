@@ -13,6 +13,7 @@
 ///   Total overhead: 42 bytes
 const std = @import("std");
 const config_mod = @import("./config.zig");
+const config_write = @import("./config_write.zig");
 const state_mod = @import("./state.zig");
 const dns_mod = @import("./dns.zig");
 const util = @import("./util.zig");
@@ -56,6 +57,8 @@ const anti_replay_window: i64 = 300; // seconds
 pub const SyncManager = struct {
     allocator: std.mem.Allocator,
     cfg: *const config_mod.SyncConfig,
+    full_cfg: *config_mod.Config, // full config for reservation write-back
+    cfg_path: []const u8, // config file path for reservation write-back
     store: *state_mod.StateStore,
     aes_key: [32]u8,
     pool_hash: [32]u8,
@@ -63,6 +66,9 @@ pub const SyncManager = struct {
     peers: std.ArrayList(Peer),
     last_full_sync: i64,
     last_keepalive: i64,
+    /// Atomically-maintained count of currently authenticated peers.
+    /// Safe to read from any thread (e.g. the SSH TUI) without a lock.
+    authenticated_count: std.atomic.Value(u32),
 
     const max_peers = 8;
     const keepalive_interval_s: i64 = 30;
@@ -81,6 +87,8 @@ pub const SyncManager = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         cfg: *const config_mod.SyncConfig,
+        full_cfg: *config_mod.Config,
+        cfg_path: []const u8,
         store: *state_mod.StateStore,
         pool_hash: [32]u8,
     ) !*Self {
@@ -129,6 +137,8 @@ pub const SyncManager = struct {
         self.* = .{
             .allocator = allocator,
             .cfg = cfg,
+            .full_cfg = full_cfg,
+            .cfg_path = cfg_path,
             .store = store,
             .aes_key = aes_key,
             .pool_hash = pool_hash,
@@ -136,6 +146,7 @@ pub const SyncManager = struct {
             .peers = std.ArrayList(Peer){},
             .last_full_sync = 0,
             .last_keepalive = 0,
+            .authenticated_count = std.atomic.Value(u32).init(0),
         };
 
         // Seed configured unicast peers (unauthenticated initially)
@@ -177,7 +188,12 @@ pub const SyncManager = struct {
         if (std.mem.eql(u8, &new_hash, &self.pool_hash)) return;
         self.pool_hash = new_hash;
         // Remove all authenticated peers; they need to re-handshake.
-        for (self.peers.items) |*p| p.authenticated = false;
+        var was_auth: u32 = 0;
+        for (self.peers.items) |*p| {
+            if (p.authenticated) was_auth += 1;
+            p.authenticated = false;
+        }
+        _ = self.authenticated_count.fetchSub(was_auth, .monotonic);
         self.sendHelloAll();
         std.log.info("sync: pool hash changed, re-authenticating all peers", .{});
     }
@@ -221,8 +237,10 @@ pub const SyncManager = struct {
                 if (isConfiguredPeer(self, p)) {
                     p.authenticated = false;
                     p.last_seen = 0;
+                    _ = self.authenticated_count.fetchSub(1, .monotonic);
                     i += 1;
                 } else {
+                    _ = self.authenticated_count.fetchSub(1, .monotonic);
                     _ = self.peers.swapRemove(i);
                 }
             } else {
@@ -524,13 +542,30 @@ pub const SyncManager = struct {
         const result = try self.decrypt(raw, &plain_buf);
 
         switch (result.msg_type) {
+            // Handshake messages are always accepted (they establish/verify auth).
             .hello => self.processHello(src, result.plaintext, false),
             .hello_ack => self.processHello(src, result.plaintext, true),
             .hello_nak => self.processHelloNak(src, result.plaintext),
-            .lease_update => self.applyLeaseUpdate(result.plaintext),
-            .lease_delete => self.applyLeaseDelete(result.plaintext),
-            .keepalive => self.updatePeerSeen(src),
-            .lease_hash => self.processLeaseHash(src, result.plaintext),
+            // Lease and hash messages require the peer to be authenticated
+            // (pool hash matched during the HELLO handshake).  After a pool
+            // config change, updatePoolHash() marks all peers unauthenticated,
+            // so stale-config peers are locked out until they re-handshake with
+            // a matching hash.
+            .lease_update, .lease_delete, .keepalive, .lease_hash => {
+                const peer = self.findPeer(src) orelse return;
+                if (!peer.authenticated) {
+                    log_v.debug("sync: ignoring {s} from unauthenticated peer", .{@tagName(result.msg_type)});
+                    return;
+                }
+                peer.last_seen = std.time.timestamp();
+                switch (result.msg_type) {
+                    .lease_update => self.applyLeaseUpdate(result.plaintext),
+                    .lease_delete => self.applyLeaseDelete(result.plaintext),
+                    .lease_hash => self.processLeaseHash(src, result.plaintext),
+                    .keepalive => {},
+                    else => unreachable,
+                }
+            },
             else => {},
         }
     }
@@ -564,6 +599,7 @@ pub const SyncManager = struct {
         const was_authenticated = peer.authenticated;
         peer.authenticated = true;
         peer.last_seen = now;
+        if (!was_authenticated) _ = self.authenticated_count.fetchAdd(1, .monotonic);
 
         if (!is_ack) {
             // Send HELLO_ACK back
@@ -634,13 +670,39 @@ pub const SyncManager = struct {
             return;
         };
         log_v.debug("sync: received lease update {s} ({s})", .{ incoming.ip, incoming.mac });
+
+        // If this is a reservation, persist it to config.yaml so it survives a reload.
+        // Without this, the reservation would exist in the lease store at runtime but
+        // disappear from config.yaml, causing it to vanish on SIGHUP or restart.
+        if (incoming.reserved) {
+            if (config_write.findPoolForIp(self.full_cfg, incoming.ip)) |pool| {
+                _ = config_write.upsertReservation(
+                    self.allocator,
+                    pool,
+                    incoming.mac,
+                    incoming.ip,
+                    incoming.hostname,
+                    incoming.client_id,
+                    null,
+                ) catch |err| {
+                    std.log.warn("sync: failed to update config.yaml for reservation {s}: {s}", .{ incoming.mac, @errorName(err) });
+                    return;
+                };
+                config_write.writeConfig(self.allocator, self.full_cfg, self.cfg_path) catch |err| {
+                    std.log.warn("sync: failed to write config.yaml for reservation {s}: {s}", .{ incoming.mac, @errorName(err) });
+                };
+                log_v.debug("sync: persisted reservation {s} ({s}) to config.yaml", .{ incoming.ip, incoming.mac });
+            } else {
+                std.log.warn("sync: received reservation {s} ({s}) does not match any pool, skipping config write", .{ incoming.ip, incoming.mac });
+            }
+        }
     }
 
     fn applyLeaseDelete(self: *Self, plaintext: []const u8) void {
         // plaintext is the MAC string (17 bytes "xx:xx:xx:xx:xx:xx")
         if (plaintext.len == 0) return;
         self.store.removeLease(plaintext);
-        log_v.debug("sync: received lease delete {s}", .{plaintext});
+        log_v.debug("sync: received lease delete {f}", .{util.escapedStr(plaintext)});
     }
 
     fn fullSyncToPeer(self: *Self, peer: *Peer) void {

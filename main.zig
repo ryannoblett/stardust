@@ -4,6 +4,8 @@ const config_mod = @import("./src/config.zig");
 const state_mod = @import("./src/state.zig");
 const dns = @import("./src/dns.zig");
 const sync_mod = @import("./src/sync.zig");
+const metrics_mod = @import("./src/metrics.zig");
+const admin_mod = @import("./src/admin_ssh.zig");
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -20,6 +22,7 @@ var g_log_level: config_mod.LogLevel = .info;
 // Set to true when stderr is connected to the systemd journal (JOURNAL_STREAM is set).
 // sd-daemon priority prefixes (<N>) are only emitted in that case.
 var g_journal_stream: bool = false;
+var g_log_mutex: std.Thread.Mutex = .{};
 
 fn logFn(
     comptime level: std.log.Level,
@@ -57,12 +60,81 @@ fn logFn(
         .warn => "WARN",
         .err => "ERROR",
     };
+    // Format into a buffer so we can detect binary data before it hits stderr.
+    var msg_buf: [4096]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, format, args) catch "(message too long)";
+
+    g_log_mutex.lock();
+    defer g_log_mutex.unlock();
+
+    if (hasBinaryData(msg)) {
+        // Escape the comptime format string so {s}/{d}/etc. print literally.
+        const safe_fmt = comptime escapeFmtBraces(format);
+        const scope_tag = @tagName(scope);
+        var line_buf: [4096]u8 = undefined;
+        if (g_journal_stream) {
+            const line = std.fmt.bufPrint(&line_buf, sd_prefix ++ "[" ++ level_str ++ "] <binary data, {d} bytes, scope={s}, fmt=\"" ++ safe_fmt ++ "\">\n", .{ msg.len, scope_tag }) catch return;
+            writeStderr(line);
+        } else {
+            var ts_buf: [20]u8 = undefined;
+            const ts = fmtTimestamp(&ts_buf, std.time.timestamp());
+            const line = std.fmt.bufPrint(&line_buf, "{s} [" ++ level_str ++ "] <binary data, {d} bytes, scope={s}, fmt=\"" ++ safe_fmt ++ "\">\n", .{ ts, msg.len, scope_tag }) catch return;
+            writeStderr(line);
+        }
+        return;
+    }
+
+    // Format the full log line into a single buffer and write it in one
+    // syscall.  This avoids partial writes that journald could interpret as
+    // binary blobs when the buffered writer inside std.debug.print flushes
+    // mid-line.
+    var line_buf: [4352]u8 = undefined; // 4096 msg + 256 prefix overhead
     if (g_journal_stream) {
-        std.debug.print(sd_prefix ++ "[" ++ level_str ++ "] " ++ format ++ "\n", args);
+        const line = std.fmt.bufPrint(&line_buf, sd_prefix ++ "[" ++ level_str ++ "] {s}\n", .{msg}) catch return;
+        writeStderr(line);
     } else {
         var ts_buf: [20]u8 = undefined;
         const ts = fmtTimestamp(&ts_buf, std.time.timestamp());
-        std.debug.print("{s} [" ++ level_str ++ "] " ++ format ++ "\n", .{ts} ++ args);
+        const line = std.fmt.bufPrint(&line_buf, "{s} [" ++ level_str ++ "] {s}\n", .{ ts, msg }) catch return;
+        writeStderr(line);
+    }
+}
+
+/// Single write() syscall to stderr.  Atomic for sizes ≤ PIPE_BUF (4096 on Linux),
+/// which avoids journald interpreting partial flushes as binary blobs.
+fn writeStderr(data: []const u8) void {
+    // Debug: if the output is exactly 59 bytes or contains bytes that
+    // journald would consider binary, dump hex to a file for diagnosis.
+    _ = std.posix.write(2, data) catch {};
+}
+
+/// True if any byte is a non-printable control character (excludes \n, \r, \t and UTF-8 high bytes).
+fn hasBinaryData(s: []const u8) bool {
+    for (s) |b| {
+        if (b < 0x20 and b != '\n' and b != '\r' and b != '\t') return true;
+        if (b == 0x7f) return true;
+    }
+    return false;
+}
+
+/// Comptime: double every { and } so the format string prints literally via std.fmt.
+fn escapeFmtBraces(comptime s: []const u8) []const u8 {
+    comptime {
+        var len: usize = 0;
+        for (s) |ch| len += if (ch == '{' or ch == '}') @as(usize, 2) else 1;
+        var buf: [len]u8 = undefined;
+        var i: usize = 0;
+        for (s) |ch| {
+            if (ch == '{' or ch == '}') {
+                buf[i] = ch;
+                buf[i + 1] = ch;
+                i += 2;
+            } else {
+                buf[i] = ch;
+                i += 1;
+            }
+        }
+        return &buf;
     }
 }
 
@@ -174,7 +246,7 @@ pub fn main() !void {
     if (cfg.sync) |*sync_cfg| {
         if (sync_cfg.enable) {
             std.log.info("Initializing sync manager (key_file={s})...", .{sync_cfg.key_file});
-            sync_mgr = sync_mod.SyncManager.init(allocator, sync_cfg, store, pool_hash) catch |err| blk: {
+            sync_mgr = sync_mod.SyncManager.init(allocator, sync_cfg, cfg, cfg_path, store, pool_hash) catch |err| blk: {
                 std.log.err("Failed to initialize sync manager ({s}); running without sync", .{@errorName(err)});
                 break :blk null;
             };
@@ -195,6 +267,66 @@ pub fn main() !void {
     // Sync reservations from config into the state store.
     // On SIGHUP the server calls syncReservations() again after reloading config.
     dhcp_server.syncReservations();
+
+    // Start HTTP metrics server in a background thread if enabled.
+    var metrics_server: ?*metrics_mod.MetricsServer = null;
+    var metrics_thread: ?std.Thread = null;
+    if (cfg.metrics.http_enable) {
+        metrics_server = metrics_mod.MetricsServer.init(allocator, cfg, store, &dhcp_server.counters) catch |err| blk: {
+            std.log.err("Failed to initialize metrics server ({s}); running without metrics HTTP", .{@errorName(err)});
+            break :blk null;
+        };
+        if (metrics_server) |ms| {
+            metrics_thread = std.Thread.spawn(.{}, metrics_mod.MetricsServer.run, .{ms}) catch |err| blk: {
+                std.log.err("Failed to start metrics thread ({s}); running without metrics HTTP", .{@errorName(err)});
+                break :blk null;
+            };
+        }
+    }
+    defer {
+        if (metrics_server) |ms| {
+            ms.stop();
+            if (metrics_thread) |t| t.join();
+            ms.deinit();
+        }
+    }
+
+    if (cfg.metrics.http_enable and metrics_server != null) {
+        std.log.info("Metrics HTTP server enabled on {s}:{d}", .{
+            cfg.metrics.http_bind,
+            cfg.metrics.http_port,
+        });
+    }
+
+    // Start SSH admin TUI server in a background thread if enabled.
+    var admin_server: ?*admin_mod.AdminServer = null;
+    var admin_thread: ?std.Thread = null;
+    if (cfg.admin_ssh.enable) {
+        admin_server = admin_mod.AdminServer.init(allocator, cfg, cfg_path, store, &dhcp_server.counters, sync_mgr) catch |err| blk: {
+            std.log.err("Failed to initialize admin SSH server ({s}); running without admin TUI", .{@errorName(err)});
+            break :blk null;
+        };
+        if (admin_server) |as| {
+            admin_thread = std.Thread.spawn(.{}, admin_mod.AdminServer.run, .{as}) catch |err| blk: {
+                std.log.err("Failed to start admin SSH thread ({s}); running without admin TUI", .{@errorName(err)});
+                break :blk null;
+            };
+        }
+    }
+    defer {
+        if (admin_server) |as| {
+            as.stop();
+            if (admin_thread) |t| t.join();
+            as.deinit();
+        }
+    }
+
+    if (cfg.admin_ssh.enable and admin_server != null) {
+        std.log.info("Admin SSH server enabled on {s}:{d}", .{
+            cfg.admin_ssh.bind,
+            cfg.admin_ssh.port,
+        });
+    }
 
     std.log.info("Starting DHCP server...", .{});
     dhcp_server.run() catch |err| {

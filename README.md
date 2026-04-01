@@ -44,9 +44,9 @@ kill -HUP $(pidof stardust)
 
 ### Core DHCP
 
-- Full DISCOVER → OFFER → REQUEST → ACK/NAK flow (RFC 2131)
+- Full DISCOVER / OFFER / REQUEST / ACK / NAK flow (RFC 2131)
 - DHCPRELEASE, DHCPDECLINE, and DHCPINFORM handling
-- Relay agent support — routes responses via `giaddr` (RFC 2131 §4.1)
+- Relay agent support — routes responses via `giaddr` (RFC 2131 S4.1)
 - Multiple pools — serve several subnets from one daemon; relay agent
   `giaddr` selects the correct pool automatically
 - Configurable lease range (`pool_start` / `pool_end`); defaults to the full
@@ -61,7 +61,7 @@ kill -HUP $(pidof stardust)
 | 1 | Subnet mask |
 | 2 | Time offset (seconds east of UTC) |
 | 3 | Router (default gateway) |
-| 4 | RFC 868 time servers |
+| 4 | Time servers (mirrors NTP servers; override with `time_servers` in pool config) |
 | 6 | DNS servers |
 | 7 | Log servers |
 | 12 | Hostname (from reservation config or client request) |
@@ -72,15 +72,48 @@ kill -HUP $(pidof stardust)
 | 53 | Message type |
 | 54 | Server identifier |
 | 55 | Parameter Request List filtering — only requested options are sent |
+| 58 | Renewal (T1) time — half of lease time |
+| 59 | Rebinding (T2) time — 87.5% of lease time |
+| 60 | Vendor class identifier (UEFI HTTP boot echo) |
 | 61 | Client identifier — used for lease tracking across MAC changes |
 | 66 | TFTP server name (PXE boot) |
-| 67 | Boot filename (PXE boot) |
+| 67 | Boot filename (PXE / UEFI HTTP boot URL) |
 | 82 | Relay agent information — parsed and logged at VERBOSE level |
 | 119 | Domain search list (RFC 3397) |
 | 121 | Classless static routes (RFC 3442) |
 
 Arbitrary additional options can be injected via `dhcp_options` in config
 (numeric keys, IPv4 or raw string values).
+
+### DHCP option overrides
+
+Options can be overridden at three levels, with higher levels taking priority:
+
+1. **Pool defaults** — `dhcp_options` map on the pool
+2. **MAC class rules** — match clients by MAC prefix (vendor OUI); applied in
+   specificity order (shortest prefix first, most specific wins)
+3. **Per-reservation** — `dhcp_options` map on individual reservations
+
+```yaml
+mac_classes:
+  - name: "IP Phones"
+    match: "64:16:7f"            # Polycom OUI
+    dhcp_options:
+      "66": "tftp.phones.local"
+      "150": "10.0.0.5"
+
+pools:
+  - subnet: "192.168.1.0/24"
+    reservations:
+      - mac: "64:16:7f:aa:bb:cc"
+        ip: "192.168.1.50"
+        dhcp_options:              # overrides the MAC class
+          "66": "tftp.lobby.local"
+```
+
+MAC class patterns support prefix matching (`"64:16:7f"` matches any MAC
+starting with that OUI) and trailing wildcards (`"64:16:7f:*"`). Matching
+is case-insensitive and validated at octet boundaries.
 
 ### Static reservations
 
@@ -97,6 +130,20 @@ pools:
         hostname: "printer"
       - client_id: "01aabbccddeeff"   # option 61 hex string
         ip: "192.168.1.51"
+```
+
+### UEFI HTTP boot
+
+When a client sends option 60 = `"HTTPClient"` (UEFI Specification S24.4),
+the server echoes option 60 and provides the configured HTTP URL as option 67.
+Non-HTTP clients receive standard TFTP options (66/67) instead.
+
+```yaml
+pools:
+  - subnet: "192.168.1.0/24"
+    http_boot_url: "http://boot.example.com/uefi/bootx64.efi"
+    tftp_server_name: "192.168.1.1"  # fallback for non-UEFI clients
+    boot_filename: "pxelinux.0"
 ```
 
 ### Pre-offer conflict detection
@@ -121,7 +168,7 @@ the same cooldown used for DHCPDECLINE.
 Stardust can update a BIND-compatible DNS server with A and PTR records when
 leases are granted or released. Each update sends two separate DNS UPDATE
 messages — one for the forward zone (A record) and one for the reverse zone
-(PTR record) — as required by RFC 2136 §3.1.
+(PTR record) — as required by RFC 2136 S3.1.
 
 Authentication uses TSIG (HMAC-SHA256 or HMAC-MD5) with a standard BIND key
 file. Leave `key_file` empty for anonymous (unauthenticated) updates.
@@ -141,9 +188,46 @@ pools:
 ```
 
 The reverse zone (`x.y.z.in-addr.arpa`) is derived automatically from the
-pool's subnet prefix length using classful octet boundaries (≤8 bit → /8,
-≤16 bit → /16, >16 bit → /24). Sub-/24 reverse delegations (RFC 2317) are
-not currently supported.
+pool's subnet prefix length using classful octet boundaries.
+
+### SSH admin TUI
+
+An interactive full-screen terminal interface accessible over SSH. Provides
+real-time visibility and management without touching config files.
+
+```bash
+ssh -p 2267 admin@dhcp-server
+```
+
+**Tabs:**
+
+| Tab | Description |
+|-----|-------------|
+| 1 Leases | Live lease table with sort, filter, yank (copy to clipboard) |
+| 2 Stats | Per-pool capacity bars, DHCP message counters, uptime |
+| 3 Pools | View/edit/add/remove pool configurations with diff preview |
+| 4 Settings | Global config (log level, metrics, allocation mode); editable fields with deferred save |
+
+**Capabilities:**
+- Full mouse support — click tabs, sort columns, select rows, scroll
+- Keyboard navigation — j/k, arrows, Tab/Shift-Tab, Home/End
+- Pool editing — scrollable form with all fields; static routes and DHCP
+  options edited via sub-modals; diff/confirm screen shows sync impact
+- Reservation management — add/edit/delete with inline DHCP option editing and option lookup
+- Force-release — evict any lease (dynamic or reserved) from the TUI
+- Config write-back — changes saved atomically and reloaded via SIGHUP
+- `read_only` mode — blocks all writes; hides sensitive key paths
+- Help screen — press `?` for all keyboard shortcuts
+
+```yaml
+admin_ssh:
+  enable: true
+  port: 2267
+  host_key: "/etc/stardust/ssh_host_key"
+  authorized_keys: "/etc/stardust/authorized_keys"
+```
+
+Generate a host key: `ssh-keygen -t ed25519 -f /etc/stardust/ssh_host_key -N ""`
 
 ### Lease synchronisation (active-active redundancy)
 
@@ -175,45 +259,40 @@ sync:
 Enable `pool_allocation_random: true` on all group members to reduce the
 chance of two servers assigning the same address during a network partition.
 
-**DNS behaviour in a sync group**
+**DNS behaviour in a sync group:**
+DNS updates are sent only by the server that issued the DHCPACK. If that server
+goes offline, the server with the lowest IP takes over DNS until it returns.
 
-DNS updates are sent only by the server that issued the DHCPACK (the
-"originating" server). If that server goes offline, the remaining server with
-the lowest IP address in the active group takes over as DNS delegate —
-sending deletes on lease expiry or DHCPRELEASE, and resuming normal operation
-until the originator returns. When the originator reconnects it automatically
-reclaims its DNS role. This election works correctly for groups of any size.
+**Pool config changes with sync:**
+Changing pool settings that affect the pool hash (subnet, range, lease time,
+reservations, static routes) disconnects all sync peers. All peers must be
+updated with matching config and restarted together.
 
-**DHCPREQUEST handling in a sync group**
+### Prometheus metrics
 
-For the normal DISCOVER → OFFER → REQUEST flow the server identifier (option
-54) ensures only the chosen server replies. For broadcast DHCPREQUEST without
-a server identifier (REBINDING state), the same lowest-IP election applies: a
-standby server defers to the originator if it is reachable, and takes over if
-it is not.
+```yaml
+metrics:
+  collect: true        # in-process counters (default true; used by SSH stats tab)
+  http_enable: true    # expose GET /metrics endpoint
+  http_port: 9167
+  http_bind: "127.0.0.1"
+```
 
 ### Logging
 
 Structured log lines on stderr, journald-compatible when `JOURNAL_STREAM` is
-set. When running under systemd, timestamps are omitted from log lines (journald
-records them independently):
+set:
 
 ```
-# standalone / non-journald
 2025-04-01T12:00:00Z [INFO] DHCPACK 192.168.1.42 to aa:bb:cc:dd:ee:ff host=printer lease=3600s
-
-# under systemd / journald
-<6>[INFO] DHCPACK 192.168.1.42 to aa:bb:cc:dd:ee:ff host=printer lease=3600s
 ```
-
-Log level is configurable in `config.yaml`:
 
 | Level | Description |
 |-------|-------------|
-| `error` | Errors only |
+| `err` | Errors only |
 | `warn` | Errors and warnings |
 | `info` | Normal operation: lease grants, server startup, peer auth (default) |
-| `verbose` | Per-event summaries: every OFFER, ACK, NAK, RELEASE, DNS send, sync send/receive |
+| `verbose` | Per-event summaries: every OFFER, ACK, NAK, RELEASE, DNS, sync |
 | `debug` | Full packet-level detail |
 
 ## Configuration reference
@@ -224,37 +303,40 @@ fields:
 | Field | Default | Description |
 |-------|---------|-------------|
 | `listen_address` | `"0.0.0.0"` | Address to bind UDP port 67 |
-| `state_dir` | — | Directory for `leases.json` (required) |
-| `log_level` | `"info"` | `error` / `warn` / `info` / `verbose` / `debug` |
+| `state_dir` | -- | Directory for `leases.json` (required) |
+| `log_level` | `"info"` | `err` / `warn` / `info` / `verbose` / `debug` |
 | `pool_allocation_random` | `false` | Random vs sequential IP allocation |
+| `mac_classes` | `[]` | MAC prefix rules with DHCP option overrides |
 
 Each entry in `pools:` is one subnet. Required pool fields: `subnet` (CIDR),
 `router`, `dns_servers`, `lease_time`. Optional: `pool_start`, `pool_end`,
 `domain_name`, `domain_search`, `reservations`, `static_routes`,
-`dhcp_options`, `dns_update`, and all time/NTP/PXE options.
+`dhcp_options`, `dns_update`, `http_boot_url`, and all time/NTP/PXE options.
 
 ## Compilation
 
-Requires **Zig 0.15.2**. No other build dependencies.
+Requires **Zig 0.15.2** and **libssh** (for the SSH admin TUI).
 
 ```bash
 git clone https://github.com/ryannoblett/stardust
 cd stardust
-zig build                        # release build → zig-out/bin/stardust
+zig build                        # release build
 zig build -Doptimize=ReleaseSafe # optimised, safety checks kept
+zig build -Doptimize=Debug       # debug build (GPA memory safety)
 zig build test                   # run all unit tests
+zig build dev                    # debug executable (stardust-dev)
 ```
 
-Cross-compilation (fully static musl binaries):
+Cross-compilation (fully static musl binaries via Nix):
 
 ```bash
-zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl
-zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl
+# Install Nix, then:
+BUNDLE=$(nix build .#libssh-aarch64-musl --no-link --print-out-paths)
+zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl -Dlibssh_dir=$BUNDLE
 ```
 
 Pre-built binaries for x86\_64, aarch64, and riscv64 are available on the
-[Releases](../../releases) page. Each archive contains the binary and an
-example `config.yaml`.
+[Releases](../../releases) page.
 
 ## Container image
 
@@ -280,73 +362,29 @@ docker run -d --name stardust \
 ```
 
 `--network host` is required — DHCP uses 255.255.255.255 broadcasts that
-cannot cross Docker's default bridge NAT. Set `state_dir: "/var/lib/stardust"`
-in your config to use the named volume.
-
-Config reload works the same way inside a container:
-
-```bash
-docker kill -s HUP stardust
-```
+cannot cross Docker's default bridge NAT.
 
 ## systemd unit
 
-The unit file is included in the `.deb` and `.rpm` packages and in the release
-tarballs as `stardust.service`. To install manually:
+Included in `.deb` / `.rpm` packages and release tarballs as `stardust.service`:
 
 ```bash
-sudo install -m 644 stardust.service /etc/systemd/system/
+sudo install -m 644 packaging/stardust.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now stardust
 ```
 
-```ini
-[Unit]
-Description=Stardust DHCP Server
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-ExecStart=/usr/local/bin/stardust -c /etc/stardust/config.yaml
-ExecReload=/bin/kill -HUP $MAINPID
-Restart=on-failure
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
-DynamicUser=yes
-StateDirectory=stardust
-RuntimeDirectory=stardust
-
-[Install]
-WantedBy=multi-user.target
-```
+The unit uses `DynamicUser=yes` with `ConfigurationDirectory=stardust`,
+`StateDirectory=stardust`, and `RuntimeDirectory=stardust` for filesystem
+isolation.
 
 ## OpenRC init script
 
-For Devuan, Alpine Linux, Gentoo, and other OpenRC-based systems. The script
-is included in the release tarballs as `stardust.openrc`.
+For Alpine Linux, Gentoo, and other OpenRC-based systems. Included in
+release tarballs as `stardust.openrc`:
 
 ```bash
-sudo install -m 755 stardust.openrc /etc/init.d/stardust
+sudo install -m 755 packaging/stardust.openrc /etc/init.d/stardust
 sudo rc-update add stardust default
 sudo rc-service stardust start
-```
-
-```sh
-#!/sbin/openrc-run
-
-description="Stardust DHCP Server"
-
-command="/usr/local/bin/stardust"
-command_args="-c /etc/stardust/config.yaml"
-command_user="root"
-pidfile="/run/${RC_SVCNAME}.pid"
-command_background="yes"
-
-depend() {
-    need net
-    after firewall
-}
-
-start_pre() {
-    checkpath --directory --owner root:root --mode 0755 /var/lib/stardust
-}
 ```

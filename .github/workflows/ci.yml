@@ -15,11 +15,20 @@ jobs:
         with:
           version: "0.15.2"
 
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build libssh static bundle
+        run: |
+          echo "LIBSSH_DIR=$(nix build .#libssh-x86_64-musl --no-link --print-out-paths)" >> "$GITHUB_ENV"
+
       - name: Build
-        run: zig build
+        run: zig build -Dlibssh_dir="${{ env.LIBSSH_DIR }}"
 
       - name: Test
-        run: zig build test
+        run: zig build test -Dlibssh_dir="${{ env.LIBSSH_DIR }}"
 
       - name: Format check
         run: zig fmt --check .

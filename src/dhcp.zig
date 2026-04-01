@@ -88,6 +88,7 @@ pub const OptionCode = enum(u8) {
     ParameterRequestList = 55,
     RenewalTimeValue = 58,
     RebindingTimeValue = 59,
+    VendorClassIdentifier = 60,
     ClientID = 61,
     TftpServerName = 66,
     BootFileName = 67,
@@ -179,6 +180,116 @@ fn resolveDestination(request: []const u8) std.posix.sockaddr.in {
 
 /// Encode an option value string into DHCP wire bytes in dst.
 /// Tries comma-separated IPv4 addresses first; falls back to raw string bytes.
+/// Check if a MAC address matches a MAC class pattern.
+/// Pattern is a prefix — trailing `:*` or `*` is stripped, then the MAC
+/// is compared case-insensitively against the prefix.
+fn matchMacClass(mac: []const u8, pattern: []const u8) bool {
+    // Strip trailing wildcards.
+    var pat = pattern;
+    while (pat.len > 0 and (pat[pat.len - 1] == '*' or pat[pat.len - 1] == ':')) {
+        pat = pat[0 .. pat.len - 1];
+    }
+    if (pat.len == 0) return true; // "*" matches everything
+    if (mac.len < pat.len) return false;
+    // Prefix match, case-insensitive.
+    for (pat, 0..) |pc, i| {
+        const mc = mac[i];
+        if (toLowerAscii(pc) != toLowerAscii(mc)) return false;
+    }
+    // Ensure we matched at an octet boundary (followed by ':' or end of string).
+    if (pat.len == mac.len) return true;
+    return mac[pat.len] == ':';
+}
+
+fn toLowerAscii(c: u8) u8 {
+    return if (c >= 'A' and c <= 'Z') c + 32 else c;
+}
+
+/// Collect merged DHCP option overrides from all layers:
+///   1. pool.dhcp_options (lowest priority)
+///   2. Matching mac_classes (least-specific match first, then more specific)
+///   3. Per-reservation dhcp_options (highest priority)
+/// Returns a map allocated on `allocator` (caller frees). Values point into
+/// config-owned strings (no duplication needed).
+fn collectOverrides(
+    allocator: std.mem.Allocator,
+    pool: *const config_mod.PoolConfig,
+    mac: []const u8,
+    reservation: ?*const config_mod.Reservation,
+    mac_classes: []const config_mod.MacClass,
+) std.StringHashMap([]const u8) {
+    var overrides = std.StringHashMap([]const u8).init(allocator);
+
+    // Layer 1: pool custom options.
+    var pool_it = pool.dhcp_options.iterator();
+    while (pool_it.next()) |entry| {
+        overrides.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
+    }
+
+    // Layer 2: MAC class matches, sorted by specificity (shortest match first).
+    // Collect matching classes with their pattern length, sort, then apply.
+    var matches: [64]struct { idx: usize, specificity: usize } = undefined;
+    var match_count: usize = 0;
+    for (mac_classes, 0..) |*mc, i| {
+        if (matchMacClass(mac, mc.match)) {
+            if (match_count < matches.len) {
+                // Specificity = length of pattern after stripping wildcards.
+                var pat = mc.match;
+                while (pat.len > 0 and (pat[pat.len - 1] == '*' or pat[pat.len - 1] == ':')) {
+                    pat = pat[0 .. pat.len - 1];
+                }
+                matches[match_count] = .{ .idx = i, .specificity = pat.len };
+                match_count += 1;
+            }
+        }
+    }
+    // Sort by specificity ascending (least specific first → most specific last wins).
+    if (match_count > 1) {
+        for (1..match_count) |i| {
+            const key = matches[i];
+            var j = i;
+            while (j > 0 and matches[j - 1].specificity > key.specificity) {
+                matches[j] = matches[j - 1];
+                j -= 1;
+            }
+            matches[j] = key;
+        }
+    }
+    for (matches[0..match_count]) |m| {
+        var mc_it = mac_classes[m.idx].dhcp_options.iterator();
+        while (mc_it.next()) |entry| {
+            overrides.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
+        }
+    }
+
+    // Layer 3: per-reservation options (highest priority).
+    if (reservation) |res| {
+        if (res.dhcp_options) |res_opts| {
+            var res_it = res_opts.iterator();
+            while (res_it.next()) |entry| {
+                overrides.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
+            }
+        }
+    }
+
+    return overrides;
+}
+
+/// Check if an option code (as integer) is present in the override map.
+fn isOverridden(overrides: *const std.StringHashMap([]const u8), code: u8) bool {
+    var buf: [3]u8 = undefined;
+    const key = std.fmt.bufPrint(&buf, "{d}", .{code}) catch return false;
+    return overrides.contains(key);
+}
+
+/// Find a config Reservation by MAC in a pool's reservation list.
+fn findConfigReservation(pool: *const config_mod.PoolConfig, mac: []const u8) ?*const config_mod.Reservation {
+    for (pool.reservations) |*r| {
+        if (std.mem.eql(u8, r.mac, mac)) return r;
+    }
+    return null;
+}
+
 fn encodeOptionValue(dst: []u8, s: []const u8) []u8 {
     var len: usize = 0;
     var all_valid = true;
@@ -330,6 +441,19 @@ fn appendStringOpt(
     opts_len.* += 2 + len;
 }
 
+/// Unconditionally append a string option (no PRL check). Used for options
+/// that must be included regardless of what the client requested — specifically
+/// option 60 (VCI echo) and option 67 (boot URL) in UEFI HTTP boot responses.
+fn appendRawStringOpt(opts_buf: []u8, opts_len: *usize, code: OptionCode, value: []const u8) void {
+    if (value.len == 0) return;
+    const len = @min(value.len, 255);
+    if (opts_len.* + 2 + len > opts_buf.len) return;
+    opts_buf[opts_len.*] = @intFromEnum(code);
+    opts_buf[opts_len.* + 1] = @intCast(len);
+    @memcpy(opts_buf[opts_len.* + 2 ..][0..len], value[0..len]);
+    opts_len.* += 2 + len;
+}
+
 // Per-MAC decline rate-limiting: after decline_threshold declines within decline_window_secs,
 // the MAC is refused new allocations for decline_cooldown_secs.
 const decline_threshold: u32 = 3;
@@ -356,6 +480,26 @@ const DeclineRecord = struct {
 // Server
 // ---------------------------------------------------------------------------
 
+/// Atomic counters for DHCP message types. Incremented from the main loop;
+/// read by the metrics/SSH threads. Counters reset to zero at server start.
+pub const Counters = struct {
+    // DHCP message counters
+    discover: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    offer: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    request: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    ack: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    nak: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    release: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    decline: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    inform: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    // Defense / security event counters
+    probe_conflict: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    decline_ip_quarantined: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    decline_mac_blocked: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    decline_global_limited: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    decline_refused: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+};
+
 pub const DHCPServer = struct {
     allocator: std.mem.Allocator,
     cfg: *Config,
@@ -375,6 +519,8 @@ pub const DHCPServer = struct {
     if_info: ?probe_mod.IfaceInfo,
     /// Lease synchronisation manager. Null when sync is disabled.
     sync_mgr: ?*sync_mod.SyncManager,
+    /// DHCP message counters. Populated only when cfg.metrics.collect is true.
+    counters: Counters,
 
     const Self = @This();
 
@@ -411,6 +557,7 @@ pub const DHCPServer = struct {
             .global_decline_window_start = 0,
             .if_info = null,
             .sync_mgr = sync_mgr,
+            .counters = .{},
         };
         return self;
     }
@@ -578,6 +725,16 @@ pub const DHCPServer = struct {
         self.cfg.deinit();
         self.cfg.* = new_cfg;
         self.log_level.* = self.cfg.log_level;
+
+        // Update the StateStore's dir reference — the old string was freed by deinit().
+        self.store.dir = self.cfg.state_dir;
+
+        // Recompute pool hash and notify sync manager so peers with stale
+        // configs are disconnected and forced to re-handshake.
+        if (self.sync_mgr) |s| {
+            const new_hash = config_mod.computePoolHash(self.cfg);
+            s.updatePoolHash(new_hash);
+        }
 
         freeDnsUpdaters(self.allocator, self.dns_updaters);
         self.dns_updaters = new_updaters;
@@ -800,20 +957,44 @@ pub const DHCPServer = struct {
 
         const msg_type = getMessageType(packet) orelse return null;
 
-        return switch (msg_type) {
-            .DHCPDISCOVER => self.createOffer(packet),
-            .DHCPREQUEST => self.createAck(packet),
-            .DHCPRELEASE => blk: {
+        switch (msg_type) {
+            .DHCPDISCOVER => {
+                _ = self.counters.discover.fetchAdd(1, .monotonic);
+                const resp = try self.createOffer(packet);
+                if (resp != null) _ = self.counters.offer.fetchAdd(1, .monotonic);
+                return resp;
+            },
+            .DHCPREQUEST => {
+                _ = self.counters.request.fetchAdd(1, .monotonic);
+                const resp = try self.createAck(packet);
+                if (resp) |r| {
+                    // Distinguish ACK from NAK by checking option 53 in the response
+                    if (getMessageType(r)) |rt| {
+                        if (rt == .DHCPACK) {
+                            _ = self.counters.ack.fetchAdd(1, .monotonic);
+                        } else {
+                            _ = self.counters.nak.fetchAdd(1, .monotonic);
+                        }
+                    }
+                }
+                return resp;
+            },
+            .DHCPRELEASE => {
+                _ = self.counters.release.fetchAdd(1, .monotonic);
                 self.handleRelease(packet);
-                break :blk null;
+                return null;
             },
-            .DHCPDECLINE => blk: {
+            .DHCPDECLINE => {
+                _ = self.counters.decline.fetchAdd(1, .monotonic);
                 self.handleDecline(packet);
-                break :blk null;
+                return null;
             },
-            .DHCPINFORM => self.handleInform(packet),
-            else => null,
-        };
+            .DHCPINFORM => {
+                _ = self.counters.inform.fetchAdd(1, .monotonic);
+                return self.handleInform(packet);
+            },
+            else => return null,
+        }
     }
 
     /// Scan DHCP options for the first occurrence of `target`. Returns the value slice or null.
@@ -836,6 +1017,14 @@ pub const DHCPServer = struct {
         return null;
     }
 
+    /// Returns true if the client's option 60 (Vendor Class Identifier) begins with
+    /// "HTTPClient", indicating a UEFI HTTP/HTTPS network boot request (per UEFI
+    /// Specification §24.4 and RFC 7386).
+    fn isHttpClient(packet: []const u8) bool {
+        const vci = getOption(packet, .VendorClassIdentifier) orelse return false;
+        return std.mem.startsWith(u8, vci, "HTTPClient");
+    }
+
     fn getMessageType(packet: []const u8) ?MessageType {
         const val = getOption(packet, .MessageType) orelse return null;
         if (val.len < 1) return null;
@@ -848,11 +1037,25 @@ pub const DHCPServer = struct {
     /// skipping the router and (if specific) the server's own address.
     /// Returns null when the pool is exhausted.
     /// Returns true if ip_bytes falls within the given pool's subnet.
+    /// Returns true if `ip_bytes` falls within the pool's allocatable range:
+    /// same subnet AND within [pool_start, pool_end] (when configured).
+    /// Used to validate lease-reuse candidates in allocateIp — if pool_end
+    /// was reduced after a lease was issued, the stale IP is outside the range
+    /// and must not be re-offered.
     fn ipInPool(ip_bytes: [4]u8, pool: *const config_mod.PoolConfig) bool {
         const ip_int = std.mem.readInt(u32, &ip_bytes, .big);
         const subnet_bytes = config_mod.parseIpv4(pool.subnet) catch return false;
         const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
-        return (ip_int & pool.subnet_mask) == subnet_int;
+        if ((ip_int & pool.subnet_mask) != subnet_int) return false;
+        if (pool.pool_start.len > 0) {
+            const b = config_mod.parseIpv4(pool.pool_start) catch return false;
+            if (ip_int < std.mem.readInt(u32, &b, .big)) return false;
+        }
+        if (pool.pool_end.len > 0) {
+            const b = config_mod.parseIpv4(pool.pool_end) catch return false;
+            if (ip_int > std.mem.readInt(u32, &b, .big)) return false;
+        }
+        return true;
     }
 
     /// Returns true if this server should send a DNS update for the given lease.
@@ -884,6 +1087,7 @@ pub const DHCPServer = struct {
                 std.log.warn("Refusing allocation to {s}: in decline cooldown for {d}s", .{
                     mac_str, rec.cooldown_until - std.time.timestamp(),
                 });
+                _ = self.counters.decline_refused.fetchAdd(1, .monotonic);
                 return null;
             }
         }
@@ -1025,6 +1229,7 @@ pub const DHCPServer = struct {
             .expires = std.time.timestamp() + probe_mod.probe_quarantine_secs,
             .client_id = null,
         }) catch {};
+        _ = self.counters.probe_conflict.fetchAdd(1, .monotonic);
         std.log.warn("Probe conflict: {s} is already in use, quarantining for {d}s", .{
             ip_str, probe_mod.probe_quarantine_secs,
         });
@@ -1067,6 +1272,26 @@ pub const DHCPServer = struct {
         logRelayAgentInfo(request);
 
         const prl = getOption(request, .ParameterRequestList);
+
+        // Build MAC string for override matching.
+        var mac_str_for_ov: [17]u8 = undefined;
+        _ = std.fmt.bufPrint(&mac_str_for_ov, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
+            mac_bytes[0], mac_bytes[1], mac_bytes[2], mac_bytes[3], mac_bytes[4], mac_bytes[5],
+        }) catch {};
+
+        // Look up per-MAC reservation for option overrides.
+        const reservation = findConfigReservation(pool, &mac_str_for_ov);
+
+        // Collect merged overrides: pool.dhcp_options → mac_classes → reservation.
+        var overrides = collectOverrides(
+            self.allocator,
+            pool,
+            &mac_str_for_ov,
+            reservation,
+            self.cfg.mac_classes,
+        );
+        defer overrides.deinit();
+
         const server_ip = self.server_ip;
         const subnet_mask = std.mem.toBytes(std.mem.nativeToBig(u32, pool.subnet_mask));
         const router_ip = try config_mod.parseIpv4(pool.router);
@@ -1174,7 +1399,8 @@ pub const DHCPServer = struct {
         }
 
         // Option 4: Time Servers (RFC 868)
-        appendIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, pool.time_servers);
+        // Option 4: use explicit time_servers if configured, otherwise mirror ntp_servers.
+        appendIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, if (pool.time_servers.len > 0) pool.time_servers else pool.ntp_servers);
 
         // Option 7: Log Servers
         appendIpListOpt(&opts_buf, &opts_len, prl, .LogServer, pool.log_servers);
@@ -1182,11 +1408,16 @@ pub const DHCPServer = struct {
         // Option 42: NTP Servers
         appendIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, pool.ntp_servers);
 
-        // Option 66: TFTP Server Name
-        appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, pool.tftp_server_name);
-
-        // Option 67: Boot Filename
-        appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, pool.boot_filename);
+        // Option 66/67: Boot options (TFTP or UEFI HTTP boot).
+        if (isHttpClient(request) and pool.http_boot_url.len > 0) {
+            // UEFI HTTP boot: echo option 60 "HTTPClient" and serve URL as option 67.
+            // Both sent unconditionally per UEFI Spec §24.4.
+            appendRawStringOpt(&opts_buf, &opts_len, .VendorClassIdentifier, "HTTPClient");
+            appendRawStringOpt(&opts_buf, &opts_len, .BootFileName, pool.http_boot_url);
+        } else {
+            appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, pool.tftp_server_name);
+            appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, pool.boot_filename);
+        }
 
         // Option 33: Static Routes (RFC 2132)
         if (isRequested(prl, .StaticRoutes) and pool.static_routes.len > 0) {
@@ -1212,8 +1443,8 @@ pub const DHCPServer = struct {
             }
         }
 
-        // Inject operator-defined options from config (filtered by PRL)
-        var opts_it = pool.dhcp_options.iterator();
+        // Inject merged overrides: pool.dhcp_options → mac_classes → reservation
+        var opts_it = overrides.iterator();
         while (opts_it.next()) |entry| {
             const code = std.fmt.parseInt(u8, entry.key_ptr.*, 10) catch continue;
             if (!isRequestedCode(prl, code)) continue;
@@ -1373,6 +1604,17 @@ pub const DHCPServer = struct {
 
         const prl = getOption(request, .ParameterRequestList);
 
+        // Collect merged overrides: pool.dhcp_options → mac_classes → reservation.
+        const config_res = findConfigReservation(pool, mac_str);
+        var overrides = collectOverrides(
+            self.allocator,
+            pool,
+            mac_str,
+            config_res,
+            self.cfg.mac_classes,
+        );
+        defer overrides.deinit();
+
         // Build options
         var opts_buf: [1024]u8 = undefined;
         var opts_len: usize = 0;
@@ -1473,7 +1715,8 @@ pub const DHCPServer = struct {
         }
 
         // Option 4: Time Servers (RFC 868)
-        appendIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, pool.time_servers);
+        // Option 4: use explicit time_servers if configured, otherwise mirror ntp_servers.
+        appendIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, if (pool.time_servers.len > 0) pool.time_servers else pool.ntp_servers);
 
         // Option 7: Log Servers
         appendIpListOpt(&opts_buf, &opts_len, prl, .LogServer, pool.log_servers);
@@ -1481,11 +1724,16 @@ pub const DHCPServer = struct {
         // Option 42: NTP Servers
         appendIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, pool.ntp_servers);
 
-        // Option 66: TFTP Server Name
-        appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, pool.tftp_server_name);
-
-        // Option 67: Boot Filename
-        appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, pool.boot_filename);
+        // Option 66/67: Boot options (TFTP or UEFI HTTP boot).
+        if (isHttpClient(request) and pool.http_boot_url.len > 0) {
+            // UEFI HTTP boot: echo option 60 "HTTPClient" and serve URL as option 67.
+            // Both sent unconditionally per UEFI Spec §24.4.
+            appendRawStringOpt(&opts_buf, &opts_len, .VendorClassIdentifier, "HTTPClient");
+            appendRawStringOpt(&opts_buf, &opts_len, .BootFileName, pool.http_boot_url);
+        } else {
+            appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, pool.tftp_server_name);
+            appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, pool.boot_filename);
+        }
 
         // Option 33: Static Routes (RFC 2132)
         if (isRequested(prl, .StaticRoutes) and pool.static_routes.len > 0) {
@@ -1522,8 +1770,8 @@ pub const DHCPServer = struct {
             }
         }
 
-        // Inject operator-defined options from config (filtered by PRL)
-        var opts_it = pool.dhcp_options.iterator();
+        // Inject merged overrides: pool.dhcp_options → mac_classes → reservation
+        var opts_it = overrides.iterator();
         while (opts_it.next()) |entry| {
             const code = std.fmt.parseInt(u8, entry.key_ptr.*, 10) catch continue;
             if (!isRequestedCode(prl, code)) continue;
@@ -1573,16 +1821,33 @@ pub const DHCPServer = struct {
             mac_bytes[3], mac_bytes[4], mac_bytes[5],
         }) catch return;
 
-        // Get IP and hostname from current lease before removing (for DNS cleanup)
+        // Get IP and hostname from current lease before removing (for DNS cleanup).
+        // Copy the strings we need — removeLease frees the originals for non-reserved leases.
         const old_lease = self.store.getLeaseByMac(mac_str);
+        var ip_copy: [16]u8 = undefined;
+        var ip_len: usize = 0;
+        var hn_copy: [256]u8 = undefined;
+        var hn_len: usize = 0;
+        var old_local: bool = false;
+        if (old_lease) |l| {
+            ip_len = @min(l.ip.len, ip_copy.len);
+            @memcpy(ip_copy[0..ip_len], l.ip[0..ip_len]);
+            if (l.hostname) |h| {
+                hn_len = @min(h.len, hn_copy.len);
+                @memcpy(hn_copy[0..hn_len], h[0..hn_len]);
+            }
+            old_local = l.local;
+        }
         // Check if reserved before removal (reserved leases get expires=0, not deleted)
         const is_reserved = if (self.store.leases.get(mac_str)) |l| l.reserved else false;
         self.store.removeLease(mac_str);
-        if (old_lease) |l| {
-            log_v.debug("DHCPRELEASE {s} from {s}", .{ l.ip, mac_str });
-            if (self.shouldHandleDns(l.local)) {
-                if (self.poolForIp(l.ip)) |pool| {
-                    if (self.dnsUpdaterForPool(pool)) |du| du.notifyLeaseRemoved(l.ip, l.hostname);
+        if (old_lease != null) {
+            const ip_str = ip_copy[0..ip_len];
+            const hn_str: ?[]const u8 = if (hn_len > 0) hn_copy[0..hn_len] else null;
+            log_v.debug("DHCPRELEASE {s} from {s}", .{ ip_str, mac_str });
+            if (self.shouldHandleDns(old_local)) {
+                if (self.poolForIp(ip_str)) |pool| {
+                    if (self.dnsUpdaterForPool(pool)) |du| du.notifyLeaseRemoved(ip_str, hn_str);
                 }
             }
         }
@@ -1622,6 +1887,7 @@ pub const DHCPServer = struct {
                 std.log.warn("DHCPDECLINE: global rate limit reached ({d} in {d}s), ignoring from {s}", .{
                     global_decline_limit, global_decline_window_secs, mac_str,
                 });
+                _ = self.counters.decline_global_limited.fetchAdd(1, .monotonic);
                 return;
             }
             self.global_decline_count += 1;
@@ -1649,6 +1915,7 @@ pub const DHCPServer = struct {
             std.log.warn("Failed to quarantine declined IP {s}: {s}", .{ ip_str, @errorName(err) });
             return;
         };
+        _ = self.counters.decline_ip_quarantined.fetchAdd(1, .monotonic);
         log_v.debug("DHCPDECLINE {s} from {s} (quarantined {d}s)", .{ ip_str, mac_str, quarantine_secs });
 
         // Track declines per MAC. After decline_threshold declines within
@@ -1668,6 +1935,7 @@ pub const DHCPServer = struct {
         if (rec.count >= decline_threshold) {
             rec.cooldown_until = now + decline_cooldown_secs;
             rec.count = 0;
+            _ = self.counters.decline_mac_blocked.fetchAdd(1, .monotonic);
             std.log.warn("DHCPDECLINE: rate-limiting {s} for {d}s after {d} declines in {d}s", .{
                 mac_str, decline_cooldown_secs, decline_threshold, decline_window_secs,
             });
@@ -1713,10 +1981,14 @@ pub const DHCPServer = struct {
             const sub_len = val[i + 1];
             if (i + 2 + sub_len > val.len) break;
             const sub_data = val[i + 2 .. i + 2 + sub_len];
+            // Truncate logged bytes to 16 to prevent blob output from large
+            // relay-agent sub-options; always show the actual length.
+            const preview = sub_data[0..@min(sub_data.len, 16)];
+            const truncated = sub_data.len > 16;
             switch (sub_code) {
-                1 => std.log.debug("Option 82 circuit-id: {x}", .{sub_data}),
-                2 => std.log.debug("Option 82 remote-id: {x}", .{sub_data}),
-                else => std.log.debug("Option 82 sub-option {d}: {x} ({d}B)", .{ sub_code, sub_data, sub_len }),
+                1 => std.log.debug("Option 82 circuit-id ({d}B){s}: {x}", .{ sub_len, if (truncated) "…" else "", preview }),
+                2 => std.log.debug("Option 82 remote-id ({d}B){s}: {x}", .{ sub_len, if (truncated) "…" else "", preview }),
+                else => std.log.debug("Option 82 sub-option {d} ({d}B){s}: {x}", .{ sub_code, sub_len, if (truncated) "…" else "", preview }),
             }
             i += 2 + sub_len;
         }
@@ -1785,6 +2057,16 @@ pub const DHCPServer = struct {
         logRelayAgentInfo(request);
 
         const prl = getOption(request, .ParameterRequestList);
+
+        // Build MAC string for override matching.
+        const mac_bytes = req_header.chaddr[0..6];
+        var mac_str_buf_inf: [17]u8 = undefined;
+        const mac_str_inf = std.fmt.bufPrint(&mac_str_buf_inf, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{
+            mac_bytes[0], mac_bytes[1], mac_bytes[2], mac_bytes[3], mac_bytes[4], mac_bytes[5],
+        }) catch "";
+        const config_res_inf = findConfigReservation(pool, mac_str_inf);
+        var overrides = collectOverrides(self.allocator, pool, mac_str_inf, config_res_inf, self.cfg.mac_classes);
+        defer overrides.deinit();
 
         var opts_buf: [1024]u8 = undefined;
         var opts_len: usize = 0;
@@ -1865,7 +2147,8 @@ pub const DHCPServer = struct {
         }
 
         // Option 4: Time Servers (RFC 868)
-        appendIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, pool.time_servers);
+        // Option 4: use explicit time_servers if configured, otherwise mirror ntp_servers.
+        appendIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, if (pool.time_servers.len > 0) pool.time_servers else pool.ntp_servers);
 
         // Option 7: Log Servers
         appendIpListOpt(&opts_buf, &opts_len, prl, .LogServer, pool.log_servers);
@@ -1873,11 +2156,16 @@ pub const DHCPServer = struct {
         // Option 42: NTP Servers
         appendIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, pool.ntp_servers);
 
-        // Option 66: TFTP Server Name
-        appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, pool.tftp_server_name);
-
-        // Option 67: Boot Filename
-        appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, pool.boot_filename);
+        // Option 66/67: Boot options (TFTP or UEFI HTTP boot).
+        if (isHttpClient(request) and pool.http_boot_url.len > 0) {
+            // UEFI HTTP boot: echo option 60 "HTTPClient" and serve URL as option 67.
+            // Both sent unconditionally per UEFI Spec §24.4.
+            appendRawStringOpt(&opts_buf, &opts_len, .VendorClassIdentifier, "HTTPClient");
+            appendRawStringOpt(&opts_buf, &opts_len, .BootFileName, pool.http_boot_url);
+        } else {
+            appendStringOpt(&opts_buf, &opts_len, prl, .TftpServerName, pool.tftp_server_name);
+            appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, pool.boot_filename);
+        }
 
         // Option 33: Static Routes (RFC 2132)
         if (isRequested(prl, .StaticRoutes) and pool.static_routes.len > 0) {
@@ -1903,8 +2191,8 @@ pub const DHCPServer = struct {
             }
         }
 
-        // Inject operator-defined options from config (filtered by PRL)
-        var opts_it = pool.dhcp_options.iterator();
+        // Inject merged overrides: pool.dhcp_options → mac_classes → reservation
+        var opts_it = overrides.iterator();
         while (opts_it.next()) |entry| {
             const code = std.fmt.parseInt(u8, entry.key_ptr.*, 10) catch continue;
             if (!isRequestedCode(prl, code)) continue;
@@ -2244,6 +2532,7 @@ fn makeTestConfig(allocator: std.mem.Allocator) !config_mod.Config {
         .ntp_servers = try allocator.alloc([]const u8, 0),
         .tftp_server_name = try allocator.dupe(u8, ""),
         .boot_filename = try allocator.dupe(u8, ""),
+        .http_boot_url = try allocator.dupe(u8, ""),
         .dns_update = .{
             .enable = false,
             .server = try allocator.dupe(u8, ""),
@@ -2301,6 +2590,7 @@ fn makeTestConfig2Pool(allocator: std.mem.Allocator) !config_mod.Config {
         .ntp_servers = try allocator.alloc([]const u8, 0),
         .tftp_server_name = try allocator.dupe(u8, ""),
         .boot_filename = try allocator.dupe(u8, ""),
+        .http_boot_url = try allocator.dupe(u8, ""),
         .dns_update = .{
             .enable = false,
             .server = try allocator.dupe(u8, ""),
@@ -2331,6 +2621,7 @@ fn makeTestConfig2Pool(allocator: std.mem.Allocator) !config_mod.Config {
         .ntp_servers = try allocator.alloc([]const u8, 0),
         .tftp_server_name = try allocator.dupe(u8, ""),
         .boot_filename = try allocator.dupe(u8, ""),
+        .http_boot_url = try allocator.dupe(u8, ""),
         .dns_update = .{
             .enable = false,
             .server = try allocator.dupe(u8, ""),
@@ -3600,6 +3891,74 @@ test "allocateIp: single-IP pool allocates the one IP" {
     try std.testing.expectEqual([4]u8{ 192, 168, 1, 42 }, ip.?);
 }
 
+test "allocateIp: stale lease above shrunk pool_end is not reused" {
+    // Regression: if pool_end is reduced after a lease was issued, allocateIp must
+    // not re-offer the now-out-of-range IP.  Previously ipInPool only checked subnet
+    // membership, so .150 passed even when pool_end=.120.
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    alloc.free(cfg.pools[0].pool_start);
+    alloc.free(cfg.pools[0].pool_end);
+    cfg.pools[0].pool_start = try alloc.dupe(u8, "192.168.1.100");
+    cfg.pools[0].pool_end = try alloc.dupe(u8, "192.168.1.120"); // shrunk; .150 is outside
+
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    // Seed a stale lease at .150 for the client MAC.
+    const mac = [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
+    try store.addLease(.{
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "192.168.1.150",
+        .hostname = null,
+        .expires = std.time.timestamp() + 3600,
+        .client_id = null,
+    });
+
+    const ip = try server.allocateIp(&server.cfg.pools[0], mac, null);
+    // Must not return the stale .150; must return an address within [.100, .120].
+    try std.testing.expect(ip != null);
+    const ip_int = std.mem.readInt(u32, &ip.?, .big);
+    const start_int = std.mem.readInt(u32, &[4]u8{ 192, 168, 1, 100 }, .big);
+    const end_int = std.mem.readInt(u32, &[4]u8{ 192, 168, 1, 120 }, .big);
+    try std.testing.expect(ip_int >= start_int and ip_int <= end_int);
+}
+
+test "allocateIp: stale lease below shrunk pool_start is not reused" {
+    // Mirror of the above: lease at .10 when pool_start was raised to .50.
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    alloc.free(cfg.pools[0].pool_start);
+    alloc.free(cfg.pools[0].pool_end);
+    cfg.pools[0].pool_start = try alloc.dupe(u8, "192.168.1.50");
+    cfg.pools[0].pool_end = try alloc.dupe(u8, "192.168.1.80");
+
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    const mac = [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01 };
+    try store.addLease(.{
+        .mac = "aa:bb:cc:dd:ee:01",
+        .ip = "192.168.1.10", // below new pool_start
+        .hostname = null,
+        .expires = std.time.timestamp() + 3600,
+        .client_id = null,
+    });
+
+    const ip = try server.allocateIp(&server.cfg.pools[0], mac, null);
+    try std.testing.expect(ip != null);
+    const ip_int = std.mem.readInt(u32, &ip.?, .big);
+    const start_int = std.mem.readInt(u32, &[4]u8{ 192, 168, 1, 50 }, .big);
+    const end_int = std.mem.readInt(u32, &[4]u8{ 192, 168, 1, 80 }, .big);
+    try std.testing.expect(ip_int >= start_int and ip_int <= end_int);
+}
+
 test "allocateIp: pool exhausted returns null" {
     const alloc = std.testing.allocator;
     var cfg = try makeTestConfig(alloc);
@@ -3885,4 +4244,387 @@ test "allocateIp: MAC reserved in both pools gets correct IP per pool" {
     // pool[1] must honour its own reservation, not return the pool[0] IP
     const ip1 = try server.allocateIp(&server.cfg.pools[1], [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF }, null);
     try std.testing.expectEqual([4]u8{ 10, 0, 0, 42 }, ip1.?);
+}
+
+test "isHttpClient: detects HTTPClient prefix" {
+    var pkt = [_]u8{0} ** (dhcp_min_packet_size + 32);
+    @memcpy(pkt[dhcp_min_packet_size - 4 .. dhcp_min_packet_size], &dhcp_magic_cookie);
+    const vci = "HTTPClient";
+    pkt[dhcp_min_packet_size + 0] = @intFromEnum(OptionCode.VendorClassIdentifier);
+    pkt[dhcp_min_packet_size + 1] = @intCast(vci.len);
+    @memcpy(pkt[dhcp_min_packet_size + 2 ..][0..vci.len], vci);
+    pkt[dhcp_min_packet_size + 2 + vci.len] = @intFromEnum(OptionCode.End);
+
+    try std.testing.expect(DHCPServer.isHttpClient(&pkt));
+}
+
+test "isHttpClient: detects HTTPClient with trailing data" {
+    // UEFI spec allows "HTTPClient" followed by architecture-specific suffix.
+    var pkt = [_]u8{0} ** (dhcp_min_packet_size + 32);
+    @memcpy(pkt[dhcp_min_packet_size - 4 .. dhcp_min_packet_size], &dhcp_magic_cookie);
+    const vci = "HTTPClient:Arch:00007";
+    pkt[dhcp_min_packet_size + 0] = @intFromEnum(OptionCode.VendorClassIdentifier);
+    pkt[dhcp_min_packet_size + 1] = @intCast(vci.len);
+    @memcpy(pkt[dhcp_min_packet_size + 2 ..][0..vci.len], vci);
+    pkt[dhcp_min_packet_size + 2 + vci.len] = @intFromEnum(OptionCode.End);
+
+    try std.testing.expect(DHCPServer.isHttpClient(&pkt));
+}
+
+test "isHttpClient: rejects non-HTTP VCI" {
+    var pkt = [_]u8{0} ** (dhcp_min_packet_size + 32);
+    @memcpy(pkt[dhcp_min_packet_size - 4 .. dhcp_min_packet_size], &dhcp_magic_cookie);
+    const vci = "PXEClient:Arch:00000";
+    pkt[dhcp_min_packet_size + 0] = @intFromEnum(OptionCode.VendorClassIdentifier);
+    pkt[dhcp_min_packet_size + 1] = @intCast(vci.len);
+    @memcpy(pkt[dhcp_min_packet_size + 2 ..][0..vci.len], vci);
+    pkt[dhcp_min_packet_size + 2 + vci.len] = @intFromEnum(OptionCode.End);
+
+    try std.testing.expect(!DHCPServer.isHttpClient(&pkt));
+}
+
+test "isHttpClient: returns false when option 60 absent" {
+    var pkt = [_]u8{0} ** (dhcp_min_packet_size + 4);
+    @memcpy(pkt[dhcp_min_packet_size - 4 .. dhcp_min_packet_size], &dhcp_magic_cookie);
+    pkt[dhcp_min_packet_size] = @intFromEnum(OptionCode.End);
+
+    try std.testing.expect(!DHCPServer.isHttpClient(&pkt));
+}
+
+/// Build a minimal DISCOVER packet, optionally with option 60 (VCI).
+fn makeDiscover(buf: []u8, mac: [6]u8, vci: ?[]const u8) usize {
+    @memset(buf, 0);
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+    hdr.op = 1;
+    hdr.htype = 1;
+    hdr.hlen = 6;
+    hdr.xid = 0xDEADBEEF;
+    hdr.magic = dhcp_magic_cookie;
+    @memcpy(hdr.chaddr[0..6], &mac);
+
+    var i: usize = dhcp_min_packet_size;
+    buf[i] = @intFromEnum(OptionCode.MessageType);
+    buf[i + 1] = 1;
+    buf[i + 2] = @intFromEnum(MessageType.DHCPDISCOVER);
+    i += 3;
+    if (vci) |v| {
+        buf[i] = @intFromEnum(OptionCode.VendorClassIdentifier);
+        buf[i + 1] = @intCast(v.len);
+        @memcpy(buf[i + 2 ..][0..v.len], v);
+        i += 2 + v.len;
+    }
+    buf[i] = @intFromEnum(OptionCode.End);
+    i += 1;
+    return i;
+}
+
+test "UEFI HTTP boot: DISCOVER with HTTPClient gets option 60 echo and URL in option 67" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    alloc.free(cfg.pools[0].http_boot_url);
+    cfg.pools[0].http_boot_url = try alloc.dupe(u8, "http://boot.example.com/efi/bootx64.efi");
+    cfg.pools[0].pool_start = blk: {
+        alloc.free(cfg.pools[0].pool_start);
+        break :blk try alloc.dupe(u8, "192.168.1.10");
+    };
+    cfg.pools[0].pool_end = blk: {
+        alloc.free(cfg.pools[0].pool_end);
+        break :blk try alloc.dupe(u8, "192.168.1.20");
+    };
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    var buf = [_]u8{0} ** 512;
+    const len = makeDiscover(&buf, [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x11 }, "HTTPClient");
+    const resp = try server.processPacket(buf[0..len]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+
+    try std.testing.expectEqual(MessageType.DHCPOFFER, DHCPServer.getMessageType(resp.?).?);
+    // Option 60 must be echoed back as "HTTPClient"
+    const opt60 = DHCPServer.getOption(resp.?, .VendorClassIdentifier);
+    try std.testing.expect(opt60 != null);
+    try std.testing.expectEqualStrings("HTTPClient", opt60.?);
+    // Option 67 must contain the HTTP URL
+    const opt67 = DHCPServer.getOption(resp.?, .BootFileName);
+    try std.testing.expect(opt67 != null);
+    try std.testing.expectEqualStrings("http://boot.example.com/efi/bootx64.efi", opt67.?);
+    // Option 66 (TftpServerName) must NOT be present
+    try std.testing.expect(DHCPServer.getOption(resp.?, .TftpServerName) == null);
+}
+
+test "UEFI HTTP boot: DISCOVER without HTTPClient gets normal TFTP options" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    alloc.free(cfg.pools[0].http_boot_url);
+    cfg.pools[0].http_boot_url = try alloc.dupe(u8, "http://boot.example.com/efi/bootx64.efi");
+    alloc.free(cfg.pools[0].tftp_server_name);
+    cfg.pools[0].tftp_server_name = try alloc.dupe(u8, "tftp.example.com");
+    alloc.free(cfg.pools[0].boot_filename);
+    cfg.pools[0].boot_filename = try alloc.dupe(u8, "pxelinux.0");
+    cfg.pools[0].pool_start = blk: {
+        alloc.free(cfg.pools[0].pool_start);
+        break :blk try alloc.dupe(u8, "192.168.1.10");
+    };
+    cfg.pools[0].pool_end = blk: {
+        alloc.free(cfg.pools[0].pool_end);
+        break :blk try alloc.dupe(u8, "192.168.1.20");
+    };
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    // No VCI option — regular PXE client
+    var buf = [_]u8{0} ** 512;
+    const len = makeDiscover(&buf, [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x22 }, null);
+    const resp = try server.processPacket(buf[0..len]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+
+    try std.testing.expectEqual(MessageType.DHCPOFFER, DHCPServer.getMessageType(resp.?).?);
+    // Option 60 must NOT be present (no echo for non-HTTP clients)
+    try std.testing.expect(DHCPServer.getOption(resp.?, .VendorClassIdentifier) == null);
+    // Option 67 must contain TFTP filename, not the HTTP URL
+    const opt67 = DHCPServer.getOption(resp.?, .BootFileName);
+    try std.testing.expect(opt67 != null);
+    try std.testing.expectEqualStrings("pxelinux.0", opt67.?);
+}
+
+test "UEFI HTTP boot: http_boot_url empty => normal TFTP options even with HTTPClient VCI" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    // http_boot_url is empty (default); tftp options set
+    alloc.free(cfg.pools[0].tftp_server_name);
+    cfg.pools[0].tftp_server_name = try alloc.dupe(u8, "tftp.example.com");
+    alloc.free(cfg.pools[0].boot_filename);
+    cfg.pools[0].boot_filename = try alloc.dupe(u8, "pxelinux.0");
+    cfg.pools[0].pool_start = blk: {
+        alloc.free(cfg.pools[0].pool_start);
+        break :blk try alloc.dupe(u8, "192.168.1.10");
+    };
+    cfg.pools[0].pool_end = blk: {
+        alloc.free(cfg.pools[0].pool_end);
+        break :blk try alloc.dupe(u8, "192.168.1.20");
+    };
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    var buf = [_]u8{0} ** 512;
+    const len = makeDiscover(&buf, [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x33 }, "HTTPClient");
+    const resp = try server.processPacket(buf[0..len]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+
+    try std.testing.expectEqual(MessageType.DHCPOFFER, DHCPServer.getMessageType(resp.?).?);
+    // http_boot_url empty => fallback to TFTP options
+    try std.testing.expect(DHCPServer.getOption(resp.?, .VendorClassIdentifier) == null);
+    const opt67 = DHCPServer.getOption(resp.?, .BootFileName);
+    try std.testing.expect(opt67 != null);
+    try std.testing.expectEqualStrings("pxelinux.0", opt67.?);
+}
+
+// ---------------------------------------------------------------------------
+// MAC class matching tests
+// ---------------------------------------------------------------------------
+
+test "matchMacClass: OUI prefix match" {
+    try std.testing.expect(matchMacClass("64:16:7f:aa:bb:cc", "64:16:7f"));
+}
+
+test "matchMacClass: OUI prefix with trailing wildcard" {
+    try std.testing.expect(matchMacClass("64:16:7f:aa:bb:cc", "64:16:7f:*"));
+}
+
+test "matchMacClass: exact MAC match" {
+    try std.testing.expect(matchMacClass("aa:bb:cc:dd:ee:ff", "aa:bb:cc:dd:ee:ff"));
+}
+
+test "matchMacClass: no match" {
+    try std.testing.expect(!matchMacClass("64:16:7f:aa:bb:cc", "00:25:90"));
+}
+
+test "matchMacClass: case insensitive" {
+    try std.testing.expect(matchMacClass("AA:BB:CC:dd:ee:ff", "aa:bb:cc"));
+}
+
+test "matchMacClass: wildcard-only matches everything" {
+    try std.testing.expect(matchMacClass("aa:bb:cc:dd:ee:ff", "*"));
+}
+
+test "matchMacClass: two-octet prefix" {
+    try std.testing.expect(matchMacClass("aa:bb:cc:dd:ee:ff", "aa:bb"));
+    try std.testing.expect(!matchMacClass("aa:bc:cc:dd:ee:ff", "aa:bb"));
+}
+
+test "collectOverrides: priority pool < mac_class < reservation" {
+    const allocator = std.testing.allocator;
+
+    // Pool options: "66" = "pool-tftp", "15" = "pool.lan"
+    var pool_opts = std.StringHashMap([]const u8).init(allocator);
+    defer pool_opts.deinit();
+    try pool_opts.put("66", "pool-tftp");
+    try pool_opts.put("15", "pool.lan");
+
+    var pool = config_mod.PoolConfig{
+        .subnet = "192.168.1.0",
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = "192.168.1.1",
+        .pool_start = "",
+        .pool_end = "",
+        .dns_servers = &.{},
+        .domain_name = "",
+        .domain_search = &.{},
+        .lease_time = 3600,
+        .time_offset = null,
+        .time_servers = &.{},
+        .log_servers = &.{},
+        .ntp_servers = &.{},
+        .tftp_server_name = "",
+        .boot_filename = "",
+        .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
+        .dhcp_options = pool_opts,
+        .reservations = &.{},
+        .static_routes = &.{},
+    };
+
+    // MAC class (OUI "aa:bb:cc") overrides "66", adds "67"
+    var mc_opts = std.StringHashMap([]const u8).init(allocator);
+    defer mc_opts.deinit();
+    try mc_opts.put("66", "class-tftp");
+    try mc_opts.put("67", "class-boot.img");
+
+    var mac_classes = [_]config_mod.MacClass{.{
+        .name = "TestClass",
+        .match = "aa:bb:cc",
+        .dhcp_options = mc_opts,
+    }};
+
+    // Reservation overrides "66"
+    var res_opts = std.StringHashMap([]const u8).init(allocator);
+    defer res_opts.deinit();
+    try res_opts.put("66", "res-tftp");
+
+    const reservation = config_mod.Reservation{
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "192.168.1.50",
+        .hostname = null,
+        .client_id = null,
+        .dhcp_options = res_opts,
+    };
+
+    var overrides = collectOverrides(allocator, &pool, "aa:bb:cc:dd:ee:ff", &reservation, &mac_classes);
+    defer overrides.deinit();
+
+    // "66" should be reservation value (highest priority)
+    try std.testing.expectEqualStrings("res-tftp", overrides.get("66").?);
+    // "67" should be MAC class value (pool didn't set it)
+    try std.testing.expectEqualStrings("class-boot.img", overrides.get("67").?);
+    // "15" should be pool value (no override from class or reservation)
+    try std.testing.expectEqualStrings("pool.lan", overrides.get("15").?);
+}
+
+test "collectOverrides: most specific MAC class wins" {
+    const allocator = std.testing.allocator;
+
+    var pool = config_mod.PoolConfig{
+        .subnet = "192.168.1.0",
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = "192.168.1.1",
+        .pool_start = "",
+        .pool_end = "",
+        .dns_servers = &.{},
+        .domain_name = "",
+        .domain_search = &.{},
+        .lease_time = 3600,
+        .time_offset = null,
+        .time_servers = &.{},
+        .log_servers = &.{},
+        .ntp_servers = &.{},
+        .tftp_server_name = "",
+        .boot_filename = "",
+        .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
+        .dhcp_options = std.StringHashMap([]const u8).init(allocator),
+        .reservations = &.{},
+        .static_routes = &.{},
+    };
+    defer pool.dhcp_options.deinit();
+
+    // OUI class (less specific) and exact MAC class (more specific)
+    var oui_opts = std.StringHashMap([]const u8).init(allocator);
+    defer oui_opts.deinit();
+    try oui_opts.put("66", "oui-tftp");
+
+    var exact_opts = std.StringHashMap([]const u8).init(allocator);
+    defer exact_opts.deinit();
+    try exact_opts.put("66", "exact-tftp");
+
+    var mac_classes = [_]config_mod.MacClass{
+        .{ .name = "OUI", .match = "aa:bb:cc", .dhcp_options = oui_opts },
+        .{ .name = "Exact", .match = "aa:bb:cc:dd:ee:ff", .dhcp_options = exact_opts },
+    };
+
+    var overrides = collectOverrides(allocator, &pool, "aa:bb:cc:dd:ee:ff", null, &mac_classes);
+    defer overrides.deinit();
+
+    // More specific (exact MAC) should win over OUI prefix
+    try std.testing.expectEqualStrings("exact-tftp", overrides.get("66").?);
+}
+
+test "collectOverrides: no matches returns pool options only" {
+    const allocator = std.testing.allocator;
+
+    var pool_opts = std.StringHashMap([]const u8).init(allocator);
+    defer pool_opts.deinit();
+    try pool_opts.put("66", "pool-tftp");
+
+    var pool = config_mod.PoolConfig{
+        .subnet = "192.168.1.0",
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = "192.168.1.1",
+        .pool_start = "",
+        .pool_end = "",
+        .dns_servers = &.{},
+        .domain_name = "",
+        .domain_search = &.{},
+        .lease_time = 3600,
+        .time_offset = null,
+        .time_servers = &.{},
+        .log_servers = &.{},
+        .ntp_servers = &.{},
+        .tftp_server_name = "",
+        .boot_filename = "",
+        .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
+        .dhcp_options = pool_opts,
+        .reservations = &.{},
+        .static_routes = &.{},
+    };
+
+    // MAC class that doesn't match
+    var mc_opts = std.StringHashMap([]const u8).init(allocator);
+    defer mc_opts.deinit();
+    try mc_opts.put("66", "class-tftp");
+
+    var mac_classes = [_]config_mod.MacClass{.{
+        .name = "Other",
+        .match = "ff:ff:ff",
+        .dhcp_options = mc_opts,
+    }};
+
+    var overrides = collectOverrides(allocator, &pool, "aa:bb:cc:dd:ee:ff", null, &mac_classes);
+    defer overrides.deinit();
+
+    // Only pool option should be present
+    try std.testing.expectEqualStrings("pool-tftp", overrides.get("66").?);
+    try std.testing.expectEqual(@as(usize, 1), overrides.count());
 }

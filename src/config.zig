@@ -19,11 +19,49 @@ pub const SyncConfig = struct {
     peers: [][]const u8, // empty if using multicast mode
 };
 
+/// SSH admin interface configuration.
+pub const AdminSSHConfig = struct {
+    enable: bool = false,
+    port: u16 = 2267, // DHCP(67) + SSH(22) concatenated
+    bind: []const u8,
+    read_only: bool = false, // if true: viewing only, all writes blocked
+    host_key: []const u8, // path to SSH host private key (Ed25519 recommended)
+    authorized_keys: []const u8, // path to authorized_keys file
+};
+
+/// Prometheus metrics configuration.
+pub const MetricsConfig = struct {
+    collect: bool = true, // enable in-process counters (used by SSH stats page)
+    http_enable: bool = false, // expose via HTTP endpoint
+    http_port: u16 = 9167, // Prometheus convention 91xx + DHCP port 67
+    http_bind: []const u8, // bind address for HTTP server
+};
+
 pub const Reservation = struct {
     mac: []const u8,
     ip: []const u8,
     hostname: ?[]const u8,
     client_id: ?[]const u8,
+    dhcp_options: ?std.StringHashMap([]const u8) = null,
+};
+
+/// MAC class rule: matches client MACs by prefix pattern and overrides DHCP options.
+/// Applied after pool defaults, before per-reservation overrides.
+pub const MacClass = struct {
+    name: []const u8,
+    match: []const u8, // MAC prefix, e.g. "64:16:7f" or "aa:bb:cc:dd:*"
+    dhcp_options: std.StringHashMap([]const u8),
+
+    pub fn deinit(self: *MacClass, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.match);
+        var it = self.dhcp_options.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        self.dhcp_options.deinit();
+    }
 };
 
 pub const StaticRoute = struct {
@@ -50,6 +88,11 @@ pub const PoolConfig = struct {
     ntp_servers: [][]const u8,
     tftp_server_name: []const u8,
     boot_filename: []const u8,
+    /// HTTP/HTTPS URL served as option 67 when the client identifies as a
+    /// UEFI HTTP boot client (option 60 = "HTTPClient…").  When non-empty and
+    /// the client sends the "HTTPClient" vendor class, this URL overrides
+    /// boot_filename and option 60 is echoed back to the client.
+    http_boot_url: []const u8,
     dns_update: dns_mod.Config,
     dhcp_options: std.StringHashMap([]const u8),
     reservations: []Reservation,
@@ -73,6 +116,7 @@ pub const PoolConfig = struct {
         allocator.free(self.ntp_servers);
         allocator.free(self.tftp_server_name);
         allocator.free(self.boot_filename);
+        allocator.free(self.http_boot_url);
         allocator.free(self.dns_update.server);
         allocator.free(self.dns_update.zone);
         allocator.free(self.dns_update.rev_zone);
@@ -84,11 +128,19 @@ pub const PoolConfig = struct {
             allocator.free(entry.value_ptr.*);
         }
         self.dhcp_options.deinit();
-        for (self.reservations) |r| {
+        for (self.reservations) |*r| {
             allocator.free(r.mac);
             allocator.free(r.ip);
             if (r.hostname) |h| allocator.free(h);
             if (r.client_id) |c| allocator.free(c);
+            if (r.dhcp_options) |*opts| {
+                var oit = opts.iterator();
+                while (oit.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    allocator.free(entry.value_ptr.*);
+                }
+                opts.deinit();
+            }
         }
         allocator.free(self.reservations);
         allocator.free(self.static_routes);
@@ -107,11 +159,16 @@ pub const Config = struct {
     log_level: LogLevel,
     pool_allocation_random: bool, // false = sequential (default), true = random start offset
     sync: ?SyncConfig,
+    mac_classes: []MacClass = &.{},
     pools: []PoolConfig, // at least one required
+    admin_ssh: AdminSSHConfig,
+    metrics: MetricsConfig,
 
     pub fn deinit(self: *Config) void {
         self.allocator.free(self.listen_address);
         self.allocator.free(self.state_dir);
+        for (self.mac_classes) |*mc| mc.deinit(self.allocator);
+        self.allocator.free(self.mac_classes);
         for (self.pools) |*pool| pool.deinit(self.allocator);
         self.allocator.free(self.pools);
         if (self.sync) |*s| {
@@ -121,6 +178,10 @@ pub const Config = struct {
             for (s.peers) |p| self.allocator.free(p);
             self.allocator.free(s.peers);
         }
+        self.allocator.free(self.admin_ssh.bind);
+        self.allocator.free(self.admin_ssh.host_key);
+        self.allocator.free(self.admin_ssh.authorized_keys);
+        self.allocator.free(self.metrics.http_bind);
     }
 };
 
@@ -161,7 +222,22 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
         .log_level = parseLogLevel(raw.log_level orelse "info"),
         .pool_allocation_random = false,
         .sync = null,
+        .mac_classes = try allocator.alloc(MacClass, 0),
         .pools = try allocator.alloc(PoolConfig, 0),
+        .admin_ssh = .{
+            .enable = false,
+            .port = 2267,
+            .bind = try allocator.dupe(u8, "0.0.0.0"),
+            .read_only = false,
+            .host_key = try allocator.dupe(u8, "/etc/stardust/ssh_host_key"),
+            .authorized_keys = try allocator.dupe(u8, "/etc/stardust/authorized_keys"),
+        },
+        .metrics = .{
+            .collect = true,
+            .http_enable = false,
+            .http_port = 9167,
+            .http_bind = try allocator.dupe(u8, "127.0.0.1"),
+        },
     };
     errdefer cfg.deinit();
 
@@ -176,6 +252,64 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
             if (root_map.get("sync")) |sync_val| {
                 if (sync_val.asMap()) |sync_map| {
                     cfg.sync = try parseSyncConfig(allocator, sync_map);
+                }
+            }
+
+            if (root_map.get("mac_classes")) |mc_val| {
+                if (mc_val.asList()) |mc_list| {
+                    cfg.mac_classes = try parseMacClasses(allocator, mc_list);
+                }
+            }
+
+            if (root_map.get("admin_ssh")) |ssh_val| {
+                if (ssh_val.asMap()) |ssh_map| {
+                    if (ssh_map.get("enable")) |v| {
+                        if (v.asScalar()) |s| cfg.admin_ssh.enable = std.mem.eql(u8, s, "true");
+                    }
+                    if (ssh_map.get("port")) |v| {
+                        if (v.asScalar()) |s| cfg.admin_ssh.port = std.fmt.parseInt(u16, s, 10) catch 2267;
+                    }
+                    if (ssh_map.get("bind")) |v| {
+                        if (v.asScalar()) |s| {
+                            allocator.free(cfg.admin_ssh.bind);
+                            cfg.admin_ssh.bind = try allocator.dupe(u8, s);
+                        }
+                    }
+                    if (ssh_map.get("read_only")) |v| {
+                        if (v.asScalar()) |s| cfg.admin_ssh.read_only = std.mem.eql(u8, s, "true");
+                    }
+                    if (ssh_map.get("host_key")) |v| {
+                        if (v.asScalar()) |s| {
+                            allocator.free(cfg.admin_ssh.host_key);
+                            cfg.admin_ssh.host_key = try allocator.dupe(u8, s);
+                        }
+                    }
+                    if (ssh_map.get("authorized_keys")) |v| {
+                        if (v.asScalar()) |s| {
+                            allocator.free(cfg.admin_ssh.authorized_keys);
+                            cfg.admin_ssh.authorized_keys = try allocator.dupe(u8, s);
+                        }
+                    }
+                }
+            }
+
+            if (root_map.get("metrics")) |met_val| {
+                if (met_val.asMap()) |met_map| {
+                    if (met_map.get("collect")) |v| {
+                        if (v.asScalar()) |s| cfg.metrics.collect = !std.mem.eql(u8, s, "false");
+                    }
+                    if (met_map.get("http_enable")) |v| {
+                        if (v.asScalar()) |s| cfg.metrics.http_enable = std.mem.eql(u8, s, "true");
+                    }
+                    if (met_map.get("http_port")) |v| {
+                        if (v.asScalar()) |s| cfg.metrics.http_port = std.fmt.parseInt(u16, s, 10) catch 9167;
+                    }
+                    if (met_map.get("http_bind")) |v| {
+                        if (v.asScalar()) |s| {
+                            allocator.free(cfg.metrics.http_bind);
+                            cfg.metrics.http_bind = try allocator.dupe(u8, s);
+                        }
+                    }
                 }
             }
 
@@ -264,6 +398,7 @@ fn parseOnePool(allocator: std.mem.Allocator, pool_map: anytype) !?PoolConfig {
         .ntp_servers = try allocator.alloc([]const u8, 0),
         .tftp_server_name = try allocator.dupe(u8, ""),
         .boot_filename = try allocator.dupe(u8, ""),
+        .http_boot_url = try allocator.dupe(u8, ""),
         .dns_update = .{
             .enable = false,
             .server = try allocator.dupe(u8, ""),
@@ -318,6 +453,13 @@ fn parseOnePool(allocator: std.mem.Allocator, pool_map: anytype) !?PoolConfig {
         if (v.asScalar()) |s| {
             allocator.free(pool.boot_filename);
             pool.boot_filename = try allocator.dupe(u8, s);
+        }
+    }
+
+    if (pool_map.get("http_boot_url")) |v| {
+        if (v.asScalar()) |s| {
+            allocator.free(pool.http_boot_url);
+            pool.http_boot_url = try allocator.dupe(u8, s);
         }
     }
 
@@ -514,11 +656,36 @@ fn parseReservations(allocator: std.mem.Allocator, pool: *PoolConfig, list: anyt
         const client_id_owned: ?[]const u8 = if (client_id_str) |c| try allocator.dupe(u8, c) else null;
         errdefer if (client_id_owned) |c| allocator.free(c);
 
+        // Parse optional per-reservation dhcp_options.
+        var res_opts: ?std.StringHashMap([]const u8) = null;
+        errdefer if (res_opts) |*opts| {
+            var oit = opts.iterator();
+            while (oit.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                allocator.free(entry.value_ptr.*);
+            }
+            opts.deinit();
+        };
+        if (m.get("dhcp_options")) |opts_val| {
+            if (opts_val.asMap()) |opts_map| {
+                res_opts = std.StringHashMap([]const u8).init(allocator);
+                var oit = opts_map.iterator();
+                while (oit.next()) |entry| {
+                    const ok = try allocator.dupe(u8, entry.key_ptr.*);
+                    errdefer allocator.free(ok);
+                    const ov = try allocator.dupe(u8, entry.value_ptr.asScalar() orelse "");
+                    errdefer allocator.free(ov);
+                    try res_opts.?.put(ok, ov);
+                }
+            }
+        }
+
         pool.reservations[idx] = .{
             .mac = mac_owned,
             .ip = ip_owned,
             .hostname = hostname_owned,
             .client_id = client_id_owned,
+            .dhcp_options = res_opts,
         };
         idx += 1;
     }
@@ -674,6 +841,54 @@ fn parseSyncConfig(allocator: std.mem.Allocator, sync_map: anytype) !?SyncConfig
         .multicast = multicast,
         .peers = peers,
     };
+}
+
+fn parseMacClasses(allocator: std.mem.Allocator, list: anytype) ![]MacClass {
+    var classes = try allocator.alloc(MacClass, list.len);
+    var idx: usize = 0;
+    for (list) |item| {
+        const m = item.asMap() orelse continue;
+        const name_str = if (m.get("name")) |v| (v.asScalar() orelse "") else "";
+        const match_str = if (m.get("match")) |v| (v.asScalar() orelse "") else "";
+        if (match_str.len == 0) {
+            std.log.warn("config: mac_class missing 'match', skipping", .{});
+            continue;
+        }
+
+        var opts = std.StringHashMap([]const u8).init(allocator);
+        errdefer {
+            var oit = opts.iterator();
+            while (oit.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                allocator.free(entry.value_ptr.*);
+            }
+            opts.deinit();
+        }
+        if (m.get("dhcp_options")) |opts_val| {
+            if (opts_val.asMap()) |opts_map| {
+                var oit = opts_map.iterator();
+                while (oit.next()) |entry| {
+                    const k = try allocator.dupe(u8, entry.key_ptr.*);
+                    errdefer allocator.free(k);
+                    const v = try allocator.dupe(u8, entry.value_ptr.asScalar() orelse "");
+                    errdefer allocator.free(v);
+                    try opts.put(k, v);
+                }
+            }
+        }
+
+        const name_duped = try allocator.dupe(u8, name_str);
+        errdefer allocator.free(name_duped);
+        const match_duped = try allocator.dupe(u8, match_str);
+
+        classes[idx] = .{
+            .name = name_duped,
+            .match = match_duped,
+            .dhcp_options = opts,
+        };
+        idx += 1;
+    }
+    return allocator.realloc(classes, idx) catch classes[0..idx];
 }
 
 /// Compute a SHA-256 pool hash over all pools' subnets, addresses, reservations,
@@ -1074,6 +1289,7 @@ fn makeHashTestConfig(alloc: std.mem.Allocator) Config {
         .ntp_servers = alloc.alloc([]const u8, 0) catch unreachable,
         .tftp_server_name = alloc.dupe(u8, "") catch unreachable,
         .boot_filename = alloc.dupe(u8, "") catch unreachable,
+        .http_boot_url = alloc.dupe(u8, "") catch unreachable,
         .dns_update = .{
             .enable = false,
             .server = alloc.dupe(u8, "") catch unreachable,
@@ -1245,6 +1461,7 @@ test "computePoolHash: different pool count produces different hash" {
         .ntp_servers = alloc.alloc([]const u8, 0) catch unreachable,
         .tftp_server_name = alloc.dupe(u8, "") catch unreachable,
         .boot_filename = alloc.dupe(u8, "") catch unreachable,
+        .http_boot_url = alloc.dupe(u8, "") catch unreachable,
         .dns_update = .{
             .enable = false,
             .server = alloc.dupe(u8, "") catch unreachable,
