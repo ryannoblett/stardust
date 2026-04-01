@@ -19,14 +19,14 @@ log_level: "info"   # err | warn | info | verbose | debug
 #   - name: "IP Phones"
 #     match: "64:16:7f"           # Polycom OUI — matches any MAC starting with 64:16:7f:
 #     dhcp_options:
-#       "66": "tftp.phones.local"  # TFTP server
-#       "150": "10.0.0.5"          # Cisco TFTP alternative
+#       66: "tftp.phones.local"  # TFTP server
+#       150: "10.0.0.5"          # Cisco TFTP alternative
 #
 #   - name: "PXE Boot Clients"
 #     match: "00:25:90:*"          # trailing :* is optional (same as prefix)
 #     dhcp_options:
-#       "66": "10.0.0.10"
-#       "67": "pxelinux.0"
+#       66: "10.0.0.10"
+#       67: "pxelinux.0"
 
 # ---------------------------------------------------------------------------
 # Pool definitions — each pool is one subnet served by this daemon.
@@ -85,15 +85,15 @@ pools:
     #     # Per-reservation DHCP option overrides — highest priority, trumps
     #     # both pool defaults and mac_class rules.
     #     # dhcp_options:
-    #     #   "66": "custom-tftp.local"
-    #     #   "67": "custom-boot.img"
+    #     #   66: "custom-tftp.local"
+    #     #   67: "custom-boot.img"
 
     # Additional DHCP options (numeric option codes as keys).
     # These override built-in pool settings for the same option code.
     # Values containing only IPs are encoded as IPv4 addresses; others as raw strings.
     # dhcp_options:
-    #   "150": "10.0.0.5,10.0.0.6"  # Cisco TFTP (IPs auto-encoded)
-    #   "252": "http://wpad.local/wpad.dat"  # WPAD URL (raw string)
+    #   150: "10.0.0.5,10.0.0.6"  # Cisco TFTP (IPs auto-encoded)
+    #   252: "http://wpad.local/wpad.dat"  # WPAD URL (raw string)
 
     # Per-pool DNS dynamic update configuration (RFC 2136)
     dns_update:
