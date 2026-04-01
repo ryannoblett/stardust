@@ -4025,7 +4025,7 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
     lc += 1;
     lines_buf[lc] = .{ .label = "-- General --", .value = "", .is_section = true, .edit_idx = null };
     lc += 1;
-    lines_buf[lc] = .{ .label = "Listen Address", .value = try std.fmt.allocPrint(fa, "{s}  (restart)", .{cfg.listen_address}), .is_section = false, .edit_idx = null };
+    lines_buf[lc] = .{ .label = "Listen Address", .value = cfg.listen_address, .is_section = false, .edit_idx = null };
     lc += 1;
     lines_buf[lc] = .{ .label = "State Directory", .value = cfg.state_dir, .is_section = false, .edit_idx = null };
     lc += 1;
