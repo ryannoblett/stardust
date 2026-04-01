@@ -5074,9 +5074,8 @@ fn handlePoolRouteEditKey(state: *TuiState, key: vaxis.Key) void {
             const gw_int = std.mem.readInt(u32, &gw_ip, .big);
             const subnet_int = std.mem.readInt(u32, &ps.ip, .big);
             if (gw_int & ps.mask != subnet_int & ps.mask) {
-                const msg = "  Gateway not on pool subnet";
+                const msg = std.fmt.bufPrint(&form.err_buf, "  Gateway not in {s}", .{form.subnet_buf[0..form.subnet_len]}) catch "  Gateway not on pool subnet";
                 form.err_len = msg.len;
-                @memcpy(form.err_buf[0..msg.len], msg);
                 return;
             }
         }
