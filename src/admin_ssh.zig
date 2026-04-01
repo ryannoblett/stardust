@@ -4035,18 +4035,6 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
     lc += 1;
     lines_buf[lc] = .{ .label = "", .value = "", .is_section = false, .edit_idx = null };
     lc += 1;
-    lines_buf[lc] = .{ .label = "-- Admin SSH --", .value = "", .is_section = true, .edit_idx = null };
-    lc += 1;
-    lines_buf[lc] = .{ .label = "Enable", .value = if (cfg.admin_ssh.enable) "true" else "false", .is_section = false, .edit_idx = null };
-    lc += 1;
-    lines_buf[lc] = .{ .label = "Port", .value = try std.fmt.allocPrint(fa, "{d}", .{cfg.admin_ssh.port}), .is_section = false, .edit_idx = null };
-    lc += 1;
-    lines_buf[lc] = .{ .label = "Bind", .value = cfg.admin_ssh.bind, .is_section = false, .edit_idx = null };
-    lc += 1;
-    lines_buf[lc] = .{ .label = "Read Only", .value = if (cfg.admin_ssh.read_only) "true" else "false", .is_section = false, .edit_idx = null };
-    lc += 1;
-    lines_buf[lc] = .{ .label = "", .value = "", .is_section = false, .edit_idx = null };
-    lc += 1;
     lines_buf[lc] = .{ .label = "-- Metrics --", .value = "", .is_section = true, .edit_idx = null };
     lc += 1;
     lines_buf[lc] = .{ .label = "Collect", .value = edit_vals[1], .is_section = false, .edit_idx = 1 };
@@ -4056,6 +4044,18 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
     lines_buf[lc] = .{ .label = "HTTP Port", .value = edit_vals[3], .is_section = false, .edit_idx = 3 };
     lc += 1;
     lines_buf[lc] = .{ .label = "HTTP Bind", .value = edit_vals[4], .is_section = false, .edit_idx = 4 };
+    lc += 1;
+    lines_buf[lc] = .{ .label = "", .value = "", .is_section = false, .edit_idx = null };
+    lc += 1;
+    lines_buf[lc] = .{ .label = "-- Admin SSH --", .value = "", .is_section = true, .edit_idx = null };
+    lc += 1;
+    lines_buf[lc] = .{ .label = "Enable", .value = if (cfg.admin_ssh.enable) "true" else "false", .is_section = false, .edit_idx = null };
+    lc += 1;
+    lines_buf[lc] = .{ .label = "Port", .value = try std.fmt.allocPrint(fa, "{d}", .{cfg.admin_ssh.port}), .is_section = false, .edit_idx = null };
+    lc += 1;
+    lines_buf[lc] = .{ .label = "Bind", .value = cfg.admin_ssh.bind, .is_section = false, .edit_idx = null };
+    lc += 1;
+    lines_buf[lc] = .{ .label = "Read Only", .value = if (cfg.admin_ssh.read_only) "true" else "false", .is_section = false, .edit_idx = null };
     lc += 1;
 
     // Sync section.
@@ -4096,8 +4096,8 @@ fn renderSettingsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, 
         }
     }
 
-    // Clamp scroll so we can't scroll past the last line.
-    const max_scroll: u16 = if (lc > win.height) @intCast(lc - win.height) else 0;
+    // Clamp scroll: allow one blank line past the last data line.
+    const max_scroll: u16 = if (lc + 1 > win.height) @intCast(lc + 1 - win.height) else 0;
     if (state.settings_scroll > max_scroll) state.settings_scroll = max_scroll;
 
     // Render.
