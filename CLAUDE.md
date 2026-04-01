@@ -47,7 +47,7 @@ Releases are triggered by pushing a `v*` tag (e.g. `v0.3-alpha1`). The release w
 
 Before tagging a release:
 
-1. Add a `## v{version} (YYYY-MM-DD)` section to `CHANGELOG.md` with a feature summary
+1. Add a `## v{version} (YYYY-MM-DD)` section to `CHANGELOG.md` with a feature summary since the last release
 2. Commit the changelog update
 3. Tag the commit and push both the branch and the tag
 
