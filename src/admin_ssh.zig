@@ -3679,40 +3679,76 @@ fn poolFormFieldLen(form: *const PoolForm, idx: u8) usize {
     return (poolFormFieldVal(form, idx)).len;
 }
 
-fn validatePoolForm(form: *const PoolForm) ?[]const u8 {
-    // Subnet: must be x.x.x.x/N
+fn validatePoolForm(form: *PoolForm) ?[]const u8 {
+    // Subnet: must be valid CIDR.
     const subnet = form.subnet_buf[0..form.subnet_len];
     if (subnet.len == 0) return "Subnet is required (e.g. 192.168.1.0/24)";
     if (std.mem.indexOfScalar(u8, subnet, '/') == null) return "Subnet must include /prefix (e.g. 192.168.1.0/24)";
-    if (parseSubnet(subnet) == null) return "Invalid subnet format";
+    const si = parseSubnet(subnet) orelse return "Invalid subnet format";
 
-    // Router: must be valid IPv4
+    // Router: must be valid IPv4 inside the subnet.
     const router = form.router_buf[0..form.router_len];
     if (router.len == 0) return "Router is required";
-    _ = config_mod.parseIpv4(router) catch return "Invalid router IP";
+    const router_ip = config_mod.parseIpv4(router) catch return "Invalid router IP";
+    {
+        const r_int = std.mem.readInt(u32, &router_ip, .big);
+        const s_int = std.mem.readInt(u32, &si.ip, .big);
+        if (r_int & si.mask != s_int & si.mask) return "Router not in subnet";
+    }
 
-    // Pool start/end: optional but must be valid IPv4 if set
+    // Pool start: optional, must be valid IPv4 inside the subnet.
     if (form.pool_start_len > 0) {
-        _ = config_mod.parseIpv4(form.pool_start_buf[0..form.pool_start_len]) catch return "Invalid pool start IP";
-    }
-    if (form.pool_end_len > 0) {
-        _ = config_mod.parseIpv4(form.pool_end_buf[0..form.pool_end_len]) catch return "Invalid pool end IP";
+        const ps_ip = config_mod.parseIpv4(form.pool_start_buf[0..form.pool_start_len]) catch return "Invalid pool start IP";
+        const ps_int = std.mem.readInt(u32, &ps_ip, .big);
+        const s_int = std.mem.readInt(u32, &si.ip, .big);
+        if (ps_int & si.mask != s_int & si.mask) return "Pool start not in subnet";
     }
 
-    // Lease time: positive integer
+    // Pool end: optional, must be valid IPv4 inside the subnet.
+    if (form.pool_end_len > 0) {
+        const pe_ip = config_mod.parseIpv4(form.pool_end_buf[0..form.pool_end_len]) catch return "Invalid pool end IP";
+        const pe_int = std.mem.readInt(u32, &pe_ip, .big);
+        const s_int = std.mem.readInt(u32, &si.ip, .big);
+        if (pe_int & si.mask != s_int & si.mask) return "Pool end not in subnet";
+    }
+
+    // Domain name: auto-lowercase, validate characters.
+    if (form.domain_name_len > 0) {
+        for (form.domain_name_buf[0..form.domain_name_len]) |*ch| {
+            if (ch.* >= 'A' and ch.* <= 'Z') ch.* = ch.* - 'A' + 'a';
+        }
+        const dn = form.domain_name_buf[0..form.domain_name_len];
+        if (dn[0] < 'a' or dn[0] > 'z') return "Domain name must start with a letter";
+        for (dn) |ch| {
+            if (!((ch >= 'a' and ch <= 'z') or (ch >= '0' and ch <= '9') or ch == '.' or ch == '-' or ch == '_'))
+                return "Domain name: only a-z, 0-9, dots, dashes, underscores";
+        }
+    }
+
+    // DNS servers: comma-separated IPs.
+    if (form.dns_servers_len > 0) {
+        if (validateIpList(form.dns_servers_buf[0..form.dns_servers_len])) |e| return e;
+    }
+
+    // Lease time: positive integer, max 2 weeks (1209600 seconds).
     const lt = form.lease_time_buf[0..form.lease_time_len];
     if (lt.len == 0) return "Lease time is required";
-    _ = std.fmt.parseInt(u32, lt, 10) catch return "Lease time must be a positive number";
+    const lt_val = std.fmt.parseInt(u32, lt, 10) catch return "Lease time must be a positive number";
+    if (lt_val == 0) return "Lease time must be > 0";
+    if (lt_val > 1_209_600) return "Lease time max is 1209600 (2 weeks)";
 
-    // Time offset: optional signed integer
+    // Time offset: optional signed integer.
     if (form.time_offset_len > 0) {
         _ = std.fmt.parseInt(i32, form.time_offset_buf[0..form.time_offset_len], 10) catch return "Time offset must be an integer";
     }
 
-    // Comma-separated IP lists: validate each entry
-    if (form.dns_servers_len > 0) {
-        if (validateIpList(form.dns_servers_buf[0..form.dns_servers_len])) |e| return e;
+    // MTU: optional, 68-65535.
+    if (form.mtu_len > 0) {
+        const mtu_val = std.fmt.parseInt(u16, form.mtu_buf[0..form.mtu_len], 10) catch return "MTU must be a number (68-65535)";
+        if (mtu_val < 68) return "MTU minimum is 68";
     }
+
+    // IP lists: validate each entry.
     if (form.time_servers_len > 0) {
         if (validateIpList(form.time_servers_buf[0..form.time_servers_len])) |e| return e;
     }
@@ -3721,6 +3757,29 @@ fn validatePoolForm(form: *const PoolForm) ?[]const u8 {
     }
     if (form.ntp_servers_len > 0) {
         if (validateIpList(form.ntp_servers_buf[0..form.ntp_servers_len])) |e| return e;
+    }
+    if (form.wins_servers_len > 0) {
+        if (validateIpList(form.wins_servers_buf[0..form.wins_servers_len])) |e| return e;
+    }
+    if (form.cisco_tftp_len > 0) {
+        if (validateIpList(form.cisco_tftp_buf[0..form.cisco_tftp_len])) |e| return e;
+    }
+
+    // HTTP Boot URL: optional, must start with http:// or https://.
+    if (form.http_boot_url_len > 0) {
+        const url = form.http_boot_url_buf[0..form.http_boot_url_len];
+        const has_scheme = std.mem.startsWith(u8, url, "http://") or std.mem.startsWith(u8, url, "https://");
+        if (!has_scheme) return "HTTP Boot URL must start with http:// or https://";
+        // After scheme, must have at least a hostname character.
+        const after_scheme = if (std.mem.startsWith(u8, url, "https://")) url[8..] else url[7..];
+        if (after_scheme.len == 0) return "HTTP Boot URL missing hostname";
+        // Validate characters: alphanumeric, dots, dashes, slashes, colons, underscores, etc.
+        for (after_scheme) |ch| {
+            if (!((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or
+                ch == '.' or ch == '-' or ch == '/' or ch == ':' or ch == '_' or ch == '~' or
+                ch == '?' or ch == '&' or ch == '=' or ch == '%' or ch == '+' or ch == '#'))
+                return "HTTP Boot URL has invalid characters";
+        }
     }
 
     return null;
