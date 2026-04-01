@@ -41,6 +41,18 @@ main.zig → config.zig + state.zig + dns.zig + dhcp.zig + admin_ssh.zig + sync.
 - **libvaxis** — Terminal UI library for the SSH admin TUI (pure Zig, no C deps)
 - **libssh** — SSH server library (C, statically linked). Cross-compilation uses Nix bundles via `-Dlibssh_dir`
 
+## Releases
+
+Releases are triggered by pushing a `v*` tag (e.g. `v0.3-alpha1`). The release workflow requires a matching entry in `CHANGELOG.md` — the build **will fail** if one is missing.
+
+Before tagging a release:
+
+1. Add a `## v{version} (YYYY-MM-DD)` section to `CHANGELOG.md` with a feature summary
+2. Commit the changelog update
+3. Tag the commit and push both the branch and the tag
+
+The release workflow extracts the changelog section and uses it as the GitHub release body. DHCP option keys in YAML examples must be unquoted integers (e.g. `66:` not `"66":`) — zig-yaml does not support quoted map keys.
+
 ## Naming Conventions
 
 - Types (structs, enums, error sets): `PascalCase`
