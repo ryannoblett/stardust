@@ -728,14 +728,24 @@ pub const DHCPServer = struct {
     ///   2. ciaddr != 0 → pool whose subnet contains ciaddr (client renewal)
     ///   3. server_ip   → pool whose subnet contains the server's own IP (direct clients)
     ///   4. fallback    → first pool
-    fn selectPool(self: *Self, giaddr: [4]u8, ciaddr: [4]u8) *const config_mod.PoolConfig {
+    fn isPoolDisabled(self: *Self, pool: *const config_mod.PoolConfig) bool {
+        if (self.sync_mgr) |s| {
+            const subnet_ip = config_mod.parseIpv4(pool.subnet) catch return false;
+            return !s.isPoolEnabled(subnet_ip, pool.prefix_len);
+        }
+        return false;
+    }
+
+    fn selectPool(self: *Self, giaddr: [4]u8, ciaddr: [4]u8) ?*const config_mod.PoolConfig {
         const zero = [4]u8{ 0, 0, 0, 0 };
 
         if (!std.mem.eql(u8, &giaddr, &zero)) {
             const g_int = std.mem.readInt(u32, &giaddr, .big);
             for (self.cfg.pools) |*pool| {
                 const s = config_mod.parseIpv4(pool.subnet) catch continue;
-                if ((g_int & pool.subnet_mask) == std.mem.readInt(u32, &s, .big)) return pool;
+                if ((g_int & pool.subnet_mask) == std.mem.readInt(u32, &s, .big)) {
+                    if (!self.isPoolDisabled(pool)) return pool;
+                }
             }
         }
 
@@ -743,17 +753,25 @@ pub const DHCPServer = struct {
             const ci_int = std.mem.readInt(u32, &ciaddr, .big);
             for (self.cfg.pools) |*pool| {
                 const s = config_mod.parseIpv4(pool.subnet) catch continue;
-                if ((ci_int & pool.subnet_mask) == std.mem.readInt(u32, &s, .big)) return pool;
+                if ((ci_int & pool.subnet_mask) == std.mem.readInt(u32, &s, .big)) {
+                    if (!self.isPoolDisabled(pool)) return pool;
+                }
             }
         }
 
         const sv_int = std.mem.readInt(u32, &self.server_ip, .big);
         for (self.cfg.pools) |*pool| {
             const s = config_mod.parseIpv4(pool.subnet) catch continue;
-            if ((sv_int & pool.subnet_mask) == std.mem.readInt(u32, &s, .big)) return pool;
+            if ((sv_int & pool.subnet_mask) == std.mem.readInt(u32, &s, .big)) {
+                if (!self.isPoolDisabled(pool)) return pool;
+            }
         }
 
-        return &self.cfg.pools[0]; // fallback
+        // Fallback to first enabled pool.
+        for (self.cfg.pools) |*pool| {
+            if (!self.isPoolDisabled(pool)) return pool;
+        }
+        return null; // all pools disabled
     }
 
     /// Return the index of `pool` in cfg.pools (pointer arithmetic).
@@ -1368,7 +1386,7 @@ pub const DHCPServer = struct {
 
     fn createOffer(self: *Self, request: []const u8) !?[]u8 {
         const req_header: *const DHCPHeader = @ptrCast(@alignCast(request.ptr));
-        const pool = self.selectPool(req_header.giaddr, req_header.ciaddr);
+        const pool = self.selectPool(req_header.giaddr, req_header.ciaddr) orelse return null;
 
         const mac_bytes: [6]u8 = req_header.chaddr[0..6].*;
         const client_id_raw = getClientId(request);
@@ -1661,7 +1679,7 @@ pub const DHCPServer = struct {
     /// Returns a DHCPNAK packet if the requested IP is invalid.
     fn createAck(self: *Self, request: []const u8) !?[]u8 {
         const req_header: *const DHCPHeader = @ptrCast(@alignCast(request.ptr));
-        const pool = self.selectPool(req_header.giaddr, req_header.ciaddr);
+        const pool = self.selectPool(req_header.giaddr, req_header.ciaddr) orelse return null;
 
         // Option 54: ignore requests directed at a different server.
         if (getServerIdentifier(request)) |sid| {
@@ -2059,7 +2077,7 @@ pub const DHCPServer = struct {
     fn handleDecline(self: *Self, request: []const u8) void {
         if (request.len < dhcp_min_packet_size) return;
         const req_header: *const DHCPHeader = @ptrCast(@alignCast(request.ptr));
-        const pool = self.selectPool(req_header.giaddr, req_header.ciaddr);
+        const pool = self.selectPool(req_header.giaddr, req_header.ciaddr) orelse return;
 
         // Remove any existing offer-lease for this MAC.
         const mac_bytes = req_header.chaddr[0..6];
@@ -2246,7 +2264,7 @@ pub const DHCPServer = struct {
     /// yiaddr is 0 — no address is assigned. Returns configuration options only.
     fn handleInform(self: *Self, request: []const u8) !?[]u8 {
         const req_header: *const DHCPHeader = @ptrCast(@alignCast(request.ptr));
-        const pool = self.selectPool(req_header.giaddr, req_header.ciaddr);
+        const pool = self.selectPool(req_header.giaddr, req_header.ciaddr) orelse return null;
         const server_ip = self.server_ip;
 
         logRelayAgentInfo(request);
@@ -4348,7 +4366,7 @@ test "selectPool: giaddr in pool[1] subnet routes to pool[1]" {
     defer server.deinit();
 
     const pool = server.selectPool([4]u8{ 10, 0, 0, 1 }, [4]u8{ 0, 0, 0, 0 });
-    try std.testing.expectEqual(&server.cfg.pools[1], pool);
+    try std.testing.expectEqual(&server.cfg.pools[1], pool.?);
 }
 
 test "selectPool: ciaddr in pool[1] subnet routes to pool[1] when giaddr is zero" {
@@ -4361,7 +4379,7 @@ test "selectPool: ciaddr in pool[1] subnet routes to pool[1] when giaddr is zero
     defer server.deinit();
 
     const pool = server.selectPool([4]u8{ 0, 0, 0, 0 }, [4]u8{ 10, 0, 0, 50 });
-    try std.testing.expectEqual(&server.cfg.pools[1], pool);
+    try std.testing.expectEqual(&server.cfg.pools[1], pool.?);
 }
 
 test "selectPool: giaddr takes priority over ciaddr in different pool" {
@@ -4375,7 +4393,7 @@ test "selectPool: giaddr takes priority over ciaddr in different pool" {
 
     // giaddr in pool[0], ciaddr in pool[1] → pool[0] must win
     const pool = server.selectPool([4]u8{ 192, 168, 1, 10 }, [4]u8{ 10, 0, 0, 50 });
-    try std.testing.expectEqual(&server.cfg.pools[0], pool);
+    try std.testing.expectEqual(&server.cfg.pools[0], pool.?);
 }
 
 test "selectPool: matches server_ip pool when giaddr and ciaddr are zero" {
@@ -4389,7 +4407,7 @@ test "selectPool: matches server_ip pool when giaddr and ciaddr are zero" {
     defer server.deinit();
 
     const pool = server.selectPool([4]u8{ 0, 0, 0, 0 }, [4]u8{ 0, 0, 0, 0 });
-    try std.testing.expectEqual(&server.cfg.pools[0], pool);
+    try std.testing.expectEqual(&server.cfg.pools[0], pool.?);
 }
 
 test "selectPool: falls back to pool[0] when nothing matches" {
@@ -4405,7 +4423,7 @@ test "selectPool: falls back to pool[0] when nothing matches" {
     defer server.deinit();
 
     const pool = server.selectPool([4]u8{ 0, 0, 0, 0 }, [4]u8{ 0, 0, 0, 0 });
-    try std.testing.expectEqual(&server.cfg.pools[0], pool);
+    try std.testing.expectEqual(&server.cfg.pools[0], pool.?);
 }
 
 // ---------------------------------------------------------------------------

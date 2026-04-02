@@ -3173,17 +3173,40 @@ fn renderPoolsTab(server: *AdminServer, state: *TuiState, win: vaxis.Window, fa:
         const row_win = win.child(.{ .x_off = 0, .y_off = @intCast(ri + 1), .width = win.width, .height = 1 });
         row_win.fill(.{ .style = row_style });
 
-        const fields = [6][]const u8{ rd.subnet, rd.range, rd.router, rd.lease, rd.res, rd.dns };
-        var x: i17 = 0;
-        for (0..6) |ci| {
-            if (widths[ci] > 0) {
-                const cell = row_win.child(.{ .x_off = x, .y_off = 0, .width = widths[ci], .height = 1 });
-                const spec = POOL_COL_SPECS[ci];
-                const raw = try truncateCell(fa, fields[ci], widths[ci], spec.left_trunc);
-                const text = if (spec.right_align) try rightAlignText(fa, raw, widths[ci]) else raw;
-                _ = cell.print(&.{.{ .text = text, .style = row_style }}, .{ .wrap = .none });
+        // Check if pool is disabled by sync.
+        const pool_disabled = if (server.sync_mgr) |s| blk: {
+            const sip = config_mod.parseIpv4(server.cfg.pools[rd.orig_idx].subnet) catch break :blk false;
+            break :blk !s.isPoolEnabled(sip, server.cfg.pools[rd.orig_idx].prefix_len);
+        } else false;
+
+        if (pool_disabled) {
+            // Render subnet normally in first column, then bold red mismatch text spanning the rest.
+            var x: i17 = 0;
+            if (widths[0] > 0) {
+                const cell = row_win.child(.{ .x_off = x, .y_off = 0, .width = widths[0], .height = 1 });
+                const raw = try truncateCell(fa, rd.subnet, widths[0], false);
+                _ = cell.print(&.{.{ .text = raw, .style = row_style }}, .{ .wrap = .none });
             }
-            x += @as(i17, widths[ci]) + LEASE_COL_SEP;
+            x += @as(i17, widths[0]) + LEASE_COL_SEP;
+            const mismatch_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 60, 60 } }, .bg = row_bg, .bold = true };
+            const remaining_w = @as(u16, @intCast(@max(0, @as(i17, win.width) - x)));
+            if (remaining_w > 0) {
+                const mismatch_cell = row_win.child(.{ .x_off = x, .y_off = 0, .width = remaining_w, .height = 1 });
+                _ = mismatch_cell.print(&.{.{ .text = "CONFIG MISMATCH, DISABLED", .style = mismatch_style }}, .{ .wrap = .none });
+            }
+        } else {
+            const fields = [6][]const u8{ rd.subnet, rd.range, rd.router, rd.lease, rd.res, rd.dns };
+            var x: i17 = 0;
+            for (0..6) |ci| {
+                if (widths[ci] > 0) {
+                    const cell = row_win.child(.{ .x_off = x, .y_off = 0, .width = widths[ci], .height = 1 });
+                    const spec = POOL_COL_SPECS[ci];
+                    const raw = try truncateCell(fa, fields[ci], widths[ci], spec.left_trunc);
+                    const text = if (spec.right_align) try rightAlignText(fa, raw, widths[ci]) else raw;
+                    _ = cell.print(&.{.{ .text = text, .style = row_style }}, .{ .wrap = .none });
+                }
+                x += @as(i17, widths[ci]) + LEASE_COL_SEP;
+            }
         }
     }
 }
