@@ -1,9 +1,9 @@
 /// DHCP Lease Synchronisation (Redundant Server Group)
 ///
-/// Implements the stardust-dhcp-sync-v1 protocol:
+/// Implements the stardust-dhcp-sync-v2 protocol:
 ///   - UDP datagrams on port 647 (default)
 ///   - AES-256-GCM payload encryption (key derived via HKDF-SHA-256 from TSIG secret)
-///   - SHA-256 pool hash for peer admission control
+///   - Per-pool SHA-256 hashes with voting for pool enable/disable
 ///   - Last-write-wins conflict resolution via last_modified timestamp on each lease
 ///
 /// Wire format (every datagram):
@@ -45,10 +45,29 @@ const NakReason = enum(u8) {
     wrong_group = 1,
     pool_hash_mismatch = 2,
     timestamp_out_of_window = 3,
+    version_mismatch = 4,
     _,
 };
 
 const anti_replay_window: i64 = 300; // seconds
+const HELLO_PROTOCOL_VERSION: u8 = 2;
+const max_local_pools: u8 = 32;
+const startup_sync_timeout_s: i64 = 5;
+
+const PoolSyncState = struct {
+    subnet_ip: [4]u8,
+    prefix_len: u8,
+    local_hash: [32]u8,
+    enabled: std.atomic.Value(bool),
+};
+
+const PeerPoolHash = struct {
+    subnet_ip: [4]u8,
+    prefix_len: u8,
+    hash: [32]u8,
+};
+
+const max_pools_per_peer: u8 = 32;
 
 // ---------------------------------------------------------------------------
 // SyncManager
@@ -61,7 +80,9 @@ pub const SyncManager = struct {
     cfg_path: []const u8, // config file path for reservation write-back
     store: *state_mod.StateStore,
     aes_key: [32]u8,
-    pool_hash: [32]u8,
+    pool_states: [max_local_pools]PoolSyncState,
+    pool_states_len: u8,
+    self_ip: u32, // host-order IP for voting tie-break
     sock_fd: std.posix.fd_t,
     peers: std.ArrayList(Peer),
     last_full_sync: i64,
@@ -80,6 +101,9 @@ pub const SyncManager = struct {
         authenticated: bool,
         last_seen: i64,
         last_hello_sent: i64, // for retry logic (unauthenticated peers)
+        peer_pool_hashes: [max_pools_per_peer]PeerPoolHash,
+        peer_pool_hashes_len: u8,
+        peer_ip: u32, // host-order IP for voting tie-break
     };
 
     const Self = @This();
@@ -90,7 +114,6 @@ pub const SyncManager = struct {
         full_cfg: *config_mod.Config,
         cfg_path: []const u8,
         store: *state_mod.StateStore,
-        pool_hash: [32]u8,
     ) !*Self {
         const self = try allocator.create(Self);
         errdefer allocator.destroy(self);
@@ -99,6 +122,10 @@ pub const SyncManager = struct {
         var tsig_key = try dns_mod.parseTsigKey(allocator, cfg.key_file);
         defer tsig_key.deinit();
         const aes_key = deriveKey(tsig_key.secret);
+
+        // Compute self_ip from listen_address for voting tie-break
+        const self_ip_bytes = parseIpv4Local(full_cfg.listen_address) catch [4]u8{ 0, 0, 0, 0 };
+        const self_ip = std.mem.readInt(u32, &self_ip_bytes, .big);
 
         // Create UDP socket
         const sock_fd = try std.posix.socket(
@@ -141,13 +168,16 @@ pub const SyncManager = struct {
             .cfg_path = cfg_path,
             .store = store,
             .aes_key = aes_key,
-            .pool_hash = pool_hash,
+            .pool_states = undefined,
+            .pool_states_len = 0,
+            .self_ip = self_ip,
             .sock_fd = sock_fd,
             .peers = std.ArrayList(Peer){},
             .last_full_sync = 0,
             .last_keepalive = 0,
             .authenticated_count = std.atomic.Value(u32).init(0),
         };
+        self.computeLocalPoolStates();
 
         // Seed configured unicast peers (unauthenticated initially)
         for (cfg.peers) |peer_ip| {
@@ -165,6 +195,9 @@ pub const SyncManager = struct {
                 .authenticated = false,
                 .last_seen = 0,
                 .last_hello_sent = 0,
+                .peer_pool_hashes = undefined,
+                .peer_pool_hashes_len = 0,
+                .peer_ip = 0,
             });
         }
 
@@ -182,20 +215,166 @@ pub const SyncManager = struct {
         self.allocator.destroy(self);
     }
 
-    /// Update pool hash (called on SIGHUP if config changed). Disconnects all
-    /// peers so they re-authenticate with the new hash.
-    pub fn updatePoolHash(self: *Self, new_hash: [32]u8) void {
-        if (std.mem.eql(u8, &new_hash, &self.pool_hash)) return;
-        self.pool_hash = new_hash;
-        // Remove all authenticated peers; they need to re-handshake.
-        var was_auth: u32 = 0;
+    /// Update pool states after a config reload (SIGHUP). Recomputes per-pool
+    /// hashes, deauthenticates all peers (forcing re-handshake), and re-evaluates
+    /// pool enable/disable state.
+    pub fn updatePoolStates(self: *Self, new_cfg: *config_mod.Config) void {
+        self.full_cfg = new_cfg;
+        self.computeLocalPoolStates();
+        // Deauthenticate all peers — they need to re-handshake.
         for (self.peers.items) |*p| {
-            if (p.authenticated) was_auth += 1;
-            p.authenticated = false;
+            if (p.authenticated) {
+                p.authenticated = false;
+                p.peer_pool_hashes_len = 0;
+            }
         }
-        _ = self.authenticated_count.fetchSub(was_auth, .monotonic);
+        self.authenticated_count.store(0, .release);
+        self.reevaluatePoolStates();
         self.sendHelloAll();
-        std.log.info("sync: pool hash changed, re-authenticating all peers", .{});
+        std.log.info("sync: pool states recomputed, re-authenticating all peers", .{});
+    }
+
+    /// Compute per-pool hash states from the current config.
+    fn computeLocalPoolStates(self: *Self) void {
+        self.pool_states_len = @intCast(@min(self.full_cfg.pools.len, max_local_pools));
+        for (self.full_cfg.pools[0..self.pool_states_len], 0..) |*pool, i| {
+            const subnet_ip = config_mod.parseIpv4(pool.subnet) catch [4]u8{ 0, 0, 0, 0 };
+            self.pool_states[i] = .{
+                .subnet_ip = subnet_ip,
+                .prefix_len = pool.prefix_len,
+                .local_hash = config_mod.computePerPoolHash(pool, self.full_cfg.mac_classes),
+                .enabled = std.atomic.Value(bool).init(true),
+            };
+        }
+    }
+
+    /// Voting algorithm: for each local pool, collect votes from self + all
+    /// authenticated peers. The hash with the most votes wins; ties broken by
+    /// lowest peer IP. If our local hash matches the winner, the pool stays
+    /// enabled; otherwise it is disabled.
+    fn reevaluatePoolStates(self: *Self) void {
+        for (self.pool_states[0..self.pool_states_len]) |*ps| {
+            const VoteEntry = struct { hash: [32]u8, count: u8, lowest_ip: u32 };
+            var votes: [max_peers + 1]VoteEntry = undefined;
+            var vote_count: usize = 0;
+
+            // Self vote
+            votes[0] = .{ .hash = ps.local_hash, .count = 1, .lowest_ip = self.self_ip };
+            vote_count = 1;
+
+            // Peer votes
+            for (self.peers.items) |*peer| {
+                if (!peer.authenticated) continue;
+                for (peer.peer_pool_hashes[0..peer.peer_pool_hashes_len]) |pph| {
+                    if (std.mem.eql(u8, &pph.subnet_ip, &ps.subnet_ip) and pph.prefix_len == ps.prefix_len) {
+                        // Find or create vote entry for this hash
+                        var found = false;
+                        for (votes[0..vote_count]) |*v| {
+                            if (std.mem.eql(u8, &v.hash, &pph.hash)) {
+                                v.count += 1;
+                                v.lowest_ip = @min(v.lowest_ip, peer.peer_ip);
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found and vote_count < votes.len) {
+                            votes[vote_count] = .{ .hash = pph.hash, .count = 1, .lowest_ip = peer.peer_ip };
+                            vote_count += 1;
+                        }
+                        break;
+                    }
+                }
+            }
+
+            // Find winner: highest count, then lowest IP on tie
+            var winner_idx: usize = 0;
+            for (1..vote_count) |i| {
+                if (votes[i].count > votes[winner_idx].count or
+                    (votes[i].count == votes[winner_idx].count and votes[i].lowest_ip < votes[winner_idx].lowest_ip))
+                {
+                    winner_idx = i;
+                }
+            }
+
+            const should_enable = std.mem.eql(u8, &votes[winner_idx].hash, &ps.local_hash);
+            const was_enabled = ps.enabled.load(.acquire);
+            ps.enabled.store(should_enable, .release);
+
+            if (!should_enable and was_enabled) {
+                std.log.warn("sync: pool {d}.{d}.{d}.{d}/{d} disabled: config mismatch, winning peer has different config", .{
+                    ps.subnet_ip[0], ps.subnet_ip[1], ps.subnet_ip[2], ps.subnet_ip[3], ps.prefix_len,
+                });
+            } else if (should_enable and !was_enabled) {
+                std.log.info("sync: pool {d}.{d}.{d}.{d}/{d} re-enabled: config now matches peers", .{
+                    ps.subnet_ip[0], ps.subnet_ip[1], ps.subnet_ip[2], ps.subnet_ip[3], ps.prefix_len,
+                });
+            }
+        }
+    }
+
+    /// Check if a pool is enabled for serving. Returns true for unknown pools (conservative).
+    pub fn isPoolEnabled(self: *const Self, subnet_ip: [4]u8, prefix_len: u8) bool {
+        for (self.pool_states[0..self.pool_states_len]) |*ps| {
+            if (std.mem.eql(u8, &ps.subnet_ip, &subnet_ip) and ps.prefix_len == prefix_len) {
+                return ps.enabled.load(.acquire);
+            }
+        }
+        return true; // unknown pool = enabled (conservative)
+    }
+
+    /// Wait for initial peer sync at startup. Polls for incoming packets
+    /// up to startup_sync_timeout_s seconds. After timeout (or first peer auth),
+    /// evaluates pool states and logs any disabled pools.
+    pub fn waitForInitialSync(self: *Self) void {
+        if (self.peers.items.len == 0) return; // no peers configured
+        std.log.info("sync: waiting up to {d}s for peer responses...", .{startup_sync_timeout_s});
+        const deadline = std.time.timestamp() + startup_sync_timeout_s;
+        while (std.time.timestamp() < deadline) {
+            self.pollOnce(1000);
+            if (self.authenticated_count.load(.acquire) > 0) {
+                std.log.info("sync: peer authenticated, evaluating pool states", .{});
+                break;
+            }
+        }
+        self.reevaluatePoolStates();
+        // Log results
+        for (self.pool_states[0..self.pool_states_len]) |*ps| {
+            if (!ps.enabled.load(.acquire)) {
+                std.log.warn("sync: pool {d}.{d}.{d}.{d}/{d} DISABLED at startup due to config mismatch", .{
+                    ps.subnet_ip[0], ps.subnet_ip[1], ps.subnet_ip[2], ps.subnet_ip[3], ps.prefix_len,
+                });
+            }
+        }
+    }
+
+    /// Poll for a single round of incoming packets with the given timeout in ms.
+    /// Uses poll(2) to wait for data, then drains all available packets.
+    fn pollOnce(self: *Self, timeout_ms: i32) void {
+        var pfd = [1]std.posix.pollfd{.{
+            .fd = self.sock_fd,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        _ = std.posix.poll(&pfd, timeout_ms) catch return;
+        if (pfd[0].revents & std.posix.POLL.IN != 0) {
+            self.handlePacket();
+        }
+    }
+
+    /// Check if an IP string belongs to a pool that is currently disabled.
+    /// Uses pool_states directly (no full_cfg dereference needed).
+    fn isIpInDisabledPool(self: *Self, ip_str: []const u8) bool {
+        if (self.pool_states_len == 0) return false;
+        const ip_bytes = parseIpv4Local(ip_str) catch return false;
+        const ip_int = std.mem.readInt(u32, &ip_bytes, .big);
+        for (self.pool_states[0..self.pool_states_len]) |*ps| {
+            const subnet_int = std.mem.readInt(u32, &ps.subnet_ip, .big);
+            const mask: u32 = if (ps.prefix_len == 0) 0 else @as(u32, 0xFFFFFFFF) << @intCast(32 - @as(u6, @intCast(ps.prefix_len)));
+            if ((ip_int & mask) == (subnet_int & mask)) {
+                return !ps.enabled.load(.acquire);
+            }
+        }
+        return false; // no matching pool = not disabled
     }
 
     /// Returns true if at least one peer is currently authenticated.
@@ -237,6 +416,7 @@ pub const SyncManager = struct {
                 if (isConfiguredPeer(self, p)) {
                     p.authenticated = false;
                     p.last_seen = 0;
+                    p.peer_pool_hashes_len = 0;
                     _ = self.authenticated_count.fetchSub(1, .monotonic);
                     i += 1;
                 } else {
@@ -261,8 +441,9 @@ pub const SyncManager = struct {
                     .port = std.mem.nativeToBig(u16, self.cfg.port),
                     .addr = @bitCast(mc_ip),
                 };
-                var hello_p = self.buildHelloPayload();
-                self.sendMsg(mc_addr, .hello, hello_p[0..self.helloPayloadLen()]);
+                var hello_buf: [hello_max_payload]u8 = undefined;
+                const hello_len = self.buildHelloPayload(&hello_buf);
+                self.sendMsg(mc_addr, .hello, hello_buf[0..hello_len]);
             }
             self.last_keepalive = now;
         }
@@ -270,8 +451,9 @@ pub const SyncManager = struct {
         // Retry HELLO to unauthenticated unicast peers
         for (self.peers.items) |*p| {
             if (!p.authenticated and now - p.last_hello_sent >= hello_retry_interval_s) {
-                var retry_p = self.buildHelloPayload();
-                self.sendMsg(p.addr, .hello, retry_p[0..self.helloPayloadLen()]);
+                var retry_buf: [hello_max_payload]u8 = undefined;
+                const retry_len = self.buildHelloPayload(&retry_buf);
+                self.sendMsg(p.addr, .hello, retry_buf[0..retry_len]);
                 p.last_hello_sent = now;
             }
         }
@@ -499,7 +681,8 @@ pub const SyncManager = struct {
     }
 
     fn sendHelloAll(self: *Self) void {
-        const payload = self.buildHelloPayload();
+        var payload: [hello_max_payload]u8 = undefined;
+        const len = self.buildHelloPayload(&payload);
         if (self.cfg.multicast) |mc| {
             const mc_ip = parseIpv4Local(mc) catch return;
             const mc_addr = std.posix.sockaddr.in{
@@ -507,30 +690,48 @@ pub const SyncManager = struct {
                 .port = std.mem.nativeToBig(u16, self.cfg.port),
                 .addr = @bitCast(mc_ip),
             };
-            self.sendMsg(mc_addr, .hello, &payload);
+            self.sendMsg(mc_addr, .hello, payload[0..len]);
         }
         for (self.peers.items) |*p| {
             if (!p.authenticated) {
-                self.sendMsg(p.addr, .hello, &payload);
+                self.sendMsg(p.addr, .hello, payload[0..len]);
                 p.last_hello_sent = std.time.timestamp();
             }
         }
     }
 
-    /// Build a HELLO/HELLO_ACK payload: version(u8) group_name_len(u8) group_name pool_hash[32]
-    fn buildHelloPayload(self: *Self) [2 + 255 + 32]u8 {
-        var payload: [2 + 255 + 32]u8 = undefined;
-        payload[0] = wire_version;
+    /// Maximum HELLO payload size: version(1) + gn_len(1) + group_name(255) + pool_count(1) + 32 * 37
+    const hello_max_payload: usize = 1 + 1 + 255 + 1 + @as(usize, max_local_pools) * 37;
+
+    /// Build a v2 HELLO/HELLO_ACK payload into the provided buffer.
+    /// Format: [version:u8=2][gn_len:u8][group_name:N][pool_count:u8]
+    ///         for each pool: [subnet_ip:4][prefix_len:1][hash:32]
+    /// Returns the number of bytes written.
+    fn buildHelloPayload(self: *Self, buf: []u8) usize {
+        var off: usize = 0;
+        buf[off] = HELLO_PROTOCOL_VERSION;
+        off += 1;
         const gn = self.cfg.group_name;
         const gn_len: u8 = @intCast(@min(gn.len, 255));
-        payload[1] = gn_len;
-        @memcpy(payload[2 .. 2 + gn_len], gn[0..gn_len]);
-        @memcpy(payload[2 + gn_len .. 2 + gn_len + 32], &self.pool_hash);
-        return payload;
+        buf[off] = gn_len;
+        off += 1;
+        @memcpy(buf[off .. off + gn_len], gn[0..gn_len]);
+        off += gn_len;
+        buf[off] = self.pool_states_len;
+        off += 1;
+        for (self.pool_states[0..self.pool_states_len]) |*ps| {
+            @memcpy(buf[off .. off + 4], &ps.subnet_ip);
+            off += 4;
+            buf[off] = ps.prefix_len;
+            off += 1;
+            @memcpy(buf[off .. off + 32], &ps.local_hash);
+            off += 32;
+        }
+        return off;
     }
 
     fn helloPayloadLen(self: *Self) usize {
-        return 2 + @min(self.cfg.group_name.len, 255) + 32;
+        return 1 + 1 + @min(self.cfg.group_name.len, 255) + 1 + @as(usize, self.pool_states_len) * 37;
     }
 
     // -----------------------------------------------------------------------
@@ -547,10 +748,9 @@ pub const SyncManager = struct {
             .hello_ack => self.processHello(src, result.plaintext, true),
             .hello_nak => self.processHelloNak(src, result.plaintext),
             // Lease and hash messages require the peer to be authenticated
-            // (pool hash matched during the HELLO handshake).  After a pool
-            // config change, updatePoolHash() marks all peers unauthenticated,
-            // so stale-config peers are locked out until they re-handshake with
-            // a matching hash.
+            // (group name matched during the HELLO handshake).  After a pool
+            // config change, updatePoolStates() marks all peers unauthenticated,
+            // so stale-config peers are locked out until they re-handshake.
             .lease_update, .lease_delete, .keepalive, .lease_hash => {
                 const peer = self.findPeer(src) orelse return;
                 if (!peer.authenticated) {
@@ -572,10 +772,24 @@ pub const SyncManager = struct {
 
     fn processHello(self: *Self, src: std.posix.sockaddr.in, plaintext: []const u8, is_ack: bool) void {
         if (plaintext.len < 2) return;
+        const version = plaintext[0];
+
+        // Reject v1 peers
+        if (version == 1) {
+            std.log.warn("sync: HELLO from v1 peer, sending NAK version_mismatch", .{});
+            var nak: [1]u8 = .{@intFromEnum(NakReason.version_mismatch)};
+            self.sendMsg(src, .hello_nak, &nak);
+            return;
+        }
+        if (version != HELLO_PROTOCOL_VERSION) {
+            std.log.warn("sync: HELLO with unknown version {d}, ignoring", .{version});
+            return;
+        }
+
         const gn_len = plaintext[1];
-        if (plaintext.len < 2 + gn_len + 32) return;
+        // Minimum: version(1) + gn_len(1) + group_name(gn_len) + pool_count(1)
+        if (plaintext.len < 2 + @as(usize, gn_len) + 1) return;
         const group_name = plaintext[2 .. 2 + gn_len];
-        const peer_pool_hash = plaintext[2 + gn_len .. 2 + gn_len + 32];
 
         // Validate group name
         if (!std.mem.eql(u8, group_name, self.cfg.group_name)) {
@@ -585,15 +799,7 @@ pub const SyncManager = struct {
             return;
         }
 
-        // Validate pool hash
-        if (!std.mem.eql(u8, peer_pool_hash, &self.pool_hash)) {
-            std.log.warn("sync: HELLO with pool hash mismatch, sending NAK", .{});
-            var nak: [1]u8 = .{@intFromEnum(NakReason.pool_hash_mismatch)};
-            self.sendMsg(src, .hello_nak, &nak);
-            return;
-        }
-
-        // Admit or update peer
+        // Authenticate peer (group name match is sufficient in v2)
         const now = std.time.timestamp();
         const peer = self.findOrAddPeer(src) catch return;
         const was_authenticated = peer.authenticated;
@@ -601,11 +807,35 @@ pub const SyncManager = struct {
         peer.last_seen = now;
         if (!was_authenticated) _ = self.authenticated_count.fetchAdd(1, .monotonic);
 
+        // Extract peer IP from source address (network-order → host-order)
+        const peer_ip_bytes: [4]u8 = @bitCast(src.addr);
+        peer.peer_ip = std.mem.readInt(u32, &peer_ip_bytes, .big);
+
+        // Parse per-pool hashes from payload
+        var off: usize = 2 + @as(usize, gn_len);
+        const pool_count = plaintext[off];
+        off += 1;
+        peer.peer_pool_hashes_len = @intCast(@min(pool_count, max_pools_per_peer));
+        var parsed: u8 = 0;
+        while (parsed < pool_count and off + 37 <= plaintext.len and parsed < max_pools_per_peer) : (parsed += 1) {
+            peer.peer_pool_hashes[parsed] = .{
+                .subnet_ip = plaintext[off..][0..4].*,
+                .prefix_len = plaintext[off + 4],
+                .hash = plaintext[off + 5 ..][0..32].*,
+            };
+            off += 37;
+        }
+        peer.peer_pool_hashes_len = parsed;
+
         if (!is_ack) {
             // Send HELLO_ACK back
-            const payload = self.buildHelloPayload();
-            self.sendMsg(src, .hello_ack, payload[0..self.helloPayloadLen()]);
+            var ack_buf: [hello_max_payload]u8 = undefined;
+            const ack_len = self.buildHelloPayload(&ack_buf);
+            self.sendMsg(src, .hello_ack, ack_buf[0..ack_len]);
         }
+
+        // Re-evaluate pool enable/disable states
+        self.reevaluatePoolStates();
 
         // Exchange lease hashes immediately
         var lh: [32]u8 = self.computeLeaseHash();
@@ -626,6 +856,7 @@ pub const SyncManager = struct {
             .wrong_group => std.log.warn("sync: received HELLO_NAK: wrong group name", .{}),
             .pool_hash_mismatch => std.log.warn("sync: received HELLO_NAK: pool hash mismatch (ensure identical subnet/pool/reservation config)", .{}),
             .timestamp_out_of_window => std.log.warn("sync: received HELLO_NAK: timestamp out of anti-replay window (check NTP sync)", .{}),
+            .version_mismatch => std.log.warn("sync: received HELLO_NAK: version mismatch (peer requires protocol v2)", .{}),
             else => std.log.warn("sync: received HELLO_NAK: unknown reason {d}", .{@intFromEnum(reason)}),
         }
     }
@@ -659,6 +890,12 @@ pub const SyncManager = struct {
         // server retains local=true (persisted in leases.json) and handles DNS for its leases.
         var incoming = parsed.value;
         incoming.local = false;
+
+        // Reject updates for IPs in disabled pools
+        if (self.isIpInDisabledPool(incoming.ip)) {
+            log_v.debug("sync: rejecting lease update for {s}: pool disabled", .{incoming.ip});
+            return;
+        }
 
         // Last-write-wins: only apply if incoming is newer
         if (self.store.leases.get(incoming.mac)) |existing| {
@@ -701,6 +938,15 @@ pub const SyncManager = struct {
     fn applyLeaseDelete(self: *Self, plaintext: []const u8) void {
         // plaintext is the MAC string (17 bytes "xx:xx:xx:xx:xx:xx")
         if (plaintext.len == 0) return;
+
+        // Reject deletes for IPs in disabled pools
+        if (self.store.leases.get(plaintext)) |existing| {
+            if (self.isIpInDisabledPool(existing.ip)) {
+                log_v.debug("sync: rejecting lease delete for {s}: pool disabled", .{existing.ip});
+                return;
+            }
+        }
+
         self.store.removeLease(plaintext);
         log_v.debug("sync: received lease delete {f}", .{util.escapedStr(plaintext)});
     }
@@ -741,6 +987,9 @@ pub const SyncManager = struct {
             .authenticated = false,
             .last_seen = 0,
             .last_hello_sent = 0,
+            .peer_pool_hashes = undefined,
+            .peer_pool_hashes_len = 0,
+            .peer_ip = 0,
         });
         return &self.peers.items[self.peers.items.len - 1];
     }
@@ -1181,7 +1430,9 @@ fn makeTestManager(aes_key: [32]u8) SyncManager {
         .cfg_path = "",
         .store = undefined,
         .aes_key = aes_key,
-        .pool_hash = [_]u8{0} ** 32,
+        .pool_states = undefined,
+        .pool_states_len = 0,
+        .self_ip = 0,
         .sock_fd = -1,
         .peers = std.ArrayList(SyncManager.Peer){},
         .last_full_sync = 0,
@@ -1198,13 +1449,36 @@ fn makeTestManagerWithStore(aes_key: [32]u8, store: *state_mod.StateStore) SyncM
         .cfg_path = "",
         .store = store,
         .aes_key = aes_key,
-        .pool_hash = [_]u8{0} ** 32,
+        .pool_states = undefined,
+        .pool_states_len = 0,
+        .self_ip = 0,
         .sock_fd = -1,
         .peers = std.ArrayList(SyncManager.Peer){},
         .last_full_sync = 0,
         .last_keepalive = 0,
         .authenticated_count = std.atomic.Value(u32).init(0),
     };
+}
+
+fn makeTestManagerWithCfg(aes_key: [32]u8, full_cfg: *config_mod.Config, store: *state_mod.StateStore) SyncManager {
+    var mgr = SyncManager{
+        .allocator = std.testing.allocator,
+        .cfg = undefined,
+        .full_cfg = full_cfg,
+        .cfg_path = "",
+        .store = store,
+        .aes_key = aes_key,
+        .pool_states = undefined,
+        .pool_states_len = 0,
+        .self_ip = 0,
+        .sock_fd = -1,
+        .peers = std.ArrayList(SyncManager.Peer){},
+        .last_full_sync = 0,
+        .last_keepalive = 0,
+        .authenticated_count = std.atomic.Value(u32).init(0),
+    };
+    mgr.computeLocalPoolStates();
+    return mgr;
 }
 
 fn makeTestStateStore(alloc: std.mem.Allocator) !*state_mod.StateStore {
@@ -1454,4 +1728,339 @@ test "decrypt rejects unknown protocol version" {
     // version check. Either error is acceptable — the packet must be rejected.
     const err = mgr.decrypt(buf[0..n.?], &plain_buf);
     try std.testing.expect(err == error.UnknownVersion or err == error.AuthFailed);
+}
+
+// ---------------------------------------------------------------------------
+// Per-pool sync protocol (v2) tests
+// ---------------------------------------------------------------------------
+
+fn makeTestPeer(ip_u32: u32, authenticated: bool, pool_hashes: []const PeerPoolHash) SyncManager.Peer {
+    var peer = SyncManager.Peer{
+        .addr = std.posix.sockaddr.in{
+            .family = std.posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, 647),
+            .addr = std.mem.nativeToBig(u32, ip_u32),
+        },
+        .authenticated = authenticated,
+        .last_seen = std.time.timestamp(),
+        .last_hello_sent = 0,
+        .peer_pool_hashes = undefined,
+        .peer_pool_hashes_len = @intCast(pool_hashes.len),
+        .peer_ip = ip_u32,
+    };
+    for (pool_hashes, 0..) |ph, i| {
+        peer.peer_pool_hashes[i] = ph;
+    }
+    return peer;
+}
+
+test "reevaluatePoolStates: all match — all enabled" {
+    const alloc = std.testing.allocator;
+    var cfg = makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    const aes_key = SyncManager.deriveKey("reeval-all-match");
+    var mgr = makeTestManagerWithCfg(aes_key, &cfg, store);
+    defer mgr.peers.deinit(alloc);
+
+    // Add a peer with the same hash as us
+    const our_hash = mgr.pool_states[0].local_hash;
+    try mgr.peers.append(alloc, makeTestPeer(0x0A000002, true, &[_]PeerPoolHash{.{
+        .subnet_ip = mgr.pool_states[0].subnet_ip,
+        .prefix_len = mgr.pool_states[0].prefix_len,
+        .hash = our_hash,
+    }}));
+
+    mgr.reevaluatePoolStates();
+
+    try std.testing.expect(mgr.pool_states[0].enabled.load(.acquire));
+}
+
+test "reevaluatePoolStates: local minority — pool disabled" {
+    const alloc = std.testing.allocator;
+    var cfg = makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    const aes_key = SyncManager.deriveKey("reeval-minority");
+    var mgr = makeTestManagerWithCfg(aes_key, &cfg, store);
+    defer mgr.peers.deinit(alloc);
+
+    // Two peers with a different hash
+    const different_hash: [32]u8 = [_]u8{0xAB} ** 32;
+    try mgr.peers.append(alloc, makeTestPeer(0x0A000002, true, &[_]PeerPoolHash{.{
+        .subnet_ip = mgr.pool_states[0].subnet_ip,
+        .prefix_len = mgr.pool_states[0].prefix_len,
+        .hash = different_hash,
+    }}));
+    try mgr.peers.append(alloc, makeTestPeer(0x0A000003, true, &[_]PeerPoolHash{.{
+        .subnet_ip = mgr.pool_states[0].subnet_ip,
+        .prefix_len = mgr.pool_states[0].prefix_len,
+        .hash = different_hash,
+    }}));
+
+    mgr.reevaluatePoolStates();
+
+    // We are the minority (1 vs 2), so our pool should be disabled
+    try std.testing.expect(!mgr.pool_states[0].enabled.load(.acquire));
+}
+
+test "reevaluatePoolStates: local majority — pool stays enabled" {
+    const alloc = std.testing.allocator;
+    var cfg = makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    const aes_key = SyncManager.deriveKey("reeval-majority");
+    var mgr = makeTestManagerWithCfg(aes_key, &cfg, store);
+    defer mgr.peers.deinit(alloc);
+    mgr.self_ip = 0x0A000001; // 10.0.0.1
+
+    const our_hash = mgr.pool_states[0].local_hash;
+    const different_hash: [32]u8 = [_]u8{0xCD} ** 32;
+
+    // One peer matches us, one doesn't
+    try mgr.peers.append(alloc, makeTestPeer(0x0A000002, true, &[_]PeerPoolHash{.{
+        .subnet_ip = mgr.pool_states[0].subnet_ip,
+        .prefix_len = mgr.pool_states[0].prefix_len,
+        .hash = our_hash,
+    }}));
+    try mgr.peers.append(alloc, makeTestPeer(0x0A000003, true, &[_]PeerPoolHash{.{
+        .subnet_ip = mgr.pool_states[0].subnet_ip,
+        .prefix_len = mgr.pool_states[0].prefix_len,
+        .hash = different_hash,
+    }}));
+
+    mgr.reevaluatePoolStates();
+
+    // We have 2 votes, they have 1 — we should be enabled
+    try std.testing.expect(mgr.pool_states[0].enabled.load(.acquire));
+}
+
+test "reevaluatePoolStates: tie broken by lowest IP" {
+    const alloc = std.testing.allocator;
+    var cfg = makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    const aes_key = SyncManager.deriveKey("reeval-tie-break");
+    var mgr = makeTestManagerWithCfg(aes_key, &cfg, store);
+    defer mgr.peers.deinit(alloc);
+
+    // Set our IP higher than the peer's
+    mgr.self_ip = 0x0A000005; // 10.0.0.5
+
+    // One peer with a different hash and lower IP
+    const different_hash: [32]u8 = [_]u8{0xEF} ** 32;
+    try mgr.peers.append(alloc, makeTestPeer(0x0A000001, true, &[_]PeerPoolHash{.{
+        .subnet_ip = mgr.pool_states[0].subnet_ip,
+        .prefix_len = mgr.pool_states[0].prefix_len,
+        .hash = different_hash,
+    }}));
+
+    mgr.reevaluatePoolStates();
+
+    // 1 vote each, peer has lower IP → peer wins → our pool disabled
+    try std.testing.expect(!mgr.pool_states[0].enabled.load(.acquire));
+}
+
+test "reevaluatePoolStates: tie broken by lowest IP (we win)" {
+    const alloc = std.testing.allocator;
+    var cfg = makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    const aes_key = SyncManager.deriveKey("reeval-tie-win");
+    var mgr = makeTestManagerWithCfg(aes_key, &cfg, store);
+    defer mgr.peers.deinit(alloc);
+
+    // Set our IP lower than the peer's
+    mgr.self_ip = 0x0A000001; // 10.0.0.1
+
+    // One peer with a different hash and higher IP
+    const different_hash: [32]u8 = [_]u8{0xEF} ** 32;
+    try mgr.peers.append(alloc, makeTestPeer(0x0A000005, true, &[_]PeerPoolHash{.{
+        .subnet_ip = mgr.pool_states[0].subnet_ip,
+        .prefix_len = mgr.pool_states[0].prefix_len,
+        .hash = different_hash,
+    }}));
+
+    mgr.reevaluatePoolStates();
+
+    // 1 vote each, we have lower IP → we win → our pool enabled
+    try std.testing.expect(mgr.pool_states[0].enabled.load(.acquire));
+}
+
+test "reevaluatePoolStates: pool only on local — always enabled" {
+    const alloc = std.testing.allocator;
+    var cfg = makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    const aes_key = SyncManager.deriveKey("reeval-local-only");
+    var mgr = makeTestManagerWithCfg(aes_key, &cfg, store);
+    defer mgr.peers.deinit(alloc);
+
+    // Add an authenticated peer that has NO pools matching ours
+    try mgr.peers.append(alloc, makeTestPeer(0x0A000002, true, &[_]PeerPoolHash{}));
+
+    mgr.reevaluatePoolStates();
+
+    // Only we vote, so we win — pool should be enabled
+    try std.testing.expect(mgr.pool_states[0].enabled.load(.acquire));
+}
+
+test "isPoolEnabled: enabled pool returns true" {
+    const alloc = std.testing.allocator;
+    var cfg = makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    const aes_key = SyncManager.deriveKey("ispe-enabled");
+    var mgr = makeTestManagerWithCfg(aes_key, &cfg, store);
+    defer mgr.peers.deinit(alloc);
+
+    // Pool starts enabled
+    try std.testing.expect(mgr.isPoolEnabled([4]u8{ 192, 168, 1, 0 }, 24));
+}
+
+test "isPoolEnabled: disabled pool returns false" {
+    const alloc = std.testing.allocator;
+    var cfg = makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    const aes_key = SyncManager.deriveKey("ispe-disabled");
+    var mgr = makeTestManagerWithCfg(aes_key, &cfg, store);
+    defer mgr.peers.deinit(alloc);
+
+    // Manually disable the pool
+    mgr.pool_states[0].enabled.store(false, .release);
+    try std.testing.expect(!mgr.isPoolEnabled([4]u8{ 192, 168, 1, 0 }, 24));
+}
+
+test "isPoolEnabled: unknown pool returns true (conservative)" {
+    const alloc = std.testing.allocator;
+    var cfg = makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    const aes_key = SyncManager.deriveKey("ispe-unknown");
+    var mgr = makeTestManagerWithCfg(aes_key, &cfg, store);
+    defer mgr.peers.deinit(alloc);
+
+    // Query a subnet we don't have
+    try std.testing.expect(mgr.isPoolEnabled([4]u8{ 10, 0, 0, 0 }, 8));
+}
+
+test "buildHelloPayload v2: verify structure" {
+    const alloc = std.testing.allocator;
+    var cfg = makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    // Set up a test sync config
+    var sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+    };
+    const aes_key = SyncManager.deriveKey("hello-v2-test");
+    var mgr = makeTestManagerWithCfg(aes_key, &cfg, store);
+    mgr.cfg = &sync_cfg;
+    defer mgr.peers.deinit(alloc);
+
+    var buf: [SyncManager.hello_max_payload]u8 = undefined;
+    const len = mgr.buildHelloPayload(&buf);
+
+    // Version byte
+    try std.testing.expectEqual(@as(u8, HELLO_PROTOCOL_VERSION), buf[0]);
+
+    // Group name length
+    const gn_len: u8 = buf[1];
+    try std.testing.expectEqual(@as(u8, 10), gn_len); // "test-group" = 10 chars
+
+    // Group name
+    try std.testing.expectEqualStrings("test-group", buf[2 .. 2 + gn_len]);
+
+    // Pool count
+    const pool_count = buf[2 + gn_len];
+    try std.testing.expectEqual(@as(u8, 1), pool_count);
+
+    // Expected length: 1 + 1 + 10 + 1 + 1*37 = 50
+    try std.testing.expectEqual(@as(usize, 50), len);
+
+    // Subnet IP should be 192.168.1.0
+    const off = 2 + @as(usize, gn_len) + 1;
+    try std.testing.expectEqualSlices(u8, &[4]u8{ 192, 168, 1, 0 }, buf[off .. off + 4]);
+
+    // Prefix len should be 24
+    try std.testing.expectEqual(@as(u8, 24), buf[off + 4]);
+}
+
+test "isIpInDisabledPool: returns false when no pool states" {
+    const aes_key = SyncManager.deriveKey("disabled-pool-none");
+    var mgr = makeTestManager(aes_key);
+    defer mgr.peers.deinit(std.testing.allocator);
+    mgr.pool_states_len = 0;
+
+    // Should not crash, and should return false
+    try std.testing.expect(!mgr.isIpInDisabledPool("192.168.1.50"));
+}
+
+test "isIpInDisabledPool: returns true for IP in disabled pool" {
+    const alloc = std.testing.allocator;
+    var cfg = makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    const aes_key = SyncManager.deriveKey("disabled-pool-check");
+    var mgr = makeTestManagerWithCfg(aes_key, &cfg, store);
+    defer mgr.peers.deinit(alloc);
+
+    // Disable the pool
+    mgr.pool_states[0].enabled.store(false, .release);
+
+    // IP in the 192.168.1.0/24 subnet should be in a disabled pool
+    try std.testing.expect(mgr.isIpInDisabledPool("192.168.1.50"));
+
+    // IP outside the subnet should not be in a disabled pool
+    try std.testing.expect(!mgr.isIpInDisabledPool("10.0.0.1"));
+}
+
+test "computeLocalPoolStates: produces correct per-pool hashes" {
+    const alloc = std.testing.allocator;
+    var cfg = makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    const aes_key = SyncManager.deriveKey("pool-states-test");
+    var mgr = makeTestManagerWithCfg(aes_key, &cfg, store);
+    defer mgr.peers.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u8, 1), mgr.pool_states_len);
+    try std.testing.expectEqualSlices(u8, &[4]u8{ 192, 168, 1, 0 }, &mgr.pool_states[0].subnet_ip);
+    try std.testing.expectEqual(@as(u8, 24), mgr.pool_states[0].prefix_len);
+    try std.testing.expect(mgr.pool_states[0].enabled.load(.acquire));
+
+    // Hash should match what computePerPoolHash returns
+    const expected = config_mod.computePerPoolHash(&cfg.pools[0], cfg.mac_classes);
+    try std.testing.expectEqualSlices(u8, &expected, &mgr.pool_states[0].local_hash);
 }

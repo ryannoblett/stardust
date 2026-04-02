@@ -239,14 +239,11 @@ pub fn main() !void {
     std.log.info("State store initialized", .{});
 
     // Initialize sync manager if enabled.
-    std.log.debug("Computing pool hash...", .{});
-    const pool_hash = config_mod.computePoolHash(cfg);
-    std.log.debug("Pool hash computed", .{});
     var sync_mgr: ?*sync_mod.SyncManager = null;
     if (cfg.sync) |*sync_cfg| {
         if (sync_cfg.enable) {
             std.log.info("Initializing sync manager (key_file={s})...", .{sync_cfg.key_file});
-            sync_mgr = sync_mod.SyncManager.init(allocator, sync_cfg, cfg, cfg_path, store, pool_hash) catch |err| blk: {
+            sync_mgr = sync_mod.SyncManager.init(allocator, sync_cfg, cfg, cfg_path, store) catch |err| blk: {
                 std.log.err("Failed to initialize sync manager ({s}); running without sync", .{@errorName(err)});
                 break :blk null;
             };
@@ -254,8 +251,9 @@ pub fn main() !void {
     }
     defer if (sync_mgr) |s| s.deinit();
 
-    if (sync_mgr != null) {
+    if (sync_mgr) |s| {
         std.log.info("Sync manager enabled", .{});
+        s.waitForInitialSync();
     }
 
     // Create and run DHCP server. The server creates and owns per-pool DNS updaters.

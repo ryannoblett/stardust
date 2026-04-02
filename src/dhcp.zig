@@ -861,11 +861,10 @@ pub const DHCPServer = struct {
         // Update the StateStore's dir reference — the old string was freed by deinit().
         self.store.dir = self.cfg.state_dir;
 
-        // Recompute pool hash and notify sync manager so peers with stale
+        // Recompute per-pool hashes and notify sync manager so peers with stale
         // configs are disconnected and forced to re-handshake.
         if (self.sync_mgr) |s| {
-            const new_hash = config_mod.computePoolHash(self.cfg);
-            s.updatePoolHash(new_hash);
+            s.updatePoolStates(self.cfg);
         }
 
         freeDnsUpdaters(self.allocator, self.dns_updaters);
