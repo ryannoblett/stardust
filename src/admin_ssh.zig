@@ -2310,7 +2310,7 @@ fn renderReservationForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Alloca
         const os = if (is_sel) active_style else opt_style;
         const code = o.code_buf[0..o.code_len];
         const val = o.value_buf[0..o.value_len];
-        const opt_text = std.fmt.allocPrint(fa, "    {s:<6} {s}", .{
+        const opt_text = std.fmt.allocPrint(fa, "    {s:>3}: {s}", .{
             if (code.len > 0) code else "?",
             if (val.len > 0) val else "?",
         }) catch "";
@@ -3788,7 +3788,7 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
                                 const o = &form.options[ei];
                                 const code = o.code_buf[0..o.code_len];
                                 const val = o.value_buf[0..o.value_len];
-                                break :blk std.fmt.allocPrint(fa, "{s:<6} {s}", .{
+                                break :blk std.fmt.allocPrint(fa, "{s:>3}: {s}", .{
                                     if (code.len > 0) code else "?",
                                     if (val.len > 0) val else "?",
                                 }) catch "";
