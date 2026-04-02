@@ -458,6 +458,131 @@ fn appendRawStringOpt(opts_buf: []u8, opts_len: *usize, code: OptionCode, value:
     opts_len.* += 2 + len;
 }
 
+// ---------------------------------------------------------------------------
+// DNS resolution cache for hostname-based server entries
+// ---------------------------------------------------------------------------
+
+const ResolveCacheEntry = struct {
+    name_hash: u64,
+    ip: [4]u8,
+    timestamp: i64, // epoch seconds
+};
+const RESOLVE_CACHE_SIZE = 32;
+const RESOLVE_CACHE_TTL = 60; // seconds
+
+/// Try to resolve a hostname (or dotted-quad IP string) to an IPv4 address.
+/// Uses a small fixed-size cache to avoid DNS lookups on every DHCP packet.
+fn resolveHostToIpv4(name: []const u8, cache: *[RESOLVE_CACHE_SIZE]ResolveCacheEntry) ?[4]u8 {
+    // Fast path: direct IPv4 parse.
+    if (config_mod.parseIpv4(name)) |ip| return ip else |_| {}
+
+    // Cache lookup by name hash.
+    const name_hash = std.hash.Wyhash.hash(0, name);
+    const now = std.time.timestamp();
+    const slot = @as(usize, @intCast(name_hash % RESOLVE_CACHE_SIZE));
+    if (cache[slot].name_hash == name_hash and
+        (now - cache[slot].timestamp) < RESOLVE_CACHE_TTL)
+    {
+        return cache[slot].ip;
+    }
+
+    // DNS resolution via libc getaddrinfo (project links libc).
+    // Null-terminate the name into a stack buffer.
+    var name_buf: [253:0]u8 = undefined;
+    if (name.len > 253) return null;
+    @memcpy(name_buf[0..name.len], name);
+    name_buf[name.len] = 0;
+    const name_z: [*:0]const u8 = name_buf[0..name.len :0];
+
+    const hints = std.posix.addrinfo{
+        .flags = .{},
+        .family = std.posix.AF.INET,
+        .socktype = std.posix.SOCK.DGRAM,
+        .protocol = 0,
+        .addrlen = 0,
+        .addr = null,
+        .canonname = null,
+        .next = null,
+    };
+    var res: ?*std.posix.addrinfo = null;
+    const rc = std.c.getaddrinfo(name_z, null, &hints, &res);
+    if (rc != @as(std.c.EAI, @enumFromInt(0))) {
+        std.log.debug("DNS resolve failed for '{s}': {s}", .{
+            name,
+            std.mem.span(std.c.gai_strerror(rc)),
+        });
+        return null;
+    }
+    defer if (res) |r| std.c.freeaddrinfo(r);
+
+    const info = res orelse return null;
+    const sa = info.addr orelse return null;
+    if (sa.family != std.posix.AF.INET) return null;
+    const sin: *const std.posix.sockaddr.in = @ptrCast(@alignCast(sa));
+    const ip: [4]u8 = @bitCast(sin.addr);
+
+    // Store in cache.
+    cache[slot] = .{
+        .name_hash = name_hash,
+        .ip = ip,
+        .timestamp = now,
+    };
+    return ip;
+}
+
+/// Fisher-Yates shuffle with a fast LCG seeded from the DHCP xid.
+fn shuffleIps(items: [][4]u8, seed: u32) void {
+    if (items.len <= 1) return;
+    var s = seed;
+    var i: usize = items.len - 1;
+    while (i > 0) : (i -= 1) {
+        s = s *% 1103515245 +% 12345;
+        const j = s % @as(u32, @intCast(i + 1));
+        const tmp = items[i];
+        items[i] = items[j];
+        items[j] = tmp;
+    }
+}
+
+/// Append a list-of-IPv4 option, resolving hostnames via DNS when needed.
+/// If `shuffle_seed` is non-null the resolved IP list is shuffled before encoding.
+fn appendResolvedIpListOpt(
+    opts_buf: []u8,
+    opts_len: *usize,
+    prl: ?[]const u8,
+    code: OptionCode,
+    servers: []const []const u8,
+    cache: *[RESOLVE_CACHE_SIZE]ResolveCacheEntry,
+    shuffle_seed: ?u32,
+) void {
+    if (!isRequested(prl, code) or servers.len == 0) return;
+    const count = @min(servers.len, 63); // max 252 bytes of data
+
+    // Resolve all entries into a stack buffer.
+    var ips: [63][4]u8 = undefined;
+    var n: usize = 0;
+    for (servers[0..count]) |s| {
+        if (resolveHostToIpv4(s, cache)) |ip| {
+            ips[n] = ip;
+            n += 1;
+        }
+    }
+    if (n == 0) return;
+
+    // Optional shuffle for load distribution.
+    if (shuffle_seed) |seed| shuffleIps(ips[0..n], seed);
+
+    const header = opts_len.*;
+    if (header + 2 + n * 4 > opts_buf.len) return;
+    opts_buf[header] = @intFromEnum(code);
+    opts_buf[header + 1] = @intCast(n * 4);
+    opts_len.* = header + 2;
+    for (ips[0..n]) |ip| {
+        @memcpy(opts_buf[opts_len.*..][0..4], &ip);
+        opts_len.* += 4;
+    }
+}
+
 // Per-MAC decline rate-limiting: after decline_threshold declines within decline_window_secs,
 // the MAC is refused new allocations for decline_cooldown_secs.
 const decline_threshold: u32 = 3;
@@ -525,6 +650,8 @@ pub const DHCPServer = struct {
     sync_mgr: ?*sync_mod.SyncManager,
     /// DHCP message counters. Populated only when cfg.metrics.collect is true.
     counters: Counters,
+    /// Fixed-size DNS resolution cache for hostname-based server entries.
+    resolve_cache: [RESOLVE_CACHE_SIZE]ResolveCacheEntry,
 
     const Self = @This();
 
@@ -562,6 +689,7 @@ pub const DHCPServer = struct {
             .if_info = null,
             .sync_mgr = sync_mgr,
             .counters = .{},
+            .resolve_cache = [_]ResolveCacheEntry{.{ .name_hash = 0, .ip = .{ 0, 0, 0, 0 }, .timestamp = 0 }} ** RESOLVE_CACHE_SIZE,
         };
         return self;
     }
@@ -1357,18 +1485,8 @@ pub const DHCPServer = struct {
             opts_len += 6;
         }
 
-        // Option 6: DNS Servers (up to 4)
-        if (isRequested(prl, .DomainNameServer) and pool.dns_servers.len > 0) {
-            const count = @min(pool.dns_servers.len, 4);
-            opts_buf[opts_len] = @intFromEnum(OptionCode.DomainNameServer);
-            opts_buf[opts_len + 1] = @intCast(count * 4);
-            opts_len += 2;
-            for (pool.dns_servers[0..count]) |dns_str| {
-                const dns_ip = config_mod.parseIpv4(dns_str) catch continue;
-                @memcpy(opts_buf[opts_len .. opts_len + 4], &dns_ip);
-                opts_len += 4;
-            }
-        }
+        // Option 6: DNS Servers (ordered, with hostname resolution)
+        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .DomainNameServer, pool.dns_servers, &self.resolve_cache, null);
 
         // Option 15: Domain Name
         if (isRequested(prl, .DomainName) and pool.domain_name.len > 0) {
@@ -1402,15 +1520,18 @@ pub const DHCPServer = struct {
             }
         }
 
-        // Option 4: Time Servers (RFC 868)
-        // Option 4: use explicit time_servers if configured, otherwise mirror ntp_servers.
-        appendIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, if (pool.time_servers.len > 0) pool.time_servers else pool.ntp_servers);
+        // Shuffle seed from xid for load-distributing server lists.
+        const xid_seed: u32 = req_header.xid;
 
-        // Option 7: Log Servers
-        appendIpListOpt(&opts_buf, &opts_len, prl, .LogServer, pool.log_servers);
+        // Option 4: Time Servers (RFC 868) — shuffled for load distribution.
+        // Use explicit time_servers if configured, otherwise mirror ntp_servers.
+        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, if (pool.time_servers.len > 0) pool.time_servers else pool.ntp_servers, &self.resolve_cache, xid_seed);
 
-        // Option 42: NTP Servers
-        appendIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, pool.ntp_servers);
+        // Option 7: Log Servers — shuffled for load distribution.
+        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .LogServer, pool.log_servers, &self.resolve_cache, xid_seed);
+
+        // Option 42: NTP Servers — shuffled for load distribution.
+        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, pool.ntp_servers, &self.resolve_cache, xid_seed);
 
         // Option 26: Interface MTU
         if (!isOverridden(&overrides, 26)) {
@@ -1441,9 +1562,9 @@ pub const DHCPServer = struct {
             }
         }
 
-        // Option 44: NetBIOS/WINS Name Servers
+        // Option 44: NetBIOS/WINS Name Servers — shuffled for load distribution.
         if (!isOverridden(&overrides, 44)) {
-            appendIpListOpt(&opts_buf, &opts_len, prl, .NetBIOSNameServers, pool.wins_servers);
+            appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .NetBIOSNameServers, pool.wins_servers, &self.resolve_cache, xid_seed);
         }
 
         // Option 66/67: Boot options (TFTP or UEFI HTTP boot).
@@ -1457,9 +1578,9 @@ pub const DHCPServer = struct {
             appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, pool.boot_filename);
         }
 
-        // Option 150: Cisco TFTP Server
+        // Option 150: Cisco TFTP Server (ordered, with hostname resolution)
         if (!isOverridden(&overrides, 150)) {
-            appendIpListOpt(&opts_buf, &opts_len, prl, .CiscoTftp, pool.tftp_servers);
+            appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .CiscoTftp, pool.tftp_servers, &self.resolve_cache, null);
         }
 
         // Option 33: Static Routes (RFC 2132)
@@ -1712,18 +1833,8 @@ pub const DHCPServer = struct {
             opts_len += 6;
         }
 
-        // Option 6: DNS Servers (up to 4)
-        if (isRequested(prl, .DomainNameServer) and pool.dns_servers.len > 0) {
-            const count = @min(pool.dns_servers.len, 4);
-            opts_buf[opts_len] = @intFromEnum(OptionCode.DomainNameServer);
-            opts_buf[opts_len + 1] = @intCast(count * 4);
-            opts_len += 2;
-            for (pool.dns_servers[0..count]) |dns_str| {
-                const dns_ip = config_mod.parseIpv4(dns_str) catch continue;
-                @memcpy(opts_buf[opts_len .. opts_len + 4], &dns_ip);
-                opts_len += 4;
-            }
-        }
+        // Option 6: DNS Servers (ordered, with hostname resolution)
+        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .DomainNameServer, pool.dns_servers, &self.resolve_cache, null);
 
         // Option 15: Domain Name
         if (isRequested(prl, .DomainName) and pool.domain_name.len > 0) {
@@ -1757,15 +1868,18 @@ pub const DHCPServer = struct {
             }
         }
 
-        // Option 4: Time Servers (RFC 868)
-        // Option 4: use explicit time_servers if configured, otherwise mirror ntp_servers.
-        appendIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, if (pool.time_servers.len > 0) pool.time_servers else pool.ntp_servers);
+        // Shuffle seed from xid for load-distributing server lists.
+        const xid_seed: u32 = req_header.xid;
 
-        // Option 7: Log Servers
-        appendIpListOpt(&opts_buf, &opts_len, prl, .LogServer, pool.log_servers);
+        // Option 4: Time Servers (RFC 868) — shuffled for load distribution.
+        // Use explicit time_servers if configured, otherwise mirror ntp_servers.
+        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, if (pool.time_servers.len > 0) pool.time_servers else pool.ntp_servers, &self.resolve_cache, xid_seed);
 
-        // Option 42: NTP Servers
-        appendIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, pool.ntp_servers);
+        // Option 7: Log Servers — shuffled for load distribution.
+        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .LogServer, pool.log_servers, &self.resolve_cache, xid_seed);
+
+        // Option 42: NTP Servers — shuffled for load distribution.
+        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, pool.ntp_servers, &self.resolve_cache, xid_seed);
 
         // Option 26: Interface MTU
         if (!isOverridden(&overrides, 26)) {
@@ -1796,9 +1910,9 @@ pub const DHCPServer = struct {
             }
         }
 
-        // Option 44: NetBIOS/WINS Name Servers
+        // Option 44: NetBIOS/WINS Name Servers — shuffled for load distribution.
         if (!isOverridden(&overrides, 44)) {
-            appendIpListOpt(&opts_buf, &opts_len, prl, .NetBIOSNameServers, pool.wins_servers);
+            appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .NetBIOSNameServers, pool.wins_servers, &self.resolve_cache, xid_seed);
         }
 
         // Option 66/67: Boot options (TFTP or UEFI HTTP boot).
@@ -1812,9 +1926,9 @@ pub const DHCPServer = struct {
             appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, pool.boot_filename);
         }
 
-        // Option 150: Cisco TFTP Server
+        // Option 150: Cisco TFTP Server (ordered, with hostname resolution)
         if (!isOverridden(&overrides, 150)) {
-            appendIpListOpt(&opts_buf, &opts_len, prl, .CiscoTftp, pool.tftp_servers);
+            appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .CiscoTftp, pool.tftp_servers, &self.resolve_cache, null);
         }
 
         // Option 33: Static Routes (RFC 2132)
@@ -2183,18 +2297,8 @@ pub const DHCPServer = struct {
             opts_len += 6;
         }
 
-        // Option 6: DNS Servers (up to 4)
-        if (isRequested(prl, .DomainNameServer) and pool.dns_servers.len > 0) {
-            const count = @min(pool.dns_servers.len, 4);
-            opts_buf[opts_len] = @intFromEnum(OptionCode.DomainNameServer);
-            opts_buf[opts_len + 1] = @intCast(count * 4);
-            opts_len += 2;
-            for (pool.dns_servers[0..count]) |dns_str| {
-                const dns_ip = config_mod.parseIpv4(dns_str) catch continue;
-                @memcpy(opts_buf[opts_len .. opts_len + 4], &dns_ip);
-                opts_len += 4;
-            }
-        }
+        // Option 6: DNS Servers (ordered, with hostname resolution)
+        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .DomainNameServer, pool.dns_servers, &self.resolve_cache, null);
 
         // Option 15: Domain Name
         if (isRequested(prl, .DomainName) and pool.domain_name.len > 0) {
@@ -2228,15 +2332,18 @@ pub const DHCPServer = struct {
             }
         }
 
-        // Option 4: Time Servers (RFC 868)
-        // Option 4: use explicit time_servers if configured, otherwise mirror ntp_servers.
-        appendIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, if (pool.time_servers.len > 0) pool.time_servers else pool.ntp_servers);
+        // Shuffle seed from xid for load-distributing server lists.
+        const xid_seed: u32 = req_header.xid;
 
-        // Option 7: Log Servers
-        appendIpListOpt(&opts_buf, &opts_len, prl, .LogServer, pool.log_servers);
+        // Option 4: Time Servers (RFC 868) — shuffled for load distribution.
+        // Use explicit time_servers if configured, otherwise mirror ntp_servers.
+        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .TimeServer, if (pool.time_servers.len > 0) pool.time_servers else pool.ntp_servers, &self.resolve_cache, xid_seed);
 
-        // Option 42: NTP Servers
-        appendIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, pool.ntp_servers);
+        // Option 7: Log Servers — shuffled for load distribution.
+        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .LogServer, pool.log_servers, &self.resolve_cache, xid_seed);
+
+        // Option 42: NTP Servers — shuffled for load distribution.
+        appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .NtpServers, pool.ntp_servers, &self.resolve_cache, xid_seed);
 
         // Option 26: Interface MTU
         if (!isOverridden(&overrides, 26)) {
@@ -2267,9 +2374,9 @@ pub const DHCPServer = struct {
             }
         }
 
-        // Option 44: NetBIOS/WINS Name Servers
+        // Option 44: NetBIOS/WINS Name Servers — shuffled for load distribution.
         if (!isOverridden(&overrides, 44)) {
-            appendIpListOpt(&opts_buf, &opts_len, prl, .NetBIOSNameServers, pool.wins_servers);
+            appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .NetBIOSNameServers, pool.wins_servers, &self.resolve_cache, xid_seed);
         }
 
         // Option 66/67: Boot options (TFTP or UEFI HTTP boot).
@@ -2283,9 +2390,9 @@ pub const DHCPServer = struct {
             appendStringOpt(&opts_buf, &opts_len, prl, .BootFileName, pool.boot_filename);
         }
 
-        // Option 150: Cisco TFTP Server
+        // Option 150: Cisco TFTP Server (ordered, with hostname resolution)
         if (!isOverridden(&overrides, 150)) {
-            appendIpListOpt(&opts_buf, &opts_len, prl, .CiscoTftp, pool.tftp_servers);
+            appendResolvedIpListOpt(&opts_buf, &opts_len, prl, .CiscoTftp, pool.tftp_servers, &self.resolve_cache, null);
         }
 
         // Option 33: Static Routes (RFC 2132)
