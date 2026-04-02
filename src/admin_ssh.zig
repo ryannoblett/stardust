@@ -523,9 +523,9 @@ const OptionEntry = struct {
     value_len: usize = 0,
 };
 
-/// A single MAC class entry in the pool form.  All fields are stored as text
-/// in fixed buffers.  Server lists use comma-separated text to avoid deeply
-/// nested modals.
+/// A single MAC class entry in the pool form.  Text fields use fixed buffers.
+/// Multi-value fields (servers, routes, options) use inline entry arrays with
+/// dedicated [+] Add buttons and edit sub-modals, matching the pool form.
 const MacClassEntry = struct {
     name_buf: [32]u8 = [_]u8{0} ** 32,
     name_len: usize = 0,
@@ -536,28 +536,30 @@ const MacClassEntry = struct {
     router_len: usize = 0,
     domain_name_buf: [64]u8 = [_]u8{0} ** 64,
     domain_name_len: usize = 0,
-    domain_search_buf: [256]u8 = [_]u8{0} ** 256,
-    domain_search_len: usize = 0,
-    dns_servers_buf: [256]u8 = [_]u8{0} ** 256,
-    dns_servers_len: usize = 0,
-    ntp_servers_buf: [128]u8 = [_]u8{0} ** 128,
-    ntp_servers_len: usize = 0,
-    log_servers_buf: [128]u8 = [_]u8{0} ** 128,
-    log_servers_len: usize = 0,
-    wins_servers_buf: [64]u8 = [_]u8{0} ** 64,
-    wins_servers_len: usize = 0,
     time_offset_buf: [8]u8 = [_]u8{0} ** 8,
     time_offset_len: usize = 0,
-    tftp_servers_buf: [128]u8 = [_]u8{0} ** 128,
-    tftp_servers_len: usize = 0,
     boot_filename_buf: [128]u8 = [_]u8{0} ** 128,
     boot_filename_len: usize = 0,
     http_boot_url_buf: [256]u8 = [_]u8{0} ** 256,
     http_boot_url_len: usize = 0,
-    routes_buf: [256]u8 = [_]u8{0} ** 256,
-    routes_len: usize = 0,
-    options_buf: [256]u8 = [_]u8{0} ** 256,
-    options_len: usize = 0,
+
+    // Inline entry arrays (with [+] Add buttons and edit modals).
+    domain_search: [8]InlineEntry = [_]InlineEntry{.{}} ** 8,
+    domain_search_count: usize = 0,
+    dns_servers: [8]InlineEntry = [_]InlineEntry{.{}} ** 8,
+    dns_servers_count: usize = 0,
+    ntp_servers: [4]InlineEntry = [_]InlineEntry{.{}} ** 4,
+    ntp_servers_count: usize = 0,
+    log_servers: [4]InlineEntry = [_]InlineEntry{.{}} ** 4,
+    log_servers_count: usize = 0,
+    wins_servers: [2]InlineEntry = [_]InlineEntry{.{}} ** 2,
+    wins_servers_count: usize = 0,
+    tftp_servers: [4]InlineEntry = [_]InlineEntry{.{}} ** 4,
+    tftp_servers_count: usize = 0,
+    routes: [16]RouteEntry = [_]RouteEntry{.{}} ** 16,
+    route_count: usize = 0,
+    options: [32]OptionEntry = [_]OptionEntry{.{}} ** 32,
+    option_count: usize = 0,
 };
 
 const PoolForm = struct {
@@ -601,6 +603,8 @@ const PoolForm = struct {
     server_edit_len: usize = 0,
     server_edit_cursor: usize = 0,
     server_edit_index: ?usize = null, // null=adding, index=editing existing
+    /// Which parent modal opened the server/route/option edit sub-modal.
+    server_edit_parent: enum { pool_form, mac_class_edit } = .pool_form,
 
     // --- Timing ---
     lease_time_buf: [10]u8 = [_]u8{0} ** 10,
@@ -1314,7 +1318,8 @@ fn runTui(
                                     state.mode = switch (state.mode) {
                                         .res_option_edit => .reservation_form,
                                         .option_lookup => .res_option_edit,
-                                        .pool_server_edit, .pool_route_edit, .pool_option_edit, .pool_mac_class_edit => .pool_form,
+                                        .pool_server_edit, .pool_route_edit, .pool_option_edit => subModalParent(&state.pool_form),
+                                        .pool_mac_class_edit => .pool_form,
                                         .pool_option_lookup => .pool_option_edit,
                                         else => .normal,
                                     };
@@ -1334,6 +1339,11 @@ fn runTui(
                                             const pf = &state.pool_form;
                                             if (pf.activeFieldInfo(pf.active_field).kind == .add_button) {
                                                 handlePoolFormKey(server, &state, .{ .codepoint = vaxis.Key.enter });
+                                            }
+                                        } else if (state.mode == .pool_mac_class_edit) {
+                                            const mci = mcActiveFieldInfo(&state.pool_form.mac_class_edit, state.pool_form.mac_class_edit_field);
+                                            if (mci.kind == .add_button) {
+                                                handleMacClassEditKey(&state, .{ .codepoint = vaxis.Key.enter });
                                             }
                                         }
                                     }
@@ -3000,56 +3010,98 @@ fn populatePoolForm(form: *PoolForm, pool: *const config_mod.PoolConfig) void {
     for (0..form.mac_class_count) |i| {
         var mce = &form.mac_classes[i];
         mce.* = .{};
-        const mc = &pool.mac_classes[i];
-        copyField(&mce.name_buf, &mce.name_len, mc.name);
-        copyField(&mce.match_buf, &mce.match_len, mc.match);
-        if (mc.router) |r| copyField(&mce.router_buf, &mce.router_len, r);
-        if (mc.domain_name) |d| copyField(&mce.domain_name_buf, &mce.domain_name_len, d);
-        mce.domain_search_len = joinComma(256, &mce.domain_search_buf, mc.domain_search);
-        mce.dns_servers_len = joinComma(256, &mce.dns_servers_buf, mc.dns_servers);
-        mce.ntp_servers_len = joinComma(128, &mce.ntp_servers_buf, mc.ntp_servers);
-        mce.log_servers_len = joinComma(128, &mce.log_servers_buf, mc.log_servers);
-        mce.wins_servers_len = joinComma(64, &mce.wins_servers_buf, mc.wins_servers);
-        if (mc.time_offset) |off| {
+        const mcc = &pool.mac_classes[i];
+        copyField(&mce.name_buf, &mce.name_len, mcc.name);
+        copyField(&mce.match_buf, &mce.match_len, mcc.match);
+        if (mcc.router) |r| copyField(&mce.router_buf, &mce.router_len, r);
+        if (mcc.domain_name) |d| copyField(&mce.domain_name_buf, &mce.domain_name_len, d);
+        if (mcc.time_offset) |off| {
             const off_str = std.fmt.bufPrint(&mce.time_offset_buf, "{d}", .{off}) catch "";
             mce.time_offset_len = off_str.len;
         }
-        mce.tftp_servers_len = joinComma(128, &mce.tftp_servers_buf, mc.tftp_servers);
-        if (mc.boot_filename) |b| copyField(&mce.boot_filename_buf, &mce.boot_filename_len, b);
-        if (mc.http_boot_url) |h| copyField(&mce.http_boot_url_buf, &mce.http_boot_url_len, h);
-        // Routes: "dest1 via gw1, dest2 via gw2"
-        {
-            var rlen: usize = 0;
-            for (mc.static_routes, 0..) |sr, ri| {
-                if (ri > 0 and rlen + 2 <= mce.routes_buf.len) {
-                    mce.routes_buf[rlen] = ',';
-                    mce.routes_buf[rlen + 1] = ' ';
-                    rlen += 2;
-                }
-                const rs = std.fmt.bufPrint(mce.routes_buf[rlen..], "{d}.{d}.{d}.{d}/{d} via {d}.{d}.{d}.{d}", .{
-                    sr.destination[0], sr.destination[1], sr.destination[2], sr.destination[3], sr.prefix_len,
-                    sr.router[0],      sr.router[1],      sr.router[2],      sr.router[3],
-                }) catch break;
-                rlen += rs.len;
-            }
-            mce.routes_len = rlen;
+        if (mcc.boot_filename) |b| copyField(&mce.boot_filename_buf, &mce.boot_filename_len, b);
+        if (mcc.http_boot_url) |h| copyField(&mce.http_boot_url_buf, &mce.http_boot_url_len, h);
+        // Copy domain search entries.
+        mce.domain_search_count = @min(mcc.domain_search.len, mce.domain_search.len);
+        for (0..mce.domain_search_count) |j| {
+            const src = mcc.domain_search[j];
+            const n = @min(src.len, mce.domain_search[j].buf.len);
+            @memcpy(mce.domain_search[j].buf[0..n], src[0..n]);
+            mce.domain_search[j].len = n;
         }
-        // Options: "code=value, code=value"
+        // Copy DNS server entries.
+        mce.dns_servers_count = @min(mcc.dns_servers.len, mce.dns_servers.len);
+        for (0..mce.dns_servers_count) |j| {
+            const src = mcc.dns_servers[j];
+            const n = @min(src.len, mce.dns_servers[j].buf.len);
+            @memcpy(mce.dns_servers[j].buf[0..n], src[0..n]);
+            mce.dns_servers[j].len = n;
+        }
+        // Copy NTP server entries.
+        mce.ntp_servers_count = @min(mcc.ntp_servers.len, mce.ntp_servers.len);
+        for (0..mce.ntp_servers_count) |j| {
+            const src = mcc.ntp_servers[j];
+            const n = @min(src.len, mce.ntp_servers[j].buf.len);
+            @memcpy(mce.ntp_servers[j].buf[0..n], src[0..n]);
+            mce.ntp_servers[j].len = n;
+        }
+        // Copy log server entries.
+        mce.log_servers_count = @min(mcc.log_servers.len, mce.log_servers.len);
+        for (0..mce.log_servers_count) |j| {
+            const src = mcc.log_servers[j];
+            const n = @min(src.len, mce.log_servers[j].buf.len);
+            @memcpy(mce.log_servers[j].buf[0..n], src[0..n]);
+            mce.log_servers[j].len = n;
+        }
+        // Copy WINS server entries.
+        mce.wins_servers_count = @min(mcc.wins_servers.len, mce.wins_servers.len);
+        for (0..mce.wins_servers_count) |j| {
+            const src = mcc.wins_servers[j];
+            const n = @min(src.len, mce.wins_servers[j].buf.len);
+            @memcpy(mce.wins_servers[j].buf[0..n], src[0..n]);
+            mce.wins_servers[j].len = n;
+        }
+        // Copy TFTP server entries.
+        mce.tftp_servers_count = @min(mcc.tftp_servers.len, mce.tftp_servers.len);
+        for (0..mce.tftp_servers_count) |j| {
+            const src = mcc.tftp_servers[j];
+            const n = @min(src.len, mce.tftp_servers[j].buf.len);
+            @memcpy(mce.tftp_servers[j].buf[0..n], src[0..n]);
+            mce.tftp_servers[j].len = n;
+        }
+        // Copy static routes.
+        mce.route_count = @min(mcc.static_routes.len, mce.routes.len);
+        for (0..mce.route_count) |j| {
+            const sr = &mcc.static_routes[j];
+            var re = &mce.routes[j];
+            re.* = .{};
+            const dest = std.fmt.bufPrint(&re.dest_buf, "{d}.{d}.{d}.{d}/{d}", .{
+                sr.destination[0], sr.destination[1], sr.destination[2], sr.destination[3], sr.prefix_len,
+            }) catch "";
+            re.dest_len = dest.len;
+            const rtr = std.fmt.bufPrint(&re.router_buf, "{d}.{d}.{d}.{d}", .{
+                sr.router[0], sr.router[1], sr.router[2], sr.router[3],
+            }) catch "";
+            re.router_len = rtr.len;
+        }
+        // Copy DHCP options.
+        mce.option_count = 0;
         {
-            var olen: usize = 0;
-            var opt_it = mc.dhcp_options.iterator();
-            var first = true;
+            var opt_it = mcc.dhcp_options.iterator();
             while (opt_it.next()) |entry| {
-                if (!first and olen + 2 <= mce.options_buf.len) {
-                    mce.options_buf[olen] = ',';
-                    mce.options_buf[olen + 1] = ' ';
-                    olen += 2;
-                }
-                first = false;
-                const os = std.fmt.bufPrint(mce.options_buf[olen..], "{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.* }) catch break;
-                olen += os.len;
+                if (mce.option_count >= mce.options.len) break;
+                var oe = &mce.options[mce.option_count];
+                oe.* = .{};
+                const code = entry.key_ptr.*;
+                const val = entry.value_ptr.*;
+                const cn = @min(code.len, oe.code_buf.len);
+                @memcpy(oe.code_buf[0..cn], code[0..cn]);
+                oe.code_len = cn;
+                const vn = @min(val.len, oe.value_buf.len);
+                @memcpy(oe.value_buf[0..vn], val[0..vn]);
+                oe.value_len = vn;
+                mce.option_count += 1;
             }
-            mce.options_len = olen;
         }
     }
 }
@@ -3621,13 +3673,45 @@ fn handleModalFieldClick(state: *TuiState, win_w: u16, win_h: u16, click_row: u1
             }
         },
         .pool_mac_class_edit => {
-            // Map click to field index in the MAC class edit modal.
+            // Map click to field index in the MAC class edit modal using layout walk.
             const rel = click_row -| modal_y;
-            if (rel >= 2) {
-                const clicked_abs = state.pool_form.mac_class_edit_scroll + (rel - 2);
-                if (clicked_abs < mac_class_field_meta.len) {
-                    state.pool_form.mac_class_edit_field = @intCast(clicked_abs);
-                    state.pool_form.mac_class_edit_cursor = macClassFieldLen(&state.pool_form.mac_class_edit, @intCast(clicked_abs));
+            if (rel < 2) return; // title area
+            const clicked_abs = state.pool_form.mac_class_edit_scroll + (rel - 2);
+            const mce = &state.pool_form.mac_class_edit;
+            var abs: u16 = 0;
+            var mpos: u8 = 0;
+            for (mac_class_layout) |mitem| {
+                switch (mitem.kind) {
+                    .section => abs += 2,
+                    .field => {
+                        if (abs == clicked_abs) {
+                            state.pool_form.mac_class_edit_field = mpos;
+                            state.pool_form.mac_class_edit_cursor = mcActiveFieldCursorLen(mce, mpos);
+                            return;
+                        }
+                        abs += 1;
+                        mpos += 1;
+                    },
+                    .inline_section => {
+                        const mtarget = mitem.inline_target.?;
+                        const mcount = mcInlineCount(mce, mtarget);
+                        if (abs == clicked_abs) {
+                            state.pool_form.mac_class_edit_field = mpos;
+                            state.pool_form.mac_class_edit_cursor = 0;
+                            return;
+                        }
+                        abs += 1;
+                        mpos += 1;
+                        for (0..mcount) |_| {
+                            if (abs == clicked_abs) {
+                                state.pool_form.mac_class_edit_field = mpos;
+                                state.pool_form.mac_class_edit_cursor = 0;
+                                return;
+                            }
+                            abs += 1;
+                            mpos += 1;
+                        }
+                    },
                 }
             }
         },
@@ -4028,20 +4112,15 @@ fn deleteInlineEntry(comptime T: type, arr: []T, count: *usize, di: usize) void 
 }
 
 /// Open the shared server edit modal, optionally populating from an existing entry.
+/// Uses serverEditEntryArr which respects server_edit_parent context.
 fn openServerEdit(form: *PoolForm, state: *TuiState, target: ServerEditTarget, edit_index: ?usize) void {
     form.err_len = 0;
     form.server_edit_target = target;
     form.server_edit_index = edit_index;
     if (edit_index) |idx| {
-        // Copy existing entry into edit buffer.
-        const entry: *const InlineEntry = switch (target) {
-            .domain_search => &form.domain_search[idx],
-            .dns => &form.dns_servers[idx],
-            .log => &form.log_servers[idx],
-            .ntp => &form.ntp_servers[idx],
-            .wins => &form.wins_servers[idx],
-            .tftp => &form.tftp_servers[idx],
-        };
+        // Copy existing entry into edit buffer (uses parent-aware arrays).
+        const entry_arr = serverEditEntryArr(form);
+        const entry = &entry_arr[idx];
         @memcpy(form.server_edit_buf[0..entry.len], entry.buf[0..entry.len]);
         form.server_edit_len = entry.len;
         form.server_edit_cursor = entry.len;
@@ -4167,6 +4246,7 @@ fn handlePoolFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
         // [+] Add buttons.
         if (af_info.kind == .add_button) {
             const target = af_info.inline_target.?;
+            form.server_edit_parent = .pool_form;
             switch (target) {
                 .domain_search, .dns, .log, .ntp, .wins, .tftp => {
                     // Check capacity.
@@ -4221,6 +4301,7 @@ fn handlePoolFormKey(server: *AdminServer, state: *TuiState, key: vaxis.Key) voi
         if (af_info.kind == .inline_entry) {
             const target = af_info.inline_target.?;
             const ei = af_info.entry_index;
+            form.server_edit_parent = .pool_form;
             switch (target) {
                 .domain_search, .dns, .log, .ntp, .wins, .tftp => {
                     const set: ServerEditTarget = switch (target) {
@@ -4809,23 +4890,86 @@ fn computePoolDiff(server: *AdminServer, state: *TuiState) void {
         for (0..form.mac_class_count) |mi| {
             const a = &form.mac_classes[mi];
             const b = &tmp_form.mac_classes[mi];
-            // Compare all text fields.
+            // Compare text fields.
             if (!std.mem.eql(u8, a.name_buf[0..a.name_len], b.name_buf[0..b.name_len]) or
                 !std.mem.eql(u8, a.match_buf[0..a.match_len], b.match_buf[0..b.match_len]) or
                 !std.mem.eql(u8, a.router_buf[0..a.router_len], b.router_buf[0..b.router_len]) or
                 !std.mem.eql(u8, a.domain_name_buf[0..a.domain_name_len], b.domain_name_buf[0..b.domain_name_len]) or
-                !std.mem.eql(u8, a.domain_search_buf[0..a.domain_search_len], b.domain_search_buf[0..b.domain_search_len]) or
-                !std.mem.eql(u8, a.dns_servers_buf[0..a.dns_servers_len], b.dns_servers_buf[0..b.dns_servers_len]) or
-                !std.mem.eql(u8, a.ntp_servers_buf[0..a.ntp_servers_len], b.ntp_servers_buf[0..b.ntp_servers_len]) or
-                !std.mem.eql(u8, a.log_servers_buf[0..a.log_servers_len], b.log_servers_buf[0..b.log_servers_len]) or
-                !std.mem.eql(u8, a.wins_servers_buf[0..a.wins_servers_len], b.wins_servers_buf[0..b.wins_servers_len]) or
                 !std.mem.eql(u8, a.time_offset_buf[0..a.time_offset_len], b.time_offset_buf[0..b.time_offset_len]) or
-                !std.mem.eql(u8, a.tftp_servers_buf[0..a.tftp_servers_len], b.tftp_servers_buf[0..b.tftp_servers_len]) or
                 !std.mem.eql(u8, a.boot_filename_buf[0..a.boot_filename_len], b.boot_filename_buf[0..b.boot_filename_len]) or
-                !std.mem.eql(u8, a.http_boot_url_buf[0..a.http_boot_url_len], b.http_boot_url_buf[0..b.http_boot_url_len]) or
-                !std.mem.eql(u8, a.routes_buf[0..a.routes_len], b.routes_buf[0..b.routes_len]) or
-                !std.mem.eql(u8, a.options_buf[0..a.options_len], b.options_buf[0..b.options_len]))
+                !std.mem.eql(u8, a.http_boot_url_buf[0..a.http_boot_url_len], b.http_boot_url_buf[0..b.http_boot_url_len]))
             {
+                mc_differ = true;
+                break;
+            }
+            // Compare inline entry counts.
+            if (a.domain_search_count != b.domain_search_count or
+                a.dns_servers_count != b.dns_servers_count or
+                a.ntp_servers_count != b.ntp_servers_count or
+                a.log_servers_count != b.log_servers_count or
+                a.wins_servers_count != b.wins_servers_count or
+                a.tftp_servers_count != b.tftp_servers_count or
+                a.route_count != b.route_count or
+                a.option_count != b.option_count)
+            {
+                mc_differ = true;
+                break;
+            }
+            // Compare inline entry contents.
+            var entry_differ = false;
+            for (0..a.domain_search_count) |j| {
+                if (!std.mem.eql(u8, a.domain_search[j].buf[0..a.domain_search[j].len], b.domain_search[j].buf[0..b.domain_search[j].len])) {
+                    entry_differ = true;
+                    break;
+                }
+            }
+            if (!entry_differ) for (0..a.dns_servers_count) |j| {
+                if (!std.mem.eql(u8, a.dns_servers[j].buf[0..a.dns_servers[j].len], b.dns_servers[j].buf[0..b.dns_servers[j].len])) {
+                    entry_differ = true;
+                    break;
+                }
+            };
+            if (!entry_differ) for (0..a.ntp_servers_count) |j| {
+                if (!std.mem.eql(u8, a.ntp_servers[j].buf[0..a.ntp_servers[j].len], b.ntp_servers[j].buf[0..b.ntp_servers[j].len])) {
+                    entry_differ = true;
+                    break;
+                }
+            };
+            if (!entry_differ) for (0..a.log_servers_count) |j| {
+                if (!std.mem.eql(u8, a.log_servers[j].buf[0..a.log_servers[j].len], b.log_servers[j].buf[0..b.log_servers[j].len])) {
+                    entry_differ = true;
+                    break;
+                }
+            };
+            if (!entry_differ) for (0..a.wins_servers_count) |j| {
+                if (!std.mem.eql(u8, a.wins_servers[j].buf[0..a.wins_servers[j].len], b.wins_servers[j].buf[0..b.wins_servers[j].len])) {
+                    entry_differ = true;
+                    break;
+                }
+            };
+            if (!entry_differ) for (0..a.tftp_servers_count) |j| {
+                if (!std.mem.eql(u8, a.tftp_servers[j].buf[0..a.tftp_servers[j].len], b.tftp_servers[j].buf[0..b.tftp_servers[j].len])) {
+                    entry_differ = true;
+                    break;
+                }
+            };
+            if (!entry_differ) for (0..a.route_count) |j| {
+                if (!std.mem.eql(u8, a.routes[j].dest_buf[0..a.routes[j].dest_len], b.routes[j].dest_buf[0..b.routes[j].dest_len]) or
+                    !std.mem.eql(u8, a.routes[j].router_buf[0..a.routes[j].router_len], b.routes[j].router_buf[0..b.routes[j].router_len]))
+                {
+                    entry_differ = true;
+                    break;
+                }
+            };
+            if (!entry_differ) for (0..a.option_count) |j| {
+                if (!std.mem.eql(u8, a.options[j].code_buf[0..a.options[j].code_len], b.options[j].code_buf[0..b.options[j].code_len]) or
+                    !std.mem.eql(u8, a.options[j].value_buf[0..a.options[j].value_len], b.options[j].value_buf[0..b.options[j].value_len]))
+                {
+                    entry_differ = true;
+                    break;
+                }
+            };
+            if (entry_differ) {
                 mc_differ = true;
                 break;
             }
@@ -5075,25 +5219,60 @@ fn buildMacClassesFromForm(allocator: std.mem.Allocator, form: *const PoolForm) 
     var classes = try allocator.alloc(config_mod.MacClass, form.mac_class_count);
     for (0..form.mac_class_count) |i| {
         const mce = &form.mac_classes[i];
-        var mc: config_mod.MacClass = undefined;
-        mc.name = try allocator.dupe(u8, mce.name_buf[0..mce.name_len]);
-        mc.match = try allocator.dupe(u8, mce.match_buf[0..mce.match_len]);
-        mc.router = if (mce.router_len > 0) try allocator.dupe(u8, mce.router_buf[0..mce.router_len]) else null;
-        mc.domain_name = if (mce.domain_name_len > 0) try allocator.dupe(u8, mce.domain_name_buf[0..mce.domain_name_len]) else null;
-        mc.domain_search = try splitCommaDupe(allocator, mce.domain_search_buf[0..mce.domain_search_len]);
-        mc.dns_servers = try splitCommaDupe(allocator, mce.dns_servers_buf[0..mce.dns_servers_len]);
-        mc.ntp_servers = try splitCommaDupe(allocator, mce.ntp_servers_buf[0..mce.ntp_servers_len]);
-        mc.log_servers = try splitCommaDupe(allocator, mce.log_servers_buf[0..mce.log_servers_len]);
-        mc.wins_servers = try splitCommaDupe(allocator, mce.wins_servers_buf[0..mce.wins_servers_len]);
-        mc.time_offset = if (mce.time_offset_len > 0) (std.fmt.parseInt(i32, mce.time_offset_buf[0..mce.time_offset_len], 10) catch null) else null;
-        mc.tftp_servers = try splitCommaDupe(allocator, mce.tftp_servers_buf[0..mce.tftp_servers_len]);
-        mc.boot_filename = if (mce.boot_filename_len > 0) try allocator.dupe(u8, mce.boot_filename_buf[0..mce.boot_filename_len]) else null;
-        mc.http_boot_url = if (mce.http_boot_url_len > 0) try allocator.dupe(u8, mce.http_boot_url_buf[0..mce.http_boot_url_len]) else null;
-        mc.static_routes = try parseMacClassRoutes(allocator, mce.routes_buf[0..mce.routes_len]);
-        mc.dhcp_options = try parseMacClassOptions(allocator, mce.options_buf[0..mce.options_len]);
-        classes[i] = mc;
+        var mcc: config_mod.MacClass = undefined;
+        mcc.name = try allocator.dupe(u8, mce.name_buf[0..mce.name_len]);
+        mcc.match = try allocator.dupe(u8, mce.match_buf[0..mce.match_len]);
+        mcc.router = if (mce.router_len > 0) try allocator.dupe(u8, mce.router_buf[0..mce.router_len]) else null;
+        mcc.domain_name = if (mce.domain_name_len > 0) try allocator.dupe(u8, mce.domain_name_buf[0..mce.domain_name_len]) else null;
+        mcc.time_offset = if (mce.time_offset_len > 0) (std.fmt.parseInt(i32, mce.time_offset_buf[0..mce.time_offset_len], 10) catch null) else null;
+        mcc.boot_filename = if (mce.boot_filename_len > 0) try allocator.dupe(u8, mce.boot_filename_buf[0..mce.boot_filename_len]) else null;
+        mcc.http_boot_url = if (mce.http_boot_url_len > 0) try allocator.dupe(u8, mce.http_boot_url_buf[0..mce.http_boot_url_len]) else null;
+        // Build inline entry arrays from entry structs.
+        mcc.domain_search = try dupeInlineEntries(allocator, &mce.domain_search, mce.domain_search_count);
+        mcc.dns_servers = try dupeInlineEntries(allocator, &mce.dns_servers, mce.dns_servers_count);
+        mcc.ntp_servers = try dupeInlineEntries(allocator, &mce.ntp_servers, mce.ntp_servers_count);
+        mcc.log_servers = try dupeInlineEntries(allocator, &mce.log_servers, mce.log_servers_count);
+        mcc.wins_servers = try dupeInlineEntries(allocator, &mce.wins_servers, mce.wins_servers_count);
+        mcc.tftp_servers = try dupeInlineEntries(allocator, &mce.tftp_servers, mce.tftp_servers_count);
+        // Build static routes from route entries.
+        mcc.static_routes = try buildRoutesFromEntries(allocator, &mce.routes, mce.route_count);
+        // Build DHCP options from option entries.
+        mcc.dhcp_options = try buildOptionsFromEntries(allocator, &mce.options, mce.option_count);
+        classes[i] = mcc;
     }
     return classes;
+}
+
+/// Build static routes from RouteEntry array.
+fn buildRoutesFromEntries(allocator: std.mem.Allocator, entries: []const RouteEntry, count: usize) ![]config_mod.StaticRoute {
+    if (count == 0) return try allocator.alloc(config_mod.StaticRoute, 0);
+    var routes = try allocator.alloc(config_mod.StaticRoute, count);
+    for (0..count) |i| {
+        const re = &entries[i];
+        const dest_str = re.dest_buf[0..re.dest_len];
+        const si = parseSubnet(dest_str) orelse {
+            routes[i] = .{ .destination = .{ 0, 0, 0, 0 }, .prefix_len = 0, .router = .{ 0, 0, 0, 0 } };
+            continue;
+        };
+        const rtr = config_mod.parseIpv4(re.router_buf[0..re.router_len]) catch [4]u8{ 0, 0, 0, 0 };
+        routes[i] = .{ .destination = si.ip, .prefix_len = si.prefix, .router = rtr };
+    }
+    return routes;
+}
+
+/// Build DHCP options from OptionEntry array.
+fn buildOptionsFromEntries(allocator: std.mem.Allocator, entries: []const OptionEntry, count: usize) !std.StringHashMap([]const u8) {
+    var opts = std.StringHashMap([]const u8).init(allocator);
+    for (0..count) |i| {
+        const oe = &entries[i];
+        if (oe.code_len == 0) continue;
+        const k = try allocator.dupe(u8, oe.code_buf[0..oe.code_len]);
+        errdefer allocator.free(k);
+        const v = try allocator.dupe(u8, oe.value_buf[0..oe.value_len]);
+        errdefer allocator.free(v);
+        try opts.put(k, v);
+    }
+    return opts;
 }
 
 /// Parse compact route text "dest1 via gw1, dest2 via gw2" into StaticRoute array.
@@ -6230,7 +6409,7 @@ fn handlePoolServerEditKey(state: *TuiState, key: vaxis.Key) void {
 
     if (key.matches(vaxis.Key.escape, .{})) {
         form.err_len = 0;
-        state.mode = .pool_form;
+        state.mode = subModalParent(form);
         return;
     }
     if (key.matches(vaxis.Key.enter, .{})) {
@@ -6266,7 +6445,7 @@ fn handlePoolServerEditKey(state: *TuiState, key: vaxis.Key) void {
             }
         }
 
-        // Save the entry to the appropriate array.
+        // Save the entry to the appropriate array (parent-aware).
         const entry_arr = serverEditEntryArr(form);
         const count = serverEditCount(form);
         if (form.server_edit_index) |idx| {
@@ -6287,8 +6466,8 @@ fn handlePoolServerEditKey(state: *TuiState, key: vaxis.Key) void {
             }
         }
 
-        // DNS Update Server auto-populate: when saving DNS server at index 0.
-        if (form.server_edit_target == .dns) {
+        // DNS Update Server auto-populate: when saving DNS server at index 0 (pool form only).
+        if (form.server_edit_parent == .pool_form and form.server_edit_target == .dns) {
             const save_idx = form.server_edit_index orelse (form.dns_servers_count - 1);
             if (save_idx == 0 and form.dns_update_server_len == 0) {
                 @memcpy(form.dns_update_server_buf[0..form.server_edit_len], form.server_edit_buf[0..form.server_edit_len]);
@@ -6296,7 +6475,7 @@ fn handlePoolServerEditKey(state: *TuiState, key: vaxis.Key) void {
             }
         }
 
-        state.mode = .pool_form;
+        state.mode = subModalParent(form);
         return;
     }
     // Tab does nothing (single field).
@@ -6352,7 +6531,19 @@ fn isValidDomainName(val: []const u8) bool {
 }
 
 /// Get a mutable pointer to the entry array for the current server_edit_target.
+/// Checks server_edit_parent to return pool form or MAC class edit arrays.
 fn serverEditEntryArr(form: *PoolForm) []InlineEntry {
+    if (form.server_edit_parent == .mac_class_edit) {
+        const mc = &form.mac_class_edit;
+        return switch (form.server_edit_target) {
+            .domain_search => &mc.domain_search,
+            .dns => &mc.dns_servers,
+            .log => &mc.log_servers,
+            .ntp => &mc.ntp_servers,
+            .wins => &mc.wins_servers,
+            .tftp => &mc.tftp_servers,
+        };
+    }
     return switch (form.server_edit_target) {
         .domain_search => &form.domain_search,
         .dns => &form.dns_servers,
@@ -6364,7 +6555,19 @@ fn serverEditEntryArr(form: *PoolForm) []InlineEntry {
 }
 
 /// Get a mutable pointer to the count for the current server_edit_target.
+/// Checks server_edit_parent to return pool form or MAC class edit count.
 fn serverEditCount(form: *PoolForm) *usize {
+    if (form.server_edit_parent == .mac_class_edit) {
+        const mc = &form.mac_class_edit;
+        return switch (form.server_edit_target) {
+            .domain_search => &mc.domain_search_count,
+            .dns => &mc.dns_servers_count,
+            .log => &mc.log_servers_count,
+            .ntp => &mc.ntp_servers_count,
+            .wins => &mc.wins_servers_count,
+            .tftp => &mc.tftp_servers_count,
+        };
+    }
     return switch (form.server_edit_target) {
         .domain_search => &form.domain_search_count,
         .dns => &form.dns_servers_count,
@@ -6376,7 +6579,19 @@ fn serverEditCount(form: *PoolForm) *usize {
 }
 
 /// Get the max capacity for the current server_edit_target.
-fn serverEditMax(form: *const PoolForm) usize {
+/// Checks server_edit_parent to return pool form or MAC class edit max.
+fn serverEditMax(form: *PoolForm) usize {
+    if (form.server_edit_parent == .mac_class_edit) {
+        const mc = &form.mac_class_edit;
+        return switch (form.server_edit_target) {
+            .domain_search => mc.domain_search.len,
+            .dns => mc.dns_servers.len,
+            .log => mc.log_servers.len,
+            .ntp => mc.ntp_servers.len,
+            .wins => mc.wins_servers.len,
+            .tftp => mc.tftp_servers.len,
+        };
+    }
     return switch (form.server_edit_target) {
         .domain_search => form.domain_search.len,
         .dns => form.dns_servers.len,
@@ -6385,6 +6600,27 @@ fn serverEditMax(form: *const PoolForm) usize {
         .wins => form.wins_servers.len,
         .tftp => form.tftp_servers.len,
     };
+}
+
+/// Get mutable route array + count, respecting server_edit_parent context.
+fn activeRoutes(form: *PoolForm) struct { routes: []RouteEntry, count: *usize, max: usize } {
+    if (form.server_edit_parent == .mac_class_edit) {
+        return .{ .routes = &form.mac_class_edit.routes, .count = &form.mac_class_edit.route_count, .max = form.mac_class_edit.routes.len };
+    }
+    return .{ .routes = &form.routes, .count = &form.route_count, .max = form.routes.len };
+}
+
+/// Get mutable option array + count, respecting server_edit_parent context.
+fn activeOptions(form: *PoolForm) struct { options: []OptionEntry, count: *usize, max: usize } {
+    if (form.server_edit_parent == .mac_class_edit) {
+        return .{ .options = &form.mac_class_edit.options, .count = &form.mac_class_edit.option_count, .max = form.mac_class_edit.options.len };
+    }
+    return .{ .options = &form.options, .count = &form.option_count, .max = form.options.len };
+}
+
+/// Return the parent mode for sub-modals based on server_edit_parent.
+fn subModalParent(form: *const PoolForm) TuiMode {
+    return if (form.server_edit_parent == .mac_class_edit) .pool_mac_class_edit else .pool_form;
 }
 
 // ---------------------------------------------------------------------------
@@ -6460,7 +6696,7 @@ fn handlePoolRouteEditKey(state: *TuiState, key: vaxis.Key) void {
 
     if (key.matches(vaxis.Key.escape, .{})) {
         form.err_len = 0;
-        state.mode = .pool_form;
+        state.mode = subModalParent(form);
         return;
     }
     if (key.matches(vaxis.Key.enter, .{})) {
@@ -6504,28 +6740,29 @@ fn handlePoolRouteEditKey(state: *TuiState, key: vaxis.Key) void {
                 return;
             }
         }
-        // Save the route.
+        // Save the route (parent-aware).
+        const ar = activeRoutes(form);
         if (form.route_edit_index) |idx| {
             // Editing existing.
-            if (idx < form.route_count) {
-                @memcpy(form.routes[idx].dest_buf[0..form.route_edit_dest_len], form.route_edit_dest[0..form.route_edit_dest_len]);
-                form.routes[idx].dest_len = form.route_edit_dest_len;
-                @memcpy(form.routes[idx].router_buf[0..form.route_edit_router_len], form.route_edit_router[0..form.route_edit_router_len]);
-                form.routes[idx].router_len = form.route_edit_router_len;
+            if (idx < ar.count.*) {
+                @memcpy(ar.routes[idx].dest_buf[0..form.route_edit_dest_len], form.route_edit_dest[0..form.route_edit_dest_len]);
+                ar.routes[idx].dest_len = form.route_edit_dest_len;
+                @memcpy(ar.routes[idx].router_buf[0..form.route_edit_router_len], form.route_edit_router[0..form.route_edit_router_len]);
+                ar.routes[idx].router_len = form.route_edit_router_len;
             }
         } else {
             // Adding new.
-            if (form.route_count < form.routes.len) {
-                var new_route = &form.routes[form.route_count];
+            if (ar.count.* < ar.max) {
+                var new_route = &ar.routes[ar.count.*];
                 new_route.* = .{};
                 @memcpy(new_route.dest_buf[0..form.route_edit_dest_len], form.route_edit_dest[0..form.route_edit_dest_len]);
                 new_route.dest_len = form.route_edit_dest_len;
                 @memcpy(new_route.router_buf[0..form.route_edit_router_len], form.route_edit_router[0..form.route_edit_router_len]);
                 new_route.router_len = form.route_edit_router_len;
-                form.route_count += 1;
+                ar.count.* += 1;
             }
         }
-        state.mode = .pool_form;
+        state.mode = subModalParent(form);
         return;
     }
     if (key.matches(vaxis.Key.tab, .{}) or key.matches(vaxis.Key.tab, .{ .shift = true })) {
@@ -6647,7 +6884,7 @@ fn handlePoolOptionEditKey(state: *TuiState, key: vaxis.Key) void {
     var form = &state.pool_form;
 
     if (key.matches(vaxis.Key.escape, .{})) {
-        state.mode = .pool_form;
+        state.mode = subModalParent(form);
         return;
     }
     if (key.matches(vaxis.Key.enter, .{})) {
@@ -6672,27 +6909,29 @@ fn handlePoolOptionEditKey(state: *TuiState, key: vaxis.Key) void {
             @memcpy(form.err_buf[0..msg.len], msg);
             return;
         }
+        // Save to parent-aware option array.
+        const ao = activeOptions(form);
         if (form.opt_edit_index) |idx| {
             // Editing existing.
-            if (idx < form.option_count) {
-                @memcpy(form.options[idx].code_buf[0..form.opt_edit_code_len], form.opt_edit_code[0..form.opt_edit_code_len]);
-                form.options[idx].code_len = form.opt_edit_code_len;
-                @memcpy(form.options[idx].value_buf[0..form.opt_edit_value_len], form.opt_edit_value[0..form.opt_edit_value_len]);
-                form.options[idx].value_len = form.opt_edit_value_len;
+            if (idx < ao.count.*) {
+                @memcpy(ao.options[idx].code_buf[0..form.opt_edit_code_len], form.opt_edit_code[0..form.opt_edit_code_len]);
+                ao.options[idx].code_len = form.opt_edit_code_len;
+                @memcpy(ao.options[idx].value_buf[0..form.opt_edit_value_len], form.opt_edit_value[0..form.opt_edit_value_len]);
+                ao.options[idx].value_len = form.opt_edit_value_len;
             }
         } else {
             // Adding new.
-            if (form.option_count < form.options.len) {
-                var new_opt = &form.options[form.option_count];
+            if (ao.count.* < ao.max) {
+                var new_opt = &ao.options[ao.count.*];
                 new_opt.* = .{};
                 @memcpy(new_opt.code_buf[0..form.opt_edit_code_len], form.opt_edit_code[0..form.opt_edit_code_len]);
                 new_opt.code_len = form.opt_edit_code_len;
                 @memcpy(new_opt.value_buf[0..form.opt_edit_value_len], form.opt_edit_value[0..form.opt_edit_value_len]);
                 new_opt.value_len = form.opt_edit_value_len;
-                form.option_count += 1;
+                ao.count.* += 1;
             }
         }
-        state.mode = .pool_form;
+        state.mode = subModalParent(form);
         return;
     }
     if (key.matches(vaxis.Key.tab, .{}) or key.matches(vaxis.Key.tab, .{ .shift = true })) {
@@ -6744,50 +6983,71 @@ fn handlePoolOptionEditKey(state: *TuiState, key: vaxis.Key) void {
 }
 
 // ---------------------------------------------------------------------------
-// MAC class edit modal
+// MAC class edit modal — layout-driven like pool form
 // ---------------------------------------------------------------------------
 
-/// Field metadata for the MAC class edit modal.
+/// Regular text field metadata for the MAC class edit modal.
 const MacClassFieldMeta = struct {
     label: []const u8,
 };
 
+/// Text-only fields in the MAC class form (indexed by mac_class_layout .field_idx).
 const mac_class_field_meta = [_]MacClassFieldMeta{
     .{ .label = "Name" }, // 0 (required)
     .{ .label = "Match" }, // 1 (required, MAC prefix)
     .{ .label = "Router" }, // 2
     .{ .label = "Domain Name" }, // 3
-    .{ .label = "Domain Search" }, // 4 (comma-separated)
-    .{ .label = "DNS Servers" }, // 5 (comma-separated)
-    .{ .label = "NTP Servers" }, // 6 (comma-separated)
-    .{ .label = "Log Servers" }, // 7 (comma-separated)
-    .{ .label = "WINS Servers" }, // 8 (comma-separated)
-    .{ .label = "Time Offset" }, // 9 (signed int)
-    .{ .label = "TFTP Servers" }, // 10 (comma-separated)
-    .{ .label = "Boot Filename" }, // 11
-    .{ .label = "HTTP Boot URL" }, // 12
-    .{ .label = "Static Routes" }, // 13 (compact format)
-    .{ .label = "DHCP Options" }, // 14 (code=value,...)
+    .{ .label = "Boot Filename" }, // 4
+    .{ .label = "HTTP Boot URL" }, // 5
+    .{ .label = "Time Offset" }, // 6 (signed int)
 };
 
-/// Return the string value of a MAC class field by index.
+/// Inline target enum for MAC class form inline sections.
+const McInlineTarget = enum { domain_search, dns, ntp, log, wins, tftp, routes, options };
+
+const MacClassLayoutKind = enum { section, field, inline_section };
+
+const MacClassLayoutItem = struct {
+    kind: MacClassLayoutKind,
+    label: []const u8 = "",
+    field_idx: ?u8 = null,
+    inline_target: ?McInlineTarget = null,
+};
+
+const mac_class_layout = [_]MacClassLayoutItem{
+    .{ .kind = .section, .label = "Identity" },
+    .{ .kind = .field, .field_idx = 0 }, // Name
+    .{ .kind = .field, .field_idx = 1 }, // Match
+    .{ .kind = .section, .label = "Overrides" },
+    .{ .kind = .field, .field_idx = 2 }, // Router
+    .{ .kind = .field, .field_idx = 3 }, // Domain Name
+    .{ .kind = .inline_section, .label = "Search Domains", .inline_target = .domain_search },
+    .{ .kind = .inline_section, .label = "DNS Servers", .inline_target = .dns },
+    .{ .kind = .inline_section, .label = "NTP Servers", .inline_target = .ntp },
+    .{ .kind = .inline_section, .label = "Log Servers", .inline_target = .log },
+    .{ .kind = .inline_section, .label = "WINS Servers", .inline_target = .wins },
+    .{ .kind = .section, .label = "Boot" },
+    .{ .kind = .inline_section, .label = "TFTP Servers", .inline_target = .tftp },
+    .{ .kind = .field, .field_idx = 4 }, // Boot Filename
+    .{ .kind = .field, .field_idx = 5 }, // HTTP Boot URL
+    .{ .kind = .section, .label = "Time" },
+    .{ .kind = .field, .field_idx = 6 }, // Time Offset
+    .{ .kind = .section, .label = "Routes" },
+    .{ .kind = .inline_section, .label = "Static Routes", .inline_target = .routes },
+    .{ .kind = .section, .label = "Other" },
+    .{ .kind = .inline_section, .label = "DHCP Options", .inline_target = .options },
+};
+
+/// Return the string value of a MAC class text field by field_idx.
 fn macClassFieldVal(mc: *const MacClassEntry, idx: u8) []const u8 {
     return switch (idx) {
         0 => mc.name_buf[0..mc.name_len],
         1 => mc.match_buf[0..mc.match_len],
         2 => mc.router_buf[0..mc.router_len],
         3 => mc.domain_name_buf[0..mc.domain_name_len],
-        4 => mc.domain_search_buf[0..mc.domain_search_len],
-        5 => mc.dns_servers_buf[0..mc.dns_servers_len],
-        6 => mc.ntp_servers_buf[0..mc.ntp_servers_len],
-        7 => mc.log_servers_buf[0..mc.log_servers_len],
-        8 => mc.wins_servers_buf[0..mc.wins_servers_len],
-        9 => mc.time_offset_buf[0..mc.time_offset_len],
-        10 => mc.tftp_servers_buf[0..mc.tftp_servers_len],
-        11 => mc.boot_filename_buf[0..mc.boot_filename_len],
-        12 => mc.http_boot_url_buf[0..mc.http_boot_url_len],
-        13 => mc.routes_buf[0..mc.routes_len],
-        14 => mc.options_buf[0..mc.options_len],
+        4 => mc.boot_filename_buf[0..mc.boot_filename_len],
+        5 => mc.http_boot_url_buf[0..mc.http_boot_url_len],
+        6 => mc.time_offset_buf[0..mc.time_offset_len],
         else => "",
     };
 }
@@ -6796,25 +7056,106 @@ fn macClassFieldLen(mc: *const MacClassEntry, idx: u8) usize {
     return macClassFieldVal(mc, idx).len;
 }
 
-/// Return a mutable pointer to the MAC class field buffer + length for text input.
+/// Return a mutable pointer to the MAC class text field buffer + length.
 fn macClassFieldBuf(mc: *MacClassEntry, idx: u8) ?struct { buf: []u8, len: *usize } {
     return switch (idx) {
         0 => .{ .buf = &mc.name_buf, .len = &mc.name_len },
         1 => .{ .buf = &mc.match_buf, .len = &mc.match_len },
         2 => .{ .buf = &mc.router_buf, .len = &mc.router_len },
         3 => .{ .buf = &mc.domain_name_buf, .len = &mc.domain_name_len },
-        4 => .{ .buf = &mc.domain_search_buf, .len = &mc.domain_search_len },
-        5 => .{ .buf = &mc.dns_servers_buf, .len = &mc.dns_servers_len },
-        6 => .{ .buf = &mc.ntp_servers_buf, .len = &mc.ntp_servers_len },
-        7 => .{ .buf = &mc.log_servers_buf, .len = &mc.log_servers_len },
-        8 => .{ .buf = &mc.wins_servers_buf, .len = &mc.wins_servers_len },
-        9 => .{ .buf = &mc.time_offset_buf, .len = &mc.time_offset_len },
-        10 => .{ .buf = &mc.tftp_servers_buf, .len = &mc.tftp_servers_len },
-        11 => .{ .buf = &mc.boot_filename_buf, .len = &mc.boot_filename_len },
-        12 => .{ .buf = &mc.http_boot_url_buf, .len = &mc.http_boot_url_len },
-        13 => .{ .buf = &mc.routes_buf, .len = &mc.routes_len },
-        14 => .{ .buf = &mc.options_buf, .len = &mc.options_len },
+        4 => .{ .buf = &mc.boot_filename_buf, .len = &mc.boot_filename_len },
+        5 => .{ .buf = &mc.http_boot_url_buf, .len = &mc.http_boot_url_len },
+        6 => .{ .buf = &mc.time_offset_buf, .len = &mc.time_offset_len },
         else => null,
+    };
+}
+
+/// Get the inline entry count for a MAC class inline target.
+fn mcInlineCount(mc: *const MacClassEntry, target: McInlineTarget) usize {
+    return switch (target) {
+        .domain_search => mc.domain_search_count,
+        .dns => mc.dns_servers_count,
+        .ntp => mc.ntp_servers_count,
+        .log => mc.log_servers_count,
+        .wins => mc.wins_servers_count,
+        .tftp => mc.tftp_servers_count,
+        .routes => mc.route_count,
+        .options => mc.option_count,
+    };
+}
+
+/// Get the max capacity for a MAC class inline target.
+fn mcInlineMax(target: McInlineTarget) usize {
+    return switch (target) {
+        .domain_search => 8,
+        .dns => 8,
+        .ntp => 4,
+        .log => 4,
+        .wins => 2,
+        .tftp => 4,
+        .routes => 16,
+        .options => 32,
+    };
+}
+
+/// Which kind of navigable item the active field in the MAC class form corresponds to.
+const McActiveFieldKind = enum { field, add_button, inline_entry };
+const McActiveFieldInfo = struct {
+    kind: McActiveFieldKind,
+    field_idx: u8 = 0,
+    inline_target: ?McInlineTarget = null,
+    entry_index: usize = 0,
+};
+
+/// Walk mac_class_layout to determine what the given active_field maps to.
+fn mcActiveFieldInfo(mc: *const MacClassEntry, af: u8) McActiveFieldInfo {
+    var pos: u8 = 0;
+    for (mac_class_layout) |item| {
+        switch (item.kind) {
+            .section => {},
+            .field => {
+                if (pos == af) return .{ .kind = .field, .field_idx = item.field_idx.? };
+                pos += 1;
+            },
+            .inline_section => {
+                const target = item.inline_target.?;
+                const count = mcInlineCount(mc, target);
+                // [+] Add button.
+                if (pos == af) return .{ .kind = .add_button, .inline_target = target };
+                pos += 1;
+                // Existing entries.
+                for (0..count) |ei| {
+                    if (pos == af) return .{ .kind = .inline_entry, .inline_target = target, .entry_index = ei };
+                    pos += 1;
+                }
+            },
+        }
+    }
+    return .{ .kind = .field, .field_idx = 0 };
+}
+
+/// Total navigable fields in the MAC class form.
+fn mcTotalFields(mc: *const MacClassEntry) u8 {
+    var pos: u8 = 0;
+    for (mac_class_layout) |item| {
+        switch (item.kind) {
+            .section => {},
+            .field => pos += 1,
+            .inline_section => {
+                pos += 1; // [+] button
+                pos += @intCast(mcInlineCount(mc, item.inline_target.?));
+            },
+        }
+    }
+    return pos;
+}
+
+/// Cursor length for a given mac class active field position.
+fn mcActiveFieldCursorLen(mc: *const MacClassEntry, af: u8) usize {
+    const info = mcActiveFieldInfo(mc, af);
+    return switch (info.kind) {
+        .field => macClassFieldLen(mc, info.field_idx),
+        .add_button, .inline_entry => 0,
     };
 }
 
@@ -6833,6 +7174,7 @@ fn renderMacClassEdit(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator
     const bg: vaxis.Style = .{ .bg = .{ .rgb = .{ 20, 20, 30 } } };
     const border_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 160, 255 } }, .bg = bg.bg };
     drawBox(box, 0, 0, BOX_W, BOX_H, border_style);
+    const section_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 80, 180, 255 } }, .bg = bg.bg, .bold = true };
     const label_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 160, 160, 190 } }, .bg = bg.bg };
     const field_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 200, 200, 200 } }, .bg = .{ .rgb = .{ 30, 30, 45 } } };
     const active_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 255, 255 } }, .bg = .{ .rgb = .{ 50, 80, 140 } } };
@@ -6840,6 +7182,7 @@ fn renderMacClassEdit(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator
     const err_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 80, 80 } }, .bg = bg.bg };
     const close_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 80, 80 } }, .bg = bg.bg, .bold = true };
     const title_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 255, 200, 80 } }, .bg = bg.bg, .bold = true };
+    const opt_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 180, 180, 200 } }, .bg = .{ .rgb = .{ 30, 30, 42 } } };
 
     // Title + [X].
     const title: []const u8 = if (form.mac_class_edit_index == null) "  New MAC Class" else "  Edit MAC Class";
@@ -6849,60 +7192,201 @@ fn renderMacClassEdit(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator
     const field_h = BOX_H - 4; // top border + title + hint + bottom border
     const LABEL_W: u16 = 17;
     const FIELD_W: u16 = BOX_W -| LABEL_W -| 3;
-    const total_fields: u16 = mac_class_field_meta.len;
 
-    // Auto-scroll to keep active field visible.
-    const active_field = form.mac_class_edit_field;
-    var scroll_row: u16 = form.mac_class_edit_scroll;
-    if (active_field < scroll_row) scroll_row = active_field;
-    if (active_field >= scroll_row + field_h) scroll_row = active_field - field_h + 1;
-    const max_scroll = if (total_fields > field_h) total_fields - field_h else 0;
+    // Compute the absolute row for the active field by walking mac_class_layout.
+    var active_row: u16 = 0;
+    var total_rows: u16 = 0;
+    {
+        var r: u16 = 0;
+        var pos: u8 = 0;
+        for (mac_class_layout) |item| {
+            switch (item.kind) {
+                .section => r += 2,
+                .field => {
+                    if (pos == form.mac_class_edit_field) active_row = r;
+                    r += 1;
+                    pos += 1;
+                },
+                .inline_section => {
+                    const count = mcInlineCount(mc, item.inline_target.?);
+                    if (pos == form.mac_class_edit_field) active_row = r;
+                    r += 1; // [+] button
+                    pos += 1;
+                    for (0..count) |_| {
+                        if (pos == form.mac_class_edit_field) active_row = r;
+                        r += 1;
+                        pos += 1;
+                    }
+                },
+            }
+        }
+        total_rows = r;
+    }
+
+    // Center active field in view.
+    const half = field_h / 2;
+    var scroll_row: u16 = if (active_row > half) active_row - half else 0;
+    const max_scroll = if (total_rows + 1 > field_h) total_rows + 1 - field_h else 0;
     if (scroll_row > max_scroll) scroll_row = max_scroll;
     form.mac_class_edit_scroll = scroll_row;
 
-    // Render fields.
+    // ---- Render by walking mac_class_layout ----
+    var abs_row: u16 = 0;
     var draw_row: u16 = 2;
-    var fi: u8 = @intCast(scroll_row);
-    while (fi < total_fields and draw_row < BOX_H - 2) : (fi += 1) {
-        const is_active = fi == active_field;
-        const meta = mac_class_field_meta[fi];
-        const val = macClassFieldVal(mc, fi);
+    var pos: u8 = 0;
 
-        const label_text = std.fmt.allocPrint(fa, "  {s:<15}", .{meta.label}) catch "";
-        _ = box.print(&.{.{ .text = label_text, .style = label_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
+    for (mac_class_layout) |item| {
+        if (draw_row >= BOX_H - 2) break;
+        switch (item.kind) {
+            .section => {
+                // Blank line.
+                if (abs_row >= scroll_row and draw_row < BOX_H - 2) draw_row += 1;
+                abs_row += 1;
+                // Section header.
+                if (abs_row >= scroll_row and draw_row < BOX_H - 2) {
+                    const sec_text = std.fmt.allocPrint(fa, "  -- {s} --", .{item.label}) catch "";
+                    _ = box.print(&.{.{ .text = sec_text, .style = section_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
+                    draw_row += 1;
+                }
+                abs_row += 1;
+            },
+            .field => {
+                const fi = item.field_idx.?;
+                const is_active = pos == form.mac_class_edit_field;
+                if (abs_row >= scroll_row and draw_row < BOX_H - 2) {
+                    const meta = mac_class_field_meta[fi];
+                    const style = if (is_active) active_style else field_style;
+                    const val = macClassFieldVal(mc, fi);
+                    const label_text = std.fmt.allocPrint(fa, "  {s:<15}", .{meta.label}) catch "";
+                    _ = box.print(&.{.{ .text = label_text, .style = label_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
 
-        const style = if (is_active) active_style else field_style;
-        const fw = @as(usize, FIELD_W);
-        var vis_start: usize = 0;
-        var cursor_vis: usize = 0;
-        if (is_active) {
-            const cur = @min(form.mac_class_edit_cursor, val.len);
-            if (cur >= fw) {
-                vis_start = cur - fw + 1;
-            }
-            cursor_vis = cur - vis_start;
+                    const fw = @as(usize, FIELD_W);
+                    var vis_start: usize = 0;
+                    var cursor_vis: usize = 0;
+                    if (is_active) {
+                        const cur = @min(form.mac_class_edit_cursor, val.len);
+                        if (cur >= fw) vis_start = cur - fw + 1;
+                        cursor_vis = cur - vis_start;
+                    }
+                    const vis_end = @min(val.len, vis_start + fw);
+                    const vis_text = val[vis_start..vis_end];
+                    const pad_len = fw - vis_text.len;
+                    const padded = std.fmt.allocPrint(fa, "{s}{s}", .{ vis_text, spaces(fa, @intCast(pad_len)) catch "" }) catch vis_text;
+                    _ = box.print(&.{.{ .text = padded, .style = style }}, .{ .col_offset = LABEL_W + 1, .row_offset = draw_row, .wrap = .none });
+
+                    // Cursor block.
+                    if (is_active) {
+                        const cursor_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 20, 20, 30 } }, .bg = .{ .rgb = .{ 100, 160, 255 } } };
+                        const cursor_col = LABEL_W + 1 + @as(u16, @intCast(cursor_vis));
+                        if (cursor_col < BOX_W -| 1) {
+                            const cur_abs = vis_start + cursor_vis;
+                            const ch: []const u8 = if (cur_abs < val.len) val[cur_abs..][0..1] else " ";
+                            _ = box.print(&.{.{ .text = ch, .style = cursor_style }}, .{ .col_offset = cursor_col, .row_offset = draw_row, .wrap = .none });
+                        }
+                    }
+                    draw_row += 1;
+                }
+                abs_row += 1;
+                pos += 1;
+            },
+            .inline_section => {
+                const target = item.inline_target.?;
+                const count = mcInlineCount(mc, target);
+                const is_add_active = pos == form.mac_class_edit_field;
+
+                // [+] Add button.
+                if (abs_row >= scroll_row and draw_row < BOX_H - 2) {
+                    const add_label = std.fmt.allocPrint(fa, "  {s:<15}", .{item.label}) catch "";
+                    _ = box.print(&.{.{ .text = add_label, .style = label_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
+                    const at_max = count >= mcInlineMax(target);
+                    if (at_max) {
+                        const max_text = std.fmt.allocPrint(fa, "(max {d})", .{mcInlineMax(target)}) catch "(max)";
+                        const grey_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 100, 100, 130 } }, .bg = .{ .rgb = .{ 30, 30, 45 } } };
+                        _ = box.print(&.{.{ .text = max_text, .style = grey_style }}, .{ .col_offset = LABEL_W + 1, .row_offset = draw_row, .wrap = .none });
+                    } else {
+                        const add_fs = if (is_add_active) active_style else field_style;
+                        _ = box.print(&.{.{ .text = "[+] Add ", .style = add_fs }}, .{ .col_offset = LABEL_W + 1, .row_offset = draw_row, .wrap = .none });
+                    }
+                    draw_row += 1;
+                }
+                abs_row += 1;
+                pos += 1;
+
+                // Inline entries.
+                for (0..count) |ei| {
+                    if (draw_row >= BOX_H - 2) break;
+                    const is_entry_active = pos == form.mac_class_edit_field;
+                    if (abs_row >= scroll_row and draw_row < BOX_H - 2) {
+                        const line_text: []const u8 = switch (target) {
+                            .domain_search => blk: {
+                                const d = &mc.domain_search[ei];
+                                break :blk if (d.len > 0) d.buf[0..d.len] else "...";
+                            },
+                            .dns => blk: {
+                                const d = &mc.dns_servers[ei];
+                                break :blk if (d.len > 0) d.buf[0..d.len] else "...";
+                            },
+                            .ntp => blk: {
+                                const d = &mc.ntp_servers[ei];
+                                break :blk if (d.len > 0) d.buf[0..d.len] else "...";
+                            },
+                            .log => blk: {
+                                const d = &mc.log_servers[ei];
+                                break :blk if (d.len > 0) d.buf[0..d.len] else "...";
+                            },
+                            .wins => blk: {
+                                const d = &mc.wins_servers[ei];
+                                break :blk if (d.len > 0) d.buf[0..d.len] else "...";
+                            },
+                            .tftp => blk: {
+                                const d = &mc.tftp_servers[ei];
+                                break :blk if (d.len > 0) d.buf[0..d.len] else "...";
+                            },
+                            .routes => blk: {
+                                const r = &mc.routes[ei];
+                                const dest = r.dest_buf[0..r.dest_len];
+                                const router = r.router_buf[0..r.router_len];
+                                break :blk std.fmt.allocPrint(fa, "{s} via {s}", .{
+                                    if (dest.len > 0) dest else "...",
+                                    if (router.len > 0) router else "...",
+                                }) catch "";
+                            },
+                            .options => blk: {
+                                const o = &mc.options[ei];
+                                const code = o.code_buf[0..o.code_len];
+                                const opt_label = std.fmt.allocPrint(fa, "  Option {s:>3}", .{if (code.len > 0) code else "?"}) catch "  Option   ?";
+                                _ = box.print(&.{.{ .text = opt_label, .style = label_style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
+                                const val = o.value_buf[0..o.value_len];
+                                break :blk if (val.len > 0) val else "";
+                            },
+                        };
+                        const os = if (is_entry_active) active_style else opt_style;
+                        const opt_trunc = line_text[0..@min(line_text.len, FIELD_W)];
+                        const opt_pad = FIELD_W -| @as(u16, @intCast(opt_trunc.len));
+                        const opt_padded = try fa.alloc(u8, opt_pad);
+                        @memset(opt_padded, ' ');
+                        _ = box.print(&.{.{ .text = opt_trunc, .style = os }}, .{ .col_offset = LABEL_W + 1, .row_offset = draw_row, .wrap = .none });
+                        _ = box.print(&.{.{ .text = opt_padded, .style = os }}, .{ .col_offset = LABEL_W + 1 + @as(u16, @intCast(opt_trunc.len)), .row_offset = draw_row, .wrap = .none });
+                        draw_row += 1;
+                    }
+                    abs_row += 1;
+                    pos += 1;
+                }
+            },
         }
-        const vis_end = @min(val.len, vis_start + fw);
-        const vis_text = val[vis_start..vis_end];
-        const pad_len = fw - vis_text.len;
-        const padded = std.fmt.allocPrint(fa, "{s}{s}", .{ vis_text, spaces(fa, @intCast(pad_len)) catch "" }) catch vis_text;
-        _ = box.print(&.{.{ .text = padded, .style = style }}, .{ .col_offset = LABEL_W + 1, .row_offset = draw_row, .wrap = .none });
-
-        // Cursor block.
-        if (is_active) {
-            const cursor_style: vaxis.Style = .{ .fg = .{ .rgb = .{ 20, 20, 30 } }, .bg = .{ .rgb = .{ 100, 160, 255 } } };
-            const cursor_col = LABEL_W + 1 + @as(u16, @intCast(cursor_vis));
-            if (cursor_col < BOX_W -| 1) {
-                const cur_abs = vis_start + cursor_vis;
-                const ch: []const u8 = if (cur_abs < val.len) val[cur_abs..][0..1] else " ";
-                _ = box.print(&.{.{ .text = ch, .style = cursor_style }}, .{ .col_offset = cursor_col, .row_offset = draw_row, .wrap = .none });
-            }
-        }
-        draw_row += 1;
     }
 
     // Hint + error.
-    _ = box.print(&.{.{ .text = "  Tab:next  Shift-Tab:prev  Enter:save  Esc:cancel", .style = hint_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 2, .wrap = .none });
+    const af_info = mcActiveFieldInfo(mc, form.mac_class_edit_field);
+    const is_add_btn = af_info.kind == .add_button;
+    const is_inline_entry = af_info.kind == .inline_entry;
+    const hint_text: []const u8 = if (is_inline_entry)
+        "  Enter:edit  d:delete  Tab:next  Esc:cancel"
+    else if (is_add_btn)
+        "  Enter:add  Tab:next  Shift-Tab:prev  Esc:cancel"
+    else
+        "  Tab:next  Shift-Tab:prev  Enter:save  Esc:cancel";
+    _ = box.print(&.{.{ .text = hint_text, .style = hint_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 2, .wrap = .none });
     if (form.err_len > 0) {
         _ = box.print(&.{.{ .text = form.err_buf[0..form.err_len], .style = err_style }}, .{ .col_offset = 1, .row_offset = BOX_H - 3, .wrap = .none });
     }
@@ -6910,6 +7394,7 @@ fn renderMacClassEdit(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator
 
 fn handleMacClassEditKey(state: *TuiState, key: vaxis.Key) void {
     var form = &state.pool_form;
+    const mc = &form.mac_class_edit;
 
     if (key.matches(vaxis.Key.escape, .{})) {
         form.err_len = 0;
@@ -6917,7 +7402,138 @@ fn handleMacClassEditKey(state: *TuiState, key: vaxis.Key) void {
         return;
     }
 
+    // Determine what the active_field points to via mac_class_layout walk.
+    const af_info = mcActiveFieldInfo(mc, form.mac_class_edit_field);
+
+    // 'd' deletes selected inline entry.
+    if (key.matches('d', .{}) and af_info.kind == .inline_entry) {
+        const target = af_info.inline_target.?;
+        const ei = af_info.entry_index;
+        switch (target) {
+            .domain_search => deleteInlineEntry(InlineEntry, &form.mac_class_edit.domain_search, &form.mac_class_edit.domain_search_count, ei),
+            .dns => deleteInlineEntry(InlineEntry, &form.mac_class_edit.dns_servers, &form.mac_class_edit.dns_servers_count, ei),
+            .ntp => deleteInlineEntry(InlineEntry, &form.mac_class_edit.ntp_servers, &form.mac_class_edit.ntp_servers_count, ei),
+            .log => deleteInlineEntry(InlineEntry, &form.mac_class_edit.log_servers, &form.mac_class_edit.log_servers_count, ei),
+            .wins => deleteInlineEntry(InlineEntry, &form.mac_class_edit.wins_servers, &form.mac_class_edit.wins_servers_count, ei),
+            .tftp => deleteInlineEntry(InlineEntry, &form.mac_class_edit.tftp_servers, &form.mac_class_edit.tftp_servers_count, ei),
+            .routes => {
+                if (ei < form.mac_class_edit.route_count) {
+                    var i: usize = ei;
+                    while (i + 1 < form.mac_class_edit.route_count) : (i += 1) {
+                        form.mac_class_edit.routes[i] = form.mac_class_edit.routes[i + 1];
+                    }
+                    form.mac_class_edit.route_count -= 1;
+                }
+            },
+            .options => {
+                if (ei < form.mac_class_edit.option_count) {
+                    var i: usize = ei;
+                    while (i + 1 < form.mac_class_edit.option_count) : (i += 1) {
+                        form.mac_class_edit.options[i] = form.mac_class_edit.options[i + 1];
+                    }
+                    form.mac_class_edit.option_count -= 1;
+                }
+            },
+        }
+        if (form.mac_class_edit_field >= mcTotalFields(&form.mac_class_edit)) form.mac_class_edit_field -|= 1;
+        return;
+    }
+
     if (key.matches(vaxis.Key.enter, .{})) {
+        // [+] Add buttons.
+        if (af_info.kind == .add_button) {
+            const target = af_info.inline_target.?;
+            form.server_edit_parent = .mac_class_edit;
+            switch (target) {
+                .domain_search, .dns, .ntp, .log, .wins, .tftp => {
+                    if (mcInlineCount(mc, target) >= mcInlineMax(target)) return;
+                    const set: ServerEditTarget = switch (target) {
+                        .domain_search => .domain_search,
+                        .dns => .dns,
+                        .ntp => .ntp,
+                        .log => .log,
+                        .wins => .wins,
+                        .tftp => .tftp,
+                        else => unreachable,
+                    };
+                    openServerEdit(form, state, set, null);
+                    return;
+                },
+                .routes => {
+                    form.err_len = 0;
+                    form.route_edit_dest_len = 0;
+                    form.route_edit_router_len = 0;
+                    form.route_edit_field = 0;
+                    form.route_edit_cursor = 0;
+                    form.route_edit_index = null;
+                    state.mode = .pool_route_edit;
+                    return;
+                },
+                .options => {
+                    form.err_len = 0;
+                    form.opt_edit_code_len = 0;
+                    form.opt_edit_value_len = 0;
+                    form.opt_edit_field = 0;
+                    form.opt_edit_cursor = 0;
+                    form.opt_edit_index = null;
+                    state.mode = .pool_option_edit;
+                    return;
+                },
+            }
+        }
+        // Existing inline entries -> edit.
+        if (af_info.kind == .inline_entry) {
+            const target = af_info.inline_target.?;
+            const ei = af_info.entry_index;
+            form.server_edit_parent = .mac_class_edit;
+            switch (target) {
+                .domain_search, .dns, .ntp, .log, .wins, .tftp => {
+                    const set: ServerEditTarget = switch (target) {
+                        .domain_search => .domain_search,
+                        .dns => .dns,
+                        .ntp => .ntp,
+                        .log => .log,
+                        .wins => .wins,
+                        .tftp => .tftp,
+                        else => unreachable,
+                    };
+                    openServerEdit(form, state, set, ei);
+                    return;
+                },
+                .routes => {
+                    if (ei < form.mac_class_edit.route_count) {
+                        form.err_len = 0;
+                        const r = &form.mac_class_edit.routes[ei];
+                        @memcpy(form.route_edit_dest[0..r.dest_len], r.dest_buf[0..r.dest_len]);
+                        form.route_edit_dest_len = r.dest_len;
+                        @memcpy(form.route_edit_router[0..r.router_len], r.router_buf[0..r.router_len]);
+                        form.route_edit_router_len = r.router_len;
+                        form.route_edit_field = 0;
+                        form.route_edit_cursor = r.dest_len;
+                        form.route_edit_index = ei;
+                        state.mode = .pool_route_edit;
+                    }
+                    return;
+                },
+                .options => {
+                    if (ei < form.mac_class_edit.option_count) {
+                        form.err_len = 0;
+                        const o = &form.mac_class_edit.options[ei];
+                        @memcpy(form.opt_edit_code[0..o.code_len], o.code_buf[0..o.code_len]);
+                        form.opt_edit_code_len = o.code_len;
+                        @memcpy(form.opt_edit_value[0..o.value_len], o.value_buf[0..o.value_len]);
+                        form.opt_edit_value_len = o.value_len;
+                        form.opt_edit_field = 0;
+                        form.opt_edit_cursor = o.code_len;
+                        form.opt_edit_index = ei;
+                        state.mode = .pool_option_edit;
+                    }
+                    return;
+                },
+            }
+        }
+
+        // Regular field: Enter saves the form.
         form.err_len = 0;
         // Validate required fields.
         if (form.mac_class_edit.name_len == 0) {
@@ -6955,12 +7571,10 @@ fn handleMacClassEditKey(state: *TuiState, key: vaxis.Key) void {
         }
         // Save.
         if (form.mac_class_edit_index) |idx| {
-            // Editing existing.
             if (idx < form.mac_class_count) {
                 form.mac_classes[idx] = form.mac_class_edit;
             }
         } else {
-            // Adding new.
             if (form.mac_class_count < form.mac_classes.len) {
                 form.mac_classes[form.mac_class_count] = form.mac_class_edit;
                 form.mac_class_count += 1;
@@ -6972,27 +7586,31 @@ fn handleMacClassEditKey(state: *TuiState, key: vaxis.Key) void {
 
     // Field navigation.
     if (key.matches(vaxis.Key.tab, .{}) or key.matches(vaxis.Key.down, .{})) {
-        if (form.mac_class_edit_field + 1 < mac_class_field_meta.len) {
+        if (form.mac_class_edit_field + 1 < mcTotalFields(&form.mac_class_edit)) {
             form.mac_class_edit_field += 1;
-            form.mac_class_edit_cursor = macClassFieldLen(&form.mac_class_edit, form.mac_class_edit_field);
+            form.mac_class_edit_cursor = mcActiveFieldCursorLen(&form.mac_class_edit, form.mac_class_edit_field);
         }
         return;
     }
     if (key.matches(vaxis.Key.tab, .{ .shift = true }) or key.matches(vaxis.Key.up, .{})) {
         if (form.mac_class_edit_field > 0) {
             form.mac_class_edit_field -= 1;
-            form.mac_class_edit_cursor = macClassFieldLen(&form.mac_class_edit, form.mac_class_edit_field);
+            form.mac_class_edit_cursor = mcActiveFieldCursorLen(&form.mac_class_edit, form.mac_class_edit_field);
         }
         return;
     }
 
+    // Non-text fields: [+] buttons, inline entries.
+    if (af_info.kind != .field) return;
+
     // Cursor movement.
+    const fi = af_info.field_idx;
     if (key.matches(vaxis.Key.left, .{})) {
         if (form.mac_class_edit_cursor > 0) form.mac_class_edit_cursor -= 1;
         return;
     }
     if (key.matches(vaxis.Key.right, .{})) {
-        if (form.mac_class_edit_cursor < macClassFieldLen(&form.mac_class_edit, form.mac_class_edit_field))
+        if (form.mac_class_edit_cursor < macClassFieldLen(&form.mac_class_edit, fi))
             form.mac_class_edit_cursor += 1;
         return;
     }
@@ -7001,22 +7619,22 @@ fn handleMacClassEditKey(state: *TuiState, key: vaxis.Key) void {
         return;
     }
     if (key.matches(vaxis.Key.end, .{})) {
-        form.mac_class_edit_cursor = macClassFieldLen(&form.mac_class_edit, form.mac_class_edit_field);
+        form.mac_class_edit_cursor = macClassFieldLen(&form.mac_class_edit, fi);
         return;
     }
 
     // Text editing.
     if (key.matches(vaxis.Key.backspace, .{})) {
-        if (macClassFieldBuf(&form.mac_class_edit, form.mac_class_edit_field)) |fb| {
+        if (macClassFieldBuf(&form.mac_class_edit, fi)) |fb| {
             if (form.mac_class_edit_cursor > 0 and fb.len.* > 0) {
-                const pos = form.mac_class_edit_cursor;
-                if (pos < fb.len.*) std.mem.copyForwards(u8, fb.buf[pos - 1 ..], fb.buf[pos..fb.len.*]);
+                const tpos = form.mac_class_edit_cursor;
+                if (tpos < fb.len.*) std.mem.copyForwards(u8, fb.buf[tpos - 1 ..], fb.buf[tpos..fb.len.*]);
                 fb.len.* -= 1;
                 form.mac_class_edit_cursor -= 1;
             }
         }
     } else if (key.matches(vaxis.Key.delete, .{})) {
-        if (macClassFieldBuf(&form.mac_class_edit, form.mac_class_edit_field)) |fb| {
+        if (macClassFieldBuf(&form.mac_class_edit, fi)) |fb| {
             if (form.mac_class_edit_cursor < fb.len.*) {
                 std.mem.copyForwards(u8, fb.buf[form.mac_class_edit_cursor..], fb.buf[form.mac_class_edit_cursor + 1 .. fb.len.*]);
                 fb.len.* -= 1;
@@ -7024,27 +7642,23 @@ fn handleMacClassEditKey(state: *TuiState, key: vaxis.Key) void {
         }
     } else if (key.codepoint >= 0x20 and key.codepoint <= 0x7E) {
         const ch: u8 = @intCast(key.codepoint);
-        const fi = form.mac_class_edit_field;
         // Per-field character filtering.
         const allowed = switch (fi) {
             0 => (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_' or ch == '-' or ch == ' ', // Name
             1 => (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f') or (ch >= 'A' and ch <= 'F') or ch == ':' or ch == '*', // Match
             2 => (ch >= '0' and ch <= '9') or ch == '.', // Router (IP)
             3 => (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '.' or ch == '-' or ch == '_', // Domain Name
-            4, 5, 6, 7, 8, 10 => (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '.' or ch == '-' or ch == '_' or ch == ',' or ch == ' ' or ch == ':', // Comma-separated lists
-            9 => (ch >= '0' and ch <= '9') or ch == '-', // Time Offset (signed int)
-            11 => (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '.' or ch == '_' or ch == '-' or ch == '/', // Boot filename
-            12 => ch >= 0x20 and ch <= 0x7E, // HTTP Boot URL (all printable)
-            13 => (ch >= '0' and ch <= '9') or ch == '.' or ch == '/' or ch == ',' or ch == ' ' or ch == 'v' or ch == 'i' or ch == 'a', // Routes
-            14 => ch >= 0x20 and ch <= 0x7E, // DHCP Options (all printable)
+            4 => (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '.' or ch == '_' or ch == '-' or ch == '/', // Boot filename
+            5 => ch >= 0x20 and ch <= 0x7E, // HTTP Boot URL (all printable)
+            6 => (ch >= '0' and ch <= '9') or ch == '-', // Time Offset (signed int)
             else => true,
         };
         if (!allowed) return;
         if (macClassFieldBuf(&form.mac_class_edit, fi)) |fb| {
             if (fb.len.* < fb.buf.len) {
-                const pos = form.mac_class_edit_cursor;
-                if (pos < fb.len.*) std.mem.copyBackwards(u8, fb.buf[pos + 1 ..], fb.buf[pos..fb.len.*]);
-                fb.buf[pos] = ch;
+                const tpos = form.mac_class_edit_cursor;
+                if (tpos < fb.len.*) std.mem.copyBackwards(u8, fb.buf[tpos + 1 ..], fb.buf[tpos..fb.len.*]);
+                fb.buf[tpos] = ch;
                 fb.len.* += 1;
                 form.mac_class_edit_cursor += 1;
             }
