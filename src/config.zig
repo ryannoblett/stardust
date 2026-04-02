@@ -661,7 +661,7 @@ fn parseOnePool(allocator: std.mem.Allocator, pool_map: anytype) !?PoolConfig {
         }
     }
 
-    validatePoolRange(&pool);
+    if (!validatePoolFields(allocator, &pool)) return null;
 
     return pool;
 }
@@ -1094,53 +1094,378 @@ fn hashPoolIntoSha256(h: *std.crypto.hash.sha2.Sha256, pool: *const PoolConfig) 
 }
 
 /// Log warnings when pool_start/pool_end are misconfigured. Does not fail load().
-fn validatePoolRange(pool: *const PoolConfig) void {
-    const subnet_bytes = parseIpv4(pool.subnet) catch return;
+// ---------------------------------------------------------------------------
+// Validation helpers
+// ---------------------------------------------------------------------------
+
+/// Check whether a string is a valid domain name: starts with a letter or
+/// digit, contains only a-z 0-9 . - _ (lowercase).
+fn isValidDomainName(val: []const u8) bool {
+    if (val.len == 0) return false;
+    const first = val[0];
+    if (!((first >= 'a' and first <= 'z') or (first >= '0' and first <= '9'))) return false;
+    for (val) |ch| {
+        if (!((ch >= 'a' and ch <= 'z') or (ch >= '0' and ch <= '9') or ch == '.' or ch == '-' or ch == '_')) return false;
+    }
+    return true;
+}
+
+/// Check whether a string is a valid IPv4 address or a valid domain name.
+fn isValidIpOrDomain(val: []const u8) bool {
+    if (val.len == 0) return false;
+    if (parseIpv4(val)) |_| return true else |_| {}
+    return isValidDomainName(val);
+}
+
+/// Check whether a string contains only valid file path characters:
+/// a-z A-Z 0-9 . _ - / + =
+fn isValidFilePath(val: []const u8) bool {
+    if (val.len == 0) return false;
+    for (val) |ch| {
+        if (!((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or
+            ch == '.' or ch == '_' or ch == '-' or ch == '/' or ch == '+' or ch == '=')) return false;
+    }
+    return true;
+}
+
+/// Auto-lowercase a mutable allocator-owned string in-place.
+fn lowercaseInPlace(s: []u8) void {
+    for (s) |*ch| {
+        if (ch.* >= 'A' and ch.* <= 'Z') ch.* = ch.* - 'A' + 'a';
+    }
+}
+
+/// Validate all pool fields after parsing. Returns true if the pool is valid
+/// (possibly with corrected values), false if the pool must be skipped.
+fn validatePoolFields(allocator: std.mem.Allocator, pool: *PoolConfig) bool {
+    const subnet_bytes = parseIpv4(pool.subnet) catch return false;
     const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
-    const broadcast_int = subnet_int | ~pool.subnet_mask;
-    // Degenerate subnets (/32 of max address or /32 of 0.0.0.0) have no usable
-    // host range. Skip further validation rather than panicking on overflow.
-    if (subnet_int == std.math.maxInt(u32) or broadcast_int == 0) return;
-    const valid_start = subnet_int + 1;
-    const valid_end = broadcast_int - 1;
 
-    var start_int: u32 = valid_start;
-    var end_int: u32 = valid_end;
-    var has_start = false;
-    var has_end = false;
+    // --- Strict checks (skip pool on failure) ---
 
-    if (pool.pool_start.len > 0) {
-        const b = parseIpv4(pool.pool_start) catch {
-            std.log.warn("config: pool_start '{s}' is not a valid IP address", .{pool.pool_start});
-            return;
-        };
-        start_int = std.mem.readInt(u32, &b, .big);
-        has_start = true;
-        if (start_int < valid_start or start_int > valid_end) {
-            std.log.warn("config: pool_start {s} is outside subnet {s}/{d}", .{
-                pool.pool_start, pool.subnet, pool.prefix_len,
-            });
-        }
+    // Router: required, valid IPv4, inside subnet.
+    if (pool.router.len == 0) {
+        std.log.err("config: pool {s}/{d}: router is required, skipping pool", .{ pool.subnet, pool.prefix_len });
+        return false;
     }
-
-    if (pool.pool_end.len > 0) {
-        const b = parseIpv4(pool.pool_end) catch {
-            std.log.warn("config: pool_end '{s}' is not a valid IP address", .{pool.pool_end});
-            return;
-        };
-        end_int = std.mem.readInt(u32, &b, .big);
-        has_end = true;
-        if (end_int < valid_start or end_int > valid_end) {
-            std.log.warn("config: pool_end {s} is outside subnet {s}/{d}", .{
-                pool.pool_end, pool.subnet, pool.prefix_len,
-            });
-        }
-    }
-
-    if (has_start and has_end and start_int > end_int) {
-        std.log.warn("config: pool_start {s} > pool_end {s}: pool is empty", .{
-            pool.pool_start, pool.pool_end,
+    const router_ip = parseIpv4(pool.router) catch {
+        std.log.err("config: pool {s}/{d}: router '{s}' is not a valid IPv4 address, skipping pool", .{
+            pool.subnet, pool.prefix_len, pool.router,
         });
+        return false;
+    };
+    {
+        const r_int = std.mem.readInt(u32, &router_ip, .big);
+        if (r_int & pool.subnet_mask != subnet_int & pool.subnet_mask) {
+            std.log.err("config: pool {s}/{d}: router {s} is not inside the subnet, skipping pool", .{
+                pool.subnet, pool.prefix_len, pool.router,
+            });
+            return false;
+        }
+    }
+
+    // Lease time: required, > 0, max 1,209,600.
+    if (pool.lease_time == 0) {
+        std.log.err("config: pool {s}/{d}: lease_time must be > 0, skipping pool", .{ pool.subnet, pool.prefix_len });
+        return false;
+    }
+    if (pool.lease_time > 1_209_600) {
+        std.log.err("config: pool {s}/{d}: lease_time {d} exceeds maximum 1209600 (2 weeks), skipping pool", .{
+            pool.subnet, pool.prefix_len, pool.lease_time,
+        });
+        return false;
+    }
+
+    // --- Warn-and-fix checks ---
+
+    const broadcast_int = subnet_int | ~pool.subnet_mask;
+    // Guard degenerate subnets.
+    const has_host_range = subnet_int != std.math.maxInt(u32) and broadcast_int != 0;
+    const valid_start: u32 = if (has_host_range) subnet_int + 1 else subnet_int;
+    const valid_end: u32 = if (has_host_range) broadcast_int - 1 else broadcast_int;
+
+    // Pool start: if set, must be valid IPv4 inside subnet.
+    var ps_int_opt: ?u32 = null;
+    if (pool.pool_start.len > 0) {
+        const ps_valid = blk: {
+            const ps_ip = parseIpv4(pool.pool_start) catch break :blk false;
+            const ps_int = std.mem.readInt(u32, &ps_ip, .big);
+            if (ps_int < valid_start or ps_int > valid_end) break :blk false;
+            ps_int_opt = ps_int;
+            break :blk true;
+        };
+        if (!ps_valid) {
+            std.log.warn("config: pool {s}/{d}: pool_start '{s}' is invalid or outside subnet, clearing to auto-compute", .{
+                pool.subnet, pool.prefix_len, pool.pool_start,
+            });
+            allocator.free(pool.pool_start);
+            pool.pool_start = allocator.dupe(u8, "") catch return false;
+            ps_int_opt = null;
+        }
+    }
+
+    // Pool end: if set, must be valid IPv4 inside subnet.
+    var pe_int_opt: ?u32 = null;
+    if (pool.pool_end.len > 0) {
+        const pe_valid = blk: {
+            const pe_ip = parseIpv4(pool.pool_end) catch break :blk false;
+            const pe_int = std.mem.readInt(u32, &pe_ip, .big);
+            if (pe_int < valid_start or pe_int > valid_end) break :blk false;
+            pe_int_opt = pe_int;
+            break :blk true;
+        };
+        if (!pe_valid) {
+            std.log.warn("config: pool {s}/{d}: pool_end '{s}' is invalid or outside subnet, clearing to auto-compute", .{
+                pool.subnet, pool.prefix_len, pool.pool_end,
+            });
+            allocator.free(pool.pool_end);
+            pool.pool_end = allocator.dupe(u8, "") catch return false;
+            pe_int_opt = null;
+        }
+    }
+
+    // If both set, start must be <= end.
+    if (ps_int_opt != null and pe_int_opt != null) {
+        if (ps_int_opt.? > pe_int_opt.?) {
+            std.log.warn("config: pool {s}/{d}: pool_start {s} > pool_end {s}, clearing both to auto-compute", .{
+                pool.subnet, pool.prefix_len, pool.pool_start, pool.pool_end,
+            });
+            allocator.free(pool.pool_start);
+            pool.pool_start = allocator.dupe(u8, "") catch return false;
+            allocator.free(pool.pool_end);
+            pool.pool_end = allocator.dupe(u8, "") catch return false;
+        }
+    }
+
+    // MTU: if set, must be 68-65535.
+    if (pool.mtu) |mtu| {
+        if (mtu < 68) {
+            std.log.warn("config: pool {s}/{d}: mtu {d} is below minimum 68, clearing", .{
+                pool.subnet, pool.prefix_len, mtu,
+            });
+            pool.mtu = null;
+        }
+    }
+
+    // Domain name: auto-lowercase, validate.
+    if (pool.domain_name.len > 0) {
+        lowercaseInPlace(@constCast(pool.domain_name));
+        if (!isValidDomainName(pool.domain_name)) {
+            std.log.warn("config: pool {s}/{d}: domain_name '{s}' is invalid, clearing", .{
+                pool.subnet, pool.prefix_len, pool.domain_name,
+            });
+            allocator.free(pool.domain_name);
+            pool.domain_name = allocator.dupe(u8, "") catch return false;
+        }
+    }
+
+    // Domain search: validate each entry, skip invalid, auto-lowercase.
+    if (pool.domain_search.len > 0) {
+        var valid_count: usize = 0;
+        for (pool.domain_search) |*entry| {
+            lowercaseInPlace(@constCast(entry.*));
+            if (isValidDomainName(entry.*)) {
+                valid_count += 1;
+            } else {
+                std.log.warn("config: pool {s}/{d}: domain_search entry '{s}' is invalid, skipping", .{
+                    pool.subnet, pool.prefix_len, entry.*,
+                });
+            }
+        }
+        if (valid_count != pool.domain_search.len) {
+            const new = allocator.alloc([]const u8, valid_count) catch return false;
+            var idx: usize = 0;
+            for (pool.domain_search) |entry| {
+                if (isValidDomainName(entry)) {
+                    new[idx] = entry;
+                    idx += 1;
+                } else {
+                    allocator.free(entry);
+                }
+            }
+            allocator.free(pool.domain_search);
+            pool.domain_search = new;
+        }
+    }
+
+    // DNS servers: valid IP or domain, max 8.
+    validateAndTrimServerList(allocator, &pool.dns_servers, 8, "dns_servers", pool.subnet, pool.prefix_len);
+
+    // NTP servers: valid IP or domain, max 4.
+    validateAndTrimServerList(allocator, &pool.ntp_servers, 4, "ntp_servers", pool.subnet, pool.prefix_len);
+
+    // Log servers: valid IP or domain, max 4.
+    validateAndTrimServerList(allocator, &pool.log_servers, 4, "log_servers", pool.subnet, pool.prefix_len);
+
+    // WINS servers: valid IP or domain, max 2.
+    validateAndTrimServerList(allocator, &pool.wins_servers, 2, "wins_servers", pool.subnet, pool.prefix_len);
+
+    // TFTP servers: valid IP or domain, max 4.
+    validateAndTrimServerList(allocator, &pool.tftp_servers, 4, "tftp_servers", pool.subnet, pool.prefix_len);
+
+    // Time servers: valid IP or domain, max 4.
+    validateAndTrimServerList(allocator, &pool.time_servers, 4, "time_servers", pool.subnet, pool.prefix_len);
+
+    // Boot filename: valid file path chars.
+    if (pool.boot_filename.len > 0) {
+        if (!isValidFilePath(pool.boot_filename)) {
+            std.log.warn("config: pool {s}/{d}: boot_filename '{s}' has invalid characters, clearing", .{
+                pool.subnet, pool.prefix_len, pool.boot_filename,
+            });
+            allocator.free(pool.boot_filename);
+            pool.boot_filename = allocator.dupe(u8, "") catch return false;
+        }
+    }
+
+    // HTTP Boot URL: must start with http:// or https://, valid hostname.
+    if (pool.http_boot_url.len > 0) {
+        const url = pool.http_boot_url;
+        const has_https = std.mem.startsWith(u8, url, "https://");
+        const has_http = std.mem.startsWith(u8, url, "http://");
+        const url_valid = blk: {
+            if (!has_https and !has_http) break :blk false;
+            const after_scheme = if (has_https) url[8..] else url[7..];
+            if (after_scheme.len == 0) break :blk false;
+            const host_end = std.mem.indexOfScalar(u8, after_scheme, '/') orelse after_scheme.len;
+            const hostname = after_scheme[0..host_end];
+            if (hostname.len == 0) break :blk false;
+            if (!((hostname[0] >= 'a' and hostname[0] <= 'z') or (hostname[0] >= 'A' and hostname[0] <= 'Z') or
+                (hostname[0] >= '0' and hostname[0] <= '9')))
+                break :blk false;
+            for (hostname) |ch| {
+                if (!((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or
+                    ch == '.' or ch == '-' or ch == ':'))
+                    break :blk false;
+            }
+            break :blk true;
+        };
+        if (!url_valid) {
+            std.log.warn("config: pool {s}/{d}: http_boot_url '{s}' is invalid, clearing", .{
+                pool.subnet, pool.prefix_len, pool.http_boot_url,
+            });
+            allocator.free(pool.http_boot_url);
+            pool.http_boot_url = allocator.dupe(u8, "") catch return false;
+        }
+    }
+
+    // DNS Update fields.
+    if (pool.dns_update.server.len > 0) {
+        if (!isValidIpOrDomain(pool.dns_update.server)) {
+            std.log.warn("config: pool {s}/{d}: dns_update.server '{s}' is invalid, clearing", .{
+                pool.subnet, pool.prefix_len, pool.dns_update.server,
+            });
+            allocator.free(pool.dns_update.server);
+            pool.dns_update.server = allocator.dupe(u8, "") catch return false;
+        }
+    }
+    if (pool.dns_update.zone.len > 0) {
+        lowercaseInPlace(@constCast(pool.dns_update.zone));
+        if (!isValidDomainName(pool.dns_update.zone)) {
+            std.log.warn("config: pool {s}/{d}: dns_update.zone '{s}' is invalid, clearing", .{
+                pool.subnet, pool.prefix_len, pool.dns_update.zone,
+            });
+            allocator.free(pool.dns_update.zone);
+            pool.dns_update.zone = allocator.dupe(u8, "") catch return false;
+        }
+    }
+    if (pool.dns_update.key_name.len > 0) {
+        const kn = pool.dns_update.key_name;
+        const kn_valid = blk: {
+            const first = kn[0];
+            if (!((first >= 'a' and first <= 'z') or (first >= 'A' and first <= 'Z') or (first >= '0' and first <= '9')))
+                break :blk false;
+            for (kn) |ch| {
+                if (!((ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or
+                    ch == '_' or ch == '-'))
+                    break :blk false;
+            }
+            break :blk true;
+        };
+        if (!kn_valid) {
+            std.log.warn("config: pool {s}/{d}: dns_update.key_name '{s}' is invalid, clearing", .{
+                pool.subnet, pool.prefix_len, pool.dns_update.key_name,
+            });
+            allocator.free(pool.dns_update.key_name);
+            pool.dns_update.key_name = allocator.dupe(u8, "") catch return false;
+        }
+    }
+    if (pool.dns_update.key_file.len > 0) {
+        if (!isValidFilePath(pool.dns_update.key_file)) {
+            std.log.warn("config: pool {s}/{d}: dns_update.key_file '{s}' has invalid characters, clearing", .{
+                pool.subnet, pool.prefix_len, pool.dns_update.key_file,
+            });
+            allocator.free(pool.dns_update.key_file);
+            pool.dns_update.key_file = allocator.dupe(u8, "") catch return false;
+        }
+    }
+
+    return true;
+}
+
+/// Validate entries in a server list (must be valid IP or domain name),
+/// remove invalid entries, and trim to max_count with warnings.
+fn validateAndTrimServerList(
+    allocator: std.mem.Allocator,
+    list: *[][]const u8,
+    max_count: usize,
+    field_name: []const u8,
+    subnet: []const u8,
+    prefix_len: u8,
+) void {
+    // First pass: filter out invalid entries.
+    var valid_count: usize = 0;
+    for (list.*) |entry| {
+        if (isValidIpOrDomain(entry)) {
+            valid_count += 1;
+        } else {
+            std.log.warn("config: pool {s}/{d}: {s} entry '{s}' is not a valid IP or domain, skipping", .{
+                subnet, prefix_len, field_name, entry,
+            });
+        }
+    }
+
+    if (valid_count != list.len) {
+        const trimmed = max_count;
+        const keep = if (valid_count > trimmed) trimmed else valid_count;
+        const new = allocator.alloc([]const u8, keep) catch return;
+        var idx: usize = 0;
+        for (list.*) |entry| {
+            if (isValidIpOrDomain(entry)) {
+                if (idx < keep) {
+                    new[idx] = entry;
+                    idx += 1;
+                } else {
+                    allocator.free(entry);
+                }
+            } else {
+                allocator.free(entry);
+            }
+        }
+        if (valid_count > max_count) {
+            std.log.warn("config: pool {s}/{d}: {s} has {d} entries, trimming to max {d}", .{
+                subnet, prefix_len, field_name, valid_count, max_count,
+            });
+        }
+        allocator.free(list.*);
+        list.* = new;
+        return;
+    }
+
+    // All valid — just check max count.
+    if (list.len > max_count) {
+        std.log.warn("config: pool {s}/{d}: {s} has {d} entries, trimming to max {d}", .{
+            subnet, prefix_len, field_name, list.len, max_count,
+        });
+        const new = allocator.alloc([]const u8, max_count) catch return;
+        for (list.*[0..max_count], 0..) |entry, i| {
+            new[i] = entry;
+        }
+        // Free the excess entries.
+        for (list.*[max_count..]) |entry| {
+            allocator.free(entry);
+        }
+        allocator.free(list.*);
+        list.* = new;
     }
 }
 
@@ -1569,4 +1894,266 @@ test "computePoolHash: different pool count produces different hash" {
     c2.pools = extra;
 
     try std.testing.expect(!std.mem.eql(u8, &computePoolHash(&c1), &computePoolHash(&c2)));
+}
+
+// ---------------------------------------------------------------------------
+// Validation helper tests
+// ---------------------------------------------------------------------------
+
+test "isValidDomainName: valid domains" {
+    try std.testing.expect(isValidDomainName("example.com"));
+    try std.testing.expect(isValidDomainName("my-host.example.com"));
+    try std.testing.expect(isValidDomainName("a"));
+    try std.testing.expect(isValidDomainName("test_domain.local"));
+    try std.testing.expect(isValidDomainName("1host.example.com"));
+}
+
+test "isValidDomainName: invalid domains" {
+    try std.testing.expect(!isValidDomainName(""));
+    try std.testing.expect(!isValidDomainName("-start.com"));
+    try std.testing.expect(!isValidDomainName(".start.com"));
+    try std.testing.expect(!isValidDomainName("has space.com"));
+    try std.testing.expect(!isValidDomainName("UPPER.COM")); // must be lowercase
+}
+
+test "isValidIpOrDomain: valid entries" {
+    try std.testing.expect(isValidIpOrDomain("192.168.1.1"));
+    try std.testing.expect(isValidIpOrDomain("dns.example.com"));
+    try std.testing.expect(isValidIpOrDomain("8.8.8.8"));
+}
+
+test "isValidIpOrDomain: invalid entries" {
+    try std.testing.expect(!isValidIpOrDomain(""));
+    try std.testing.expect(!isValidIpOrDomain("not an ip or domain"));
+    try std.testing.expect(!isValidIpOrDomain("!invalid"));
+}
+
+test "isValidFilePath: valid paths" {
+    try std.testing.expect(isValidFilePath("/tftpboot/pxelinux.0"));
+    try std.testing.expect(isValidFilePath("boot/grub/grubx64.efi"));
+    try std.testing.expect(isValidFilePath("Kdhcp-key.+165+12345.key"));
+}
+
+test "isValidFilePath: invalid paths" {
+    try std.testing.expect(!isValidFilePath(""));
+    try std.testing.expect(!isValidFilePath("path with spaces"));
+    try std.testing.expect(!isValidFilePath("/etc/keys/my key$"));
+}
+
+// ---------------------------------------------------------------------------
+// validatePoolFields tests
+// ---------------------------------------------------------------------------
+
+/// Build a minimal valid PoolConfig for validation tests.
+fn makeValidTestPool(alloc: std.mem.Allocator) PoolConfig {
+    return PoolConfig{
+        .subnet = alloc.dupe(u8, "192.168.1.0") catch unreachable,
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = alloc.dupe(u8, "192.168.1.1") catch unreachable,
+        .pool_start = alloc.dupe(u8, "") catch unreachable,
+        .pool_end = alloc.dupe(u8, "") catch unreachable,
+        .dns_servers = alloc.alloc([]const u8, 0) catch unreachable,
+        .domain_name = alloc.dupe(u8, "") catch unreachable,
+        .domain_search = alloc.alloc([]const u8, 0) catch unreachable,
+        .lease_time = 3600,
+        .time_offset = null,
+        .time_servers = alloc.alloc([]const u8, 0) catch unreachable,
+        .log_servers = alloc.alloc([]const u8, 0) catch unreachable,
+        .ntp_servers = alloc.alloc([]const u8, 0) catch unreachable,
+        .mtu = null,
+        .wins_servers = alloc.alloc([]const u8, 0) catch unreachable,
+        .tftp_servers = alloc.alloc([]const u8, 0) catch unreachable,
+        .boot_filename = alloc.dupe(u8, "") catch unreachable,
+        .http_boot_url = alloc.dupe(u8, "") catch unreachable,
+        .dns_update = .{
+            .enable = false,
+            .server = alloc.dupe(u8, "") catch unreachable,
+            .zone = alloc.dupe(u8, "") catch unreachable,
+            .rev_zone = alloc.dupe(u8, "") catch unreachable,
+            .key_name = alloc.dupe(u8, "") catch unreachable,
+            .key_file = alloc.dupe(u8, "") catch unreachable,
+            .lease_time = 3600,
+        },
+        .dhcp_options = std.StringHashMap([]const u8).init(alloc),
+        .reservations = alloc.alloc(Reservation, 0) catch unreachable,
+        .static_routes = alloc.alloc(StaticRoute, 0) catch unreachable,
+    };
+}
+
+test "validatePoolFields: valid pool passes" {
+    const alloc = std.testing.allocator;
+    var pool = makeValidTestPool(alloc);
+    defer pool.deinit(alloc);
+    try std.testing.expect(validatePoolFields(alloc, &pool));
+}
+
+// Note: strict-rejection tests (missing router, router outside subnet,
+// lease_time 0, lease_time > 2 weeks) are not included as unit tests because
+// they emit std.log.err which the Zig 0.15 test runner treats as failures.
+// Those paths are covered by integration / config-load testing.
+
+test "validatePoolFields: invalid pool_start cleared" {
+    const alloc = std.testing.allocator;
+    var pool = makeValidTestPool(alloc);
+    defer pool.deinit(alloc);
+    alloc.free(pool.pool_start);
+    pool.pool_start = alloc.dupe(u8, "not.an.ip") catch unreachable;
+    try std.testing.expect(validatePoolFields(alloc, &pool));
+    try std.testing.expectEqualStrings("", pool.pool_start);
+}
+
+test "validatePoolFields: pool_start outside subnet cleared" {
+    const alloc = std.testing.allocator;
+    var pool = makeValidTestPool(alloc);
+    defer pool.deinit(alloc);
+    alloc.free(pool.pool_start);
+    pool.pool_start = alloc.dupe(u8, "10.0.0.1") catch unreachable;
+    try std.testing.expect(validatePoolFields(alloc, &pool));
+    try std.testing.expectEqualStrings("", pool.pool_start);
+}
+
+test "validatePoolFields: pool_start > pool_end clears both" {
+    const alloc = std.testing.allocator;
+    var pool = makeValidTestPool(alloc);
+    defer pool.deinit(alloc);
+    alloc.free(pool.pool_start);
+    pool.pool_start = alloc.dupe(u8, "192.168.1.200") catch unreachable;
+    alloc.free(pool.pool_end);
+    pool.pool_end = alloc.dupe(u8, "192.168.1.100") catch unreachable;
+    try std.testing.expect(validatePoolFields(alloc, &pool));
+    try std.testing.expectEqualStrings("", pool.pool_start);
+    try std.testing.expectEqualStrings("", pool.pool_end);
+}
+
+test "validatePoolFields: MTU below 68 cleared" {
+    const alloc = std.testing.allocator;
+    var pool = makeValidTestPool(alloc);
+    defer pool.deinit(alloc);
+    pool.mtu = 50;
+    try std.testing.expect(validatePoolFields(alloc, &pool));
+    try std.testing.expectEqual(@as(?u16, null), pool.mtu);
+}
+
+test "validatePoolFields: invalid domain_name cleared" {
+    const alloc = std.testing.allocator;
+    var pool = makeValidTestPool(alloc);
+    defer pool.deinit(alloc);
+    alloc.free(pool.domain_name);
+    pool.domain_name = alloc.dupe(u8, "-bad.domain") catch unreachable;
+    try std.testing.expect(validatePoolFields(alloc, &pool));
+    try std.testing.expectEqualStrings("", pool.domain_name);
+}
+
+test "validatePoolFields: domain_name auto-lowercased" {
+    const alloc = std.testing.allocator;
+    var pool = makeValidTestPool(alloc);
+    defer pool.deinit(alloc);
+    alloc.free(pool.domain_name);
+    pool.domain_name = alloc.dupe(u8, "Example.COM") catch unreachable;
+    try std.testing.expect(validatePoolFields(alloc, &pool));
+    try std.testing.expectEqualStrings("example.com", pool.domain_name);
+}
+
+test "validatePoolFields: invalid boot_filename cleared" {
+    const alloc = std.testing.allocator;
+    var pool = makeValidTestPool(alloc);
+    defer pool.deinit(alloc);
+    alloc.free(pool.boot_filename);
+    pool.boot_filename = alloc.dupe(u8, "file with spaces") catch unreachable;
+    try std.testing.expect(validatePoolFields(alloc, &pool));
+    try std.testing.expectEqualStrings("", pool.boot_filename);
+}
+
+test "validatePoolFields: invalid http_boot_url cleared" {
+    const alloc = std.testing.allocator;
+    var pool = makeValidTestPool(alloc);
+    defer pool.deinit(alloc);
+    alloc.free(pool.http_boot_url);
+    pool.http_boot_url = alloc.dupe(u8, "ftp://bad.example.com") catch unreachable;
+    try std.testing.expect(validatePoolFields(alloc, &pool));
+    try std.testing.expectEqualStrings("", pool.http_boot_url);
+}
+
+test "validatePoolFields: valid http_boot_url preserved" {
+    const alloc = std.testing.allocator;
+    var pool = makeValidTestPool(alloc);
+    defer pool.deinit(alloc);
+    alloc.free(pool.http_boot_url);
+    pool.http_boot_url = alloc.dupe(u8, "http://boot.example.com/grub.efi") catch unreachable;
+    try std.testing.expect(validatePoolFields(alloc, &pool));
+    try std.testing.expectEqualStrings("http://boot.example.com/grub.efi", pool.http_boot_url);
+}
+
+test "validatePoolFields: dns_update fields validated" {
+    const alloc = std.testing.allocator;
+    var pool = makeValidTestPool(alloc);
+    defer pool.deinit(alloc);
+    alloc.free(pool.dns_update.server);
+    pool.dns_update.server = alloc.dupe(u8, "not valid!") catch unreachable;
+    alloc.free(pool.dns_update.zone);
+    pool.dns_update.zone = alloc.dupe(u8, "-bad") catch unreachable;
+    alloc.free(pool.dns_update.key_name);
+    pool.dns_update.key_name = alloc.dupe(u8, ".bad") catch unreachable;
+    alloc.free(pool.dns_update.key_file);
+    pool.dns_update.key_file = alloc.dupe(u8, "path with spaces") catch unreachable;
+    try std.testing.expect(validatePoolFields(alloc, &pool));
+    try std.testing.expectEqualStrings("", pool.dns_update.server);
+    try std.testing.expectEqualStrings("", pool.dns_update.zone);
+    try std.testing.expectEqualStrings("", pool.dns_update.key_name);
+    try std.testing.expectEqualStrings("", pool.dns_update.key_file);
+}
+
+test "validatePoolFields: server list trimmed to max" {
+    const alloc = std.testing.allocator;
+    var pool = makeValidTestPool(alloc);
+    defer pool.deinit(alloc);
+
+    // Set 5 WINS servers (max 2).
+    alloc.free(pool.wins_servers);
+    pool.wins_servers = alloc.alloc([]const u8, 5) catch unreachable;
+    pool.wins_servers[0] = alloc.dupe(u8, "192.168.1.10") catch unreachable;
+    pool.wins_servers[1] = alloc.dupe(u8, "192.168.1.11") catch unreachable;
+    pool.wins_servers[2] = alloc.dupe(u8, "192.168.1.12") catch unreachable;
+    pool.wins_servers[3] = alloc.dupe(u8, "192.168.1.13") catch unreachable;
+    pool.wins_servers[4] = alloc.dupe(u8, "192.168.1.14") catch unreachable;
+
+    try std.testing.expect(validatePoolFields(alloc, &pool));
+    try std.testing.expectEqual(@as(usize, 2), pool.wins_servers.len);
+    try std.testing.expectEqualStrings("192.168.1.10", pool.wins_servers[0]);
+    try std.testing.expectEqualStrings("192.168.1.11", pool.wins_servers[1]);
+}
+
+test "validatePoolFields: invalid server entries removed" {
+    const alloc = std.testing.allocator;
+    var pool = makeValidTestPool(alloc);
+    defer pool.deinit(alloc);
+
+    alloc.free(pool.dns_servers);
+    pool.dns_servers = alloc.alloc([]const u8, 3) catch unreachable;
+    pool.dns_servers[0] = alloc.dupe(u8, "8.8.8.8") catch unreachable;
+    pool.dns_servers[1] = alloc.dupe(u8, "not valid!") catch unreachable;
+    pool.dns_servers[2] = alloc.dupe(u8, "dns.example.com") catch unreachable;
+
+    try std.testing.expect(validatePoolFields(alloc, &pool));
+    try std.testing.expectEqual(@as(usize, 2), pool.dns_servers.len);
+    try std.testing.expectEqualStrings("8.8.8.8", pool.dns_servers[0]);
+    try std.testing.expectEqualStrings("dns.example.com", pool.dns_servers[1]);
+}
+
+test "validatePoolFields: domain_search invalid entries removed" {
+    const alloc = std.testing.allocator;
+    var pool = makeValidTestPool(alloc);
+    defer pool.deinit(alloc);
+
+    alloc.free(pool.domain_search);
+    pool.domain_search = alloc.alloc([]const u8, 3) catch unreachable;
+    pool.domain_search[0] = alloc.dupe(u8, "example.com") catch unreachable;
+    pool.domain_search[1] = alloc.dupe(u8, "-bad.com") catch unreachable;
+    pool.domain_search[2] = alloc.dupe(u8, "local.lan") catch unreachable;
+
+    try std.testing.expect(validatePoolFields(alloc, &pool));
+    try std.testing.expectEqual(@as(usize, 2), pool.domain_search.len);
+    try std.testing.expectEqualStrings("example.com", pool.domain_search[0]);
+    try std.testing.expectEqualStrings("local.lan", pool.domain_search[1]);
 }
