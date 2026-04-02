@@ -352,11 +352,17 @@ fn buildTsigVars(buf: []u8, key_name: []const u8, algo_name: []const u8, now: u6
     return pos;
 }
 
-fn signTsig(msg_buf: []u8, msg_len: usize, key: *const TsigKey, key_name: []const u8) error{NameTooLong}!usize {
+fn signTsig(msg_buf: []u8, msg_len: usize, key: *const TsigKey, key_name: []const u8) error{ NameTooLong, BufferTooSmall }!usize {
     const algo_name = switch (key.algorithm) {
         .hmac_sha256 => "hmac-sha256",
         .hmac_md5 => "hmac-md5.sig-alg.reg.int",
     };
+
+    // Ensure enough space for TSIG record: key_name wire format + type/class/TTL (8)
+    // + RDLENGTH (2) + algo wire format + time(6) + fudge(2) + mac_size(2) + mac(32)
+    // + orig_id(2) + error(2) + other_len(2).
+    const min_space = key_name.len * 2 + 100;
+    if (msg_buf.len < msg_len + min_space) return error.BufferTooSmall;
 
     const now_signed: i64 = std.time.timestamp();
     const now: u64 = @intCast(@max(now_signed, 0));
@@ -800,4 +806,34 @@ test "DNSUpdater: empty key_file leaves tsig_key null (anonymous updates)" {
     const updater = try DNSUpdater.create(std.testing.allocator, &cfg);
     defer updater.cleanup();
     try std.testing.expect(updater.tsig_key == null);
+}
+
+test "signTsig: returns BufferTooSmall when message nearly fills buffer" {
+    // Create a buffer that is barely large enough for the base message but
+    // leaves insufficient room for the TSIG RR that signTsig must append.
+    var msg: [80]u8 = undefined;
+    var pos: usize = 0;
+    // Header: ID + flags + counts (12 bytes)
+    std.mem.writeInt(u16, msg[0..2], 0xABCD, .big);
+    std.mem.writeInt(u16, msg[2..4], 0x2800, .big);
+    std.mem.writeInt(u16, msg[4..6], 1, .big); // ZOCOUNT
+    std.mem.writeInt(u16, msg[6..8], 0, .big);
+    std.mem.writeInt(u16, msg[8..10], 0, .big);
+    std.mem.writeInt(u16, msg[10..12], 0, .big);
+    pos = 12;
+    // Zone: "example.com" + SOA + IN
+    pos += try encodeDnsName(msg[pos..], "example.com");
+    std.mem.writeInt(u16, msg[pos..][0..2], 6, .big);
+    pos += 2;
+    std.mem.writeInt(u16, msg[pos..][0..2], 1, .big);
+    pos += 2;
+    // Fill most of the remaining buffer so there is no room for TSIG.
+    const fill_len = msg.len - pos;
+    @memset(msg[pos .. pos + fill_len], 0);
+    const msg_len = msg.len; // buffer is completely full
+
+    var key_bytes = "test_secret_key!".*;
+    const key = TsigKey{ .algorithm = .hmac_sha256, .secret = &key_bytes, .allocator = std.testing.allocator };
+    const result = signTsig(&msg, msg_len, &key, "dhcp-update");
+    try std.testing.expectError(error.BufferTooSmall, result);
 }

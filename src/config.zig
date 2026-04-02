@@ -461,7 +461,7 @@ fn parseOnePool(allocator: std.mem.Allocator, pool_map: anytype) !?PoolConfig {
         if (v.asList()) |list| {
             allocator.free(pool.tftp_servers);
             pool.tftp_servers = try allocator.alloc([]const u8, list.len);
-            for (pool.tftp_servers) |*s| s.* = "";
+            for (pool.tftp_servers) |*s| s.* = allocator.alloc(u8, 0) catch unreachable;
             for (list, 0..) |item, i| {
                 pool.tftp_servers[i] = try allocator.dupe(u8, item.asScalar() orelse "");
             }
@@ -491,7 +491,7 @@ fn parseOnePool(allocator: std.mem.Allocator, pool_map: anytype) !?PoolConfig {
         if (legacy_count > 0) {
             allocator.free(pool.tftp_servers);
             pool.tftp_servers = try allocator.alloc([]const u8, legacy_count);
-            for (pool.tftp_servers) |*s| s.* = "";
+            for (pool.tftp_servers) |*s| s.* = allocator.alloc(u8, 0) catch unreachable;
             var idx: usize = 0;
             if (legacy_name) |name| {
                 pool.tftp_servers[idx] = try allocator.dupe(u8, name);
@@ -534,7 +534,7 @@ fn parseOnePool(allocator: std.mem.Allocator, pool_map: anytype) !?PoolConfig {
         if (v.asList()) |list| {
             allocator.free(pool.dns_servers);
             pool.dns_servers = try allocator.alloc([]const u8, list.len);
-            for (pool.dns_servers) |*s| s.* = "";
+            for (pool.dns_servers) |*s| s.* = allocator.alloc(u8, 0) catch unreachable;
             for (list, 0..) |item, i| {
                 pool.dns_servers[i] = try allocator.dupe(u8, item.asScalar() orelse "");
             }
@@ -545,7 +545,7 @@ fn parseOnePool(allocator: std.mem.Allocator, pool_map: anytype) !?PoolConfig {
         if (v.asList()) |list| {
             allocator.free(pool.domain_search);
             pool.domain_search = try allocator.alloc([]const u8, list.len);
-            for (pool.domain_search) |*s| s.* = "";
+            for (pool.domain_search) |*s| s.* = allocator.alloc(u8, 0) catch unreachable;
             for (list, 0..) |item, i| {
                 pool.domain_search[i] = try allocator.dupe(u8, item.asScalar() orelse "");
             }
@@ -556,7 +556,7 @@ fn parseOnePool(allocator: std.mem.Allocator, pool_map: anytype) !?PoolConfig {
         if (v.asList()) |list| {
             allocator.free(pool.time_servers);
             pool.time_servers = try allocator.alloc([]const u8, list.len);
-            for (pool.time_servers) |*s| s.* = "";
+            for (pool.time_servers) |*s| s.* = allocator.alloc(u8, 0) catch unreachable;
             for (list, 0..) |item, i| {
                 pool.time_servers[i] = try allocator.dupe(u8, item.asScalar() orelse "");
             }
@@ -567,7 +567,7 @@ fn parseOnePool(allocator: std.mem.Allocator, pool_map: anytype) !?PoolConfig {
         if (v.asList()) |list| {
             allocator.free(pool.log_servers);
             pool.log_servers = try allocator.alloc([]const u8, list.len);
-            for (pool.log_servers) |*s| s.* = "";
+            for (pool.log_servers) |*s| s.* = allocator.alloc(u8, 0) catch unreachable;
             for (list, 0..) |item, i| {
                 pool.log_servers[i] = try allocator.dupe(u8, item.asScalar() orelse "");
             }
@@ -578,7 +578,7 @@ fn parseOnePool(allocator: std.mem.Allocator, pool_map: anytype) !?PoolConfig {
         if (v.asList()) |list| {
             allocator.free(pool.ntp_servers);
             pool.ntp_servers = try allocator.alloc([]const u8, list.len);
-            for (pool.ntp_servers) |*s| s.* = "";
+            for (pool.ntp_servers) |*s| s.* = allocator.alloc(u8, 0) catch unreachable;
             for (list, 0..) |item, i| {
                 pool.ntp_servers[i] = try allocator.dupe(u8, item.asScalar() orelse "");
             }
@@ -595,7 +595,7 @@ fn parseOnePool(allocator: std.mem.Allocator, pool_map: anytype) !?PoolConfig {
         if (v.asList()) |list| {
             allocator.free(pool.wins_servers);
             pool.wins_servers = try allocator.alloc([]const u8, list.len);
-            for (pool.wins_servers) |*s| s.* = "";
+            for (pool.wins_servers) |*s| s.* = allocator.alloc(u8, 0) catch unreachable;
             for (list, 0..) |item, i| {
                 pool.wins_servers[i] = try allocator.dupe(u8, item.asScalar() orelse "");
             }

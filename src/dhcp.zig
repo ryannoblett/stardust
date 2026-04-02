@@ -5070,3 +5070,102 @@ test "OFFER includes WINS option 44 and Cisco TFTP option 150" {
     try std.testing.expect(found_44);
     try std.testing.expect(found_150);
 }
+
+// ---------------------------------------------------------------------------
+// shuffleIps unit tests
+// ---------------------------------------------------------------------------
+
+test "shuffleIps: zero items does not crash" {
+    var items = [_][4]u8{};
+    shuffleIps(&items, 42);
+}
+
+test "shuffleIps: single item unchanged" {
+    var items = [_][4]u8{.{ 10, 0, 0, 1 }};
+    shuffleIps(&items, 42);
+    try std.testing.expectEqual([4]u8{ 10, 0, 0, 1 }, items[0]);
+}
+
+test "shuffleIps: deterministic with fixed seed" {
+    var a = [_][4]u8{ .{ 1, 1, 1, 1 }, .{ 2, 2, 2, 2 }, .{ 3, 3, 3, 3 }, .{ 4, 4, 4, 4 } };
+    var b = [_][4]u8{ .{ 1, 1, 1, 1 }, .{ 2, 2, 2, 2 }, .{ 3, 3, 3, 3 }, .{ 4, 4, 4, 4 } };
+    shuffleIps(&a, 12345);
+    shuffleIps(&b, 12345);
+    // Same seed must produce identical order.
+    try std.testing.expectEqualSlices([4]u8, &a, &b);
+}
+
+test "shuffleIps: different seeds produce different orders" {
+    var a = [_][4]u8{ .{ 1, 1, 1, 1 }, .{ 2, 2, 2, 2 }, .{ 3, 3, 3, 3 }, .{ 4, 4, 4, 4 }, .{ 5, 5, 5, 5 } };
+    var b = [_][4]u8{ .{ 1, 1, 1, 1 }, .{ 2, 2, 2, 2 }, .{ 3, 3, 3, 3 }, .{ 4, 4, 4, 4 }, .{ 5, 5, 5, 5 } };
+    shuffleIps(&a, 1);
+    shuffleIps(&b, 999999);
+    // With 5 items and wildly different seeds, the orders should differ.
+    var same = true;
+    for (a, b) |ai, bi| {
+        if (!std.mem.eql(u8, &ai, &bi)) {
+            same = false;
+            break;
+        }
+    }
+    try std.testing.expect(!same);
+}
+
+// ---------------------------------------------------------------------------
+// Option 66 from tftp_servers[0] test
+// ---------------------------------------------------------------------------
+
+test "OFFER includes option 66 (TFTP server name) from tftp_servers[0] as string" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+
+    // Set tftp_servers to two entries.
+    alloc.free(cfg.pools[0].tftp_servers);
+    cfg.pools[0].tftp_servers = try alloc.alloc([]const u8, 2);
+    cfg.pools[0].tftp_servers[0] = try alloc.dupe(u8, "10.0.0.5");
+    cfg.pools[0].tftp_servers[1] = try alloc.dupe(u8, "10.0.0.6");
+    cfg.pools[0].pool_start = blk: {
+        alloc.free(cfg.pools[0].pool_start);
+        break :blk try alloc.dupe(u8, "192.168.1.10");
+    };
+    cfg.pools[0].pool_end = blk: {
+        alloc.free(cfg.pools[0].pool_end);
+        break :blk try alloc.dupe(u8, "192.168.1.20");
+    };
+
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    // Build a DISCOVER with PRL requesting option 66.
+    var buf align(4) = [_]u8{0} ** 512;
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(&buf));
+    hdr.op = 1;
+    hdr.htype = 1;
+    hdr.hlen = 6;
+    hdr.xid = 0x66666666;
+    hdr.magic = dhcp_magic_cookie;
+    @memcpy(hdr.chaddr[0..6], &[6]u8{ 0xAA, 0xBB, 0xCC, 0x66, 0x66, 0x66 });
+    var i: usize = dhcp_min_packet_size;
+    buf[i] = @intFromEnum(OptionCode.MessageType);
+    buf[i + 1] = 1;
+    buf[i + 2] = @intFromEnum(MessageType.DHCPDISCOVER);
+    i += 3;
+    buf[i] = @intFromEnum(OptionCode.ParameterRequestList);
+    buf[i + 1] = 1;
+    buf[i + 2] = 66; // request option 66
+    i += 3;
+    buf[i] = @intFromEnum(OptionCode.End);
+    i += 1;
+
+    const resp = try server.processPacket(buf[0..i]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+
+    // Verify option 66 is "10.0.0.5" as a raw string (not IP-encoded 4 bytes).
+    const opt66 = DHCPServer.getOption(resp.?, .TftpServerName);
+    try std.testing.expect(opt66 != null);
+    try std.testing.expectEqualStrings("10.0.0.5", opt66.?);
+}

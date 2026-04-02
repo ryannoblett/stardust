@@ -222,14 +222,8 @@ pub const StateStore = struct {
 
     /// Add or update a lease without acquiring a lock or saving. Caller must hold write lock.
     fn addLeaseUnlocked(store: *StateStore, lease: Lease) !void {
-        // Remove old entry for this MAC if present.
-        if (store.leases.fetchRemove(lease.mac)) |kv| {
-            store.allocator.free(kv.value.mac);
-            store.allocator.free(kv.value.ip);
-            if (kv.value.hostname) |h| store.allocator.free(h);
-            if (kv.value.client_id) |c| store.allocator.free(c);
-        }
-
+        // Allocate all new strings BEFORE removing the old entry so that OOM
+        // does not cause data loss (the old lease stays intact on failure).
         const mac = try store.allocator.dupe(u8, lease.mac);
         errdefer store.allocator.free(mac);
         const ip = try store.allocator.dupe(u8, lease.ip);
@@ -238,6 +232,14 @@ pub const StateStore = struct {
         errdefer if (hostname) |h| store.allocator.free(h);
         const client_id: ?[]const u8 = if (lease.client_id) |c| try store.allocator.dupe(u8, c) else null;
         errdefer if (client_id) |c| store.allocator.free(c);
+
+        // Now that all allocations succeeded, remove the old entry (if any).
+        if (store.leases.fetchRemove(lease.mac)) |kv| {
+            store.allocator.free(kv.value.mac);
+            store.allocator.free(kv.value.ip);
+            if (kv.value.hostname) |h| store.allocator.free(h);
+            if (kv.value.client_id) |c| store.allocator.free(c);
+        }
 
         try store.leases.put(mac, .{
             .mac = mac,
@@ -811,4 +813,71 @@ fn makeTestStoreAt(allocator: std.mem.Allocator, dir: []const u8) !*StateStore {
         .leases = std.StringHashMap(Lease).init(allocator),
     };
     return store;
+}
+
+test "addLeaseUnlocked: updating same MAC replaces IP" {
+    const alloc = std.testing.allocator;
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+
+    // Add a lease for a MAC.
+    try store.addLeaseUnlocked(.{
+        .mac = "aa:bb:cc:dd:ee:01",
+        .ip = "192.168.1.10",
+        .hostname = "host-a",
+        .expires = std.time.timestamp() + 3600,
+        .client_id = null,
+    });
+    try std.testing.expectEqual(@as(usize, 1), store.leases.count());
+    try std.testing.expectEqualStrings("192.168.1.10", store.leases.get("aa:bb:cc:dd:ee:01").?.ip);
+    try std.testing.expectEqualStrings("host-a", store.leases.get("aa:bb:cc:dd:ee:01").?.hostname.?);
+
+    // Update the same MAC with a new IP and hostname.
+    try store.addLeaseUnlocked(.{
+        .mac = "aa:bb:cc:dd:ee:01",
+        .ip = "192.168.1.20",
+        .hostname = "host-b",
+        .expires = std.time.timestamp() + 7200,
+        .client_id = null,
+    });
+
+    // Still only one entry; old IP replaced.
+    try std.testing.expectEqual(@as(usize, 1), store.leases.count());
+    const updated = store.leases.get("aa:bb:cc:dd:ee:01").?;
+    try std.testing.expectEqualStrings("192.168.1.20", updated.ip);
+    try std.testing.expectEqualStrings("host-b", updated.hostname.?);
+}
+
+test "addLeaseUnlocked: old IP mapping gone after MAC update" {
+    const alloc = std.testing.allocator;
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+
+    // Add lease with IP .10.
+    try store.addLeaseUnlocked(.{
+        .mac = "aa:bb:cc:dd:ee:02",
+        .ip = "192.168.1.10",
+        .hostname = null,
+        .expires = std.time.timestamp() + 3600,
+        .client_id = null,
+    });
+
+    // Update same MAC with IP .20.
+    try store.addLeaseUnlocked(.{
+        .mac = "aa:bb:cc:dd:ee:02",
+        .ip = "192.168.1.20",
+        .hostname = null,
+        .expires = std.time.timestamp() + 3600,
+        .client_id = null,
+    });
+
+    // getLeaseByIp for the old IP should return null (no lease has it).
+    store.lock.lockShared();
+    defer store.lock.unlockShared();
+    var found_old_ip = false;
+    var it = store.leases.valueIterator();
+    while (it.next()) |lease| {
+        if (std.mem.eql(u8, lease.ip, "192.168.1.10")) found_old_ip = true;
+    }
+    try std.testing.expect(!found_old_ip);
 }

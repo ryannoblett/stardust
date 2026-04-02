@@ -4448,8 +4448,8 @@ fn computePoolDiff(server: *AdminServer, state: *TuiState) void {
     var tmp_form: PoolForm = .{};
     populatePoolForm(&tmp_form, pool);
 
-    // Sync-breaking field indices: subnet(0), pool_start(2), pool_end(3), lease_time(5)
-    const sync_fields = [_]u8{ 0, 2, 3, 5 };
+    // Sync-breaking field indices: subnet(0), pool_start(2), pool_end(3), lease_time(4)
+    const sync_fields = [_]u8{ 0, 2, 3, 4 };
 
     var fi: u8 = 0;
     while (fi < PoolForm.REGULAR_FIELD_COUNT) : (fi += 1) {
@@ -4721,7 +4721,7 @@ fn buildPoolFromFormInner(
     pool.domain_name = try allocator.dupe(u8, form.domain_name_buf[0..form.domain_name_len]);
     errdefer allocator.free(pool.domain_name);
     pool.domain_search = try allocator.alloc([]const u8, form.domain_search_count);
-    for (pool.domain_search) |*s| s.* = "";
+    for (pool.domain_search) |*s| s.* = allocator.alloc(u8, 0) catch unreachable;
     errdefer {
         for (pool.domain_search) |s| allocator.free(s);
         allocator.free(pool.domain_search);
@@ -4819,7 +4819,7 @@ fn buildRoutesFromForm(allocator: std.mem.Allocator, form: *const PoolForm) ![]c
 fn dupeInlineEntries(allocator: std.mem.Allocator, entries: anytype, count: usize) ![][]const u8 {
     if (count == 0) return try allocator.alloc([]const u8, 0);
     const result = try allocator.alloc([]const u8, count);
-    for (result) |*s| s.* = "";
+    for (result) |*s| s.* = allocator.alloc(u8, 0) catch unreachable;
     errdefer {
         for (result) |s| allocator.free(s);
         allocator.free(result);
@@ -4846,7 +4846,7 @@ fn splitCommaDupe(allocator: std.mem.Allocator, input: []const u8) ![][]const u8
     }
     if (count == 0) return try allocator.alloc([]const u8, 0);
     const result = try allocator.alloc([]const u8, count);
-    for (result) |*s| s.* = "";
+    for (result) |*s| s.* = allocator.alloc(u8, 0) catch unreachable;
     errdefer {
         for (result) |s| allocator.free(s);
         allocator.free(result);
@@ -7791,4 +7791,124 @@ test "validatePoolForm: valid with DHCP options and routes" {
     @memcpy(form.options[0].value_buf[0..9], "10.0.0.99");
     form.options[0].value_len = 9;
     try std.testing.expect(validatePoolForm(&form) == null);
+}
+
+// ---------------------------------------------------------------------------
+// validateReservationForm tests
+// ---------------------------------------------------------------------------
+
+test "validateReservationForm: valid minimal IP + MAC" {
+    var form = ReservationForm{};
+    @memcpy(form.ip_buf[0..11], "192.168.1.5");
+    form.ip_len = 11;
+    @memcpy(form.mac_buf[0..17], "aa:bb:cc:dd:ee:ff");
+    form.mac_len = 17;
+    try std.testing.expect(validateReservationForm(&form) == null);
+}
+
+test "validateReservationForm: missing IP fails" {
+    var form = ReservationForm{};
+    @memcpy(form.mac_buf[0..17], "aa:bb:cc:dd:ee:ff");
+    form.mac_len = 17;
+    try std.testing.expect(validateReservationForm(&form) != null);
+}
+
+test "validateReservationForm: missing MAC fails" {
+    var form = ReservationForm{};
+    @memcpy(form.ip_buf[0..11], "192.168.1.5");
+    form.ip_len = 11;
+    try std.testing.expect(validateReservationForm(&form) != null);
+}
+
+test "validateReservationForm: invalid IP format fails" {
+    var form = ReservationForm{};
+    @memcpy(form.ip_buf[0..7], "not.a.i");
+    form.ip_len = 7;
+    @memcpy(form.mac_buf[0..17], "aa:bb:cc:dd:ee:ff");
+    form.mac_len = 17;
+    try std.testing.expect(validateReservationForm(&form) != null);
+}
+
+test "validateReservationForm: MAC with dashes normalizes to colons" {
+    var form = ReservationForm{};
+    @memcpy(form.ip_buf[0..11], "192.168.1.5");
+    form.ip_len = 11;
+    @memcpy(form.mac_buf[0..17], "aa-bb-cc-dd-ee-ff");
+    form.mac_len = 17;
+    try std.testing.expect(validateReservationForm(&form) == null);
+    try std.testing.expectEqualStrings("aa:bb:cc:dd:ee:ff", form.mac_buf[0..form.mac_len]);
+}
+
+test "validateReservationForm: MAC uppercase normalizes to lowercase" {
+    var form = ReservationForm{};
+    @memcpy(form.ip_buf[0..11], "192.168.1.5");
+    form.ip_len = 11;
+    @memcpy(form.mac_buf[0..17], "AA:BB:CC:DD:EE:FF");
+    form.mac_len = 17;
+    try std.testing.expect(validateReservationForm(&form) == null);
+    try std.testing.expectEqualStrings("aa:bb:cc:dd:ee:ff", form.mac_buf[0..form.mac_len]);
+}
+
+test "validateReservationForm: invalid MAC length fails" {
+    var form = ReservationForm{};
+    @memcpy(form.ip_buf[0..11], "192.168.1.5");
+    form.ip_len = 11;
+    @memcpy(form.mac_buf[0..11], "aa:bb:cc:dd");
+    form.mac_len = 11;
+    try std.testing.expect(validateReservationForm(&form) != null);
+}
+
+test "validateReservationForm: valid hostname passes" {
+    var form = ReservationForm{};
+    @memcpy(form.ip_buf[0..11], "192.168.1.5");
+    form.ip_len = 11;
+    @memcpy(form.mac_buf[0..17], "aa:bb:cc:dd:ee:ff");
+    form.mac_len = 17;
+    @memcpy(form.hostname_buf[0..7], "printer");
+    form.hostname_len = 7;
+    try std.testing.expect(validateReservationForm(&form) == null);
+}
+
+test "validateReservationForm: hostname uppercase auto-lowercases" {
+    var form = ReservationForm{};
+    @memcpy(form.ip_buf[0..11], "192.168.1.5");
+    form.ip_len = 11;
+    @memcpy(form.mac_buf[0..17], "aa:bb:cc:dd:ee:ff");
+    form.mac_len = 17;
+    @memcpy(form.hostname_buf[0..7], "Printer");
+    form.hostname_len = 7;
+    try std.testing.expect(validateReservationForm(&form) == null);
+    try std.testing.expectEqualStrings("printer", form.hostname_buf[0..form.hostname_len]);
+}
+
+test "validateReservationForm: hostname starting with dash fails" {
+    var form = ReservationForm{};
+    @memcpy(form.ip_buf[0..11], "192.168.1.5");
+    form.ip_len = 11;
+    @memcpy(form.mac_buf[0..17], "aa:bb:cc:dd:ee:ff");
+    form.mac_len = 17;
+    @memcpy(form.hostname_buf[0..8], "-printer");
+    form.hostname_len = 8;
+    try std.testing.expect(validateReservationForm(&form) != null);
+}
+
+test "validateReservationForm: hostname with invalid chars fails" {
+    var form = ReservationForm{};
+    @memcpy(form.ip_buf[0..11], "192.168.1.5");
+    form.ip_len = 11;
+    @memcpy(form.mac_buf[0..17], "aa:bb:cc:dd:ee:ff");
+    form.mac_len = 17;
+    @memcpy(form.hostname_buf[0..9], "host_name");
+    form.hostname_len = 9;
+    try std.testing.expect(validateReservationForm(&form) != null);
+}
+
+test "validateReservationForm: empty hostname is valid (optional)" {
+    var form = ReservationForm{};
+    @memcpy(form.ip_buf[0..11], "192.168.1.5");
+    form.ip_len = 11;
+    @memcpy(form.mac_buf[0..17], "aa:bb:cc:dd:ee:ff");
+    form.mac_len = 17;
+    // hostname_len stays 0 (default)
+    try std.testing.expect(validateReservationForm(&form) == null);
 }
