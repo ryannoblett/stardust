@@ -2297,7 +2297,7 @@ fn renderReservationForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Alloca
     const add_active = form.active_field == 3;
     const add_fs = if (add_active) active_style else field_style;
     _ = win.print(&.{.{ .text = "  DHCP Options ", .style = label_style }}, .{ .col_offset = col + 1, .row_offset = add_row, .wrap = .none });
-    const add_text = "[+] Add";
+    const add_text = "[+] Add ";
     _ = win.print(&.{.{ .text = add_text, .style = add_fs }}, .{ .col_offset = col + 1 + LABEL_W, .row_offset = add_row, .wrap = .none });
 
     // Rows 8+: existing options
@@ -3737,7 +3737,7 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
                         _ = box.print(&.{.{ .text = max_text, .style = grey_style }}, .{ .col_offset = LABEL_W + 1, .row_offset = draw_row, .wrap = .none });
                     } else {
                         const add_fs = if (is_add_active) active_style else field_style;
-                        _ = box.print(&.{.{ .text = "[+] Add", .style = add_fs }}, .{ .col_offset = LABEL_W + 1, .row_offset = draw_row, .wrap = .none });
+                        _ = box.print(&.{.{ .text = "[+] Add ", .style = add_fs }}, .{ .col_offset = LABEL_W + 1, .row_offset = draw_row, .wrap = .none });
                     }
                     draw_row += 1;
                 }
@@ -3753,33 +3753,33 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
                             .domain_search => blk: {
                                 const d = &form.domain_search[ei];
                                 const t = d.buf[0..d.len];
-                                break :blk std.fmt.allocPrint(fa, "  {s}", .{if (t.len > 0) t else "..."}) catch "";
+                                break :blk if (t.len > 0) t else "...";
                             },
                             .dns => blk: {
                                 const d = &form.dns_servers[ei];
-                                break :blk std.fmt.allocPrint(fa, "  {s}", .{if (d.len > 0) d.buf[0..d.len] else "..."}) catch "";
+                                break :blk if (d.len > 0) d.buf[0..d.len] else "...";
                             },
                             .wins => blk: {
                                 const d = &form.wins_servers[ei];
-                                break :blk std.fmt.allocPrint(fa, "  {s}", .{if (d.len > 0) d.buf[0..d.len] else "..."}) catch "";
+                                break :blk if (d.len > 0) d.buf[0..d.len] else "...";
                             },
                             .ntp => blk: {
                                 const d = &form.ntp_servers[ei];
-                                break :blk std.fmt.allocPrint(fa, "  {s}", .{if (d.len > 0) d.buf[0..d.len] else "..."}) catch "";
+                                break :blk if (d.len > 0) d.buf[0..d.len] else "...";
                             },
                             .log => blk: {
                                 const d = &form.log_servers[ei];
-                                break :blk std.fmt.allocPrint(fa, "  {s}", .{if (d.len > 0) d.buf[0..d.len] else "..."}) catch "";
+                                break :blk if (d.len > 0) d.buf[0..d.len] else "...";
                             },
                             .tftp => blk: {
                                 const d = &form.tftp_servers[ei];
-                                break :blk std.fmt.allocPrint(fa, "  {s}", .{if (d.len > 0) d.buf[0..d.len] else "..."}) catch "";
+                                break :blk if (d.len > 0) d.buf[0..d.len] else "...";
                             },
                             .routes => blk: {
                                 const r = &form.routes[ei];
                                 const dest = r.dest_buf[0..r.dest_len];
                                 const router = r.router_buf[0..r.router_len];
-                                break :blk std.fmt.allocPrint(fa, "  {s:<18} via {s}", .{
+                                break :blk std.fmt.allocPrint(fa, "{s} via {s}", .{
                                     if (dest.len > 0) dest else "...",
                                     if (router.len > 0) router else "...",
                                 }) catch "";
@@ -3788,20 +3788,19 @@ fn renderPoolForm(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator) !v
                                 const o = &form.options[ei];
                                 const code = o.code_buf[0..o.code_len];
                                 const val = o.value_buf[0..o.value_len];
-                                break :blk std.fmt.allocPrint(fa, "  {s:<6} {s}", .{
+                                break :blk std.fmt.allocPrint(fa, "{s:<6} {s}", .{
                                     if (code.len > 0) code else "?",
                                     if (val.len > 0) val else "?",
                                 }) catch "";
                             },
                         };
                         const os = if (is_entry_active) active_style else opt_style;
-                        const opt_w = LABEL_W + FIELD_W;
-                        const opt_trunc = line_text[0..@min(line_text.len, opt_w)];
-                        const opt_pad = opt_w -| @as(u16, @intCast(opt_trunc.len));
+                        const opt_trunc = line_text[0..@min(line_text.len, FIELD_W)];
+                        const opt_pad = FIELD_W -| @as(u16, @intCast(opt_trunc.len));
                         const opt_padded = try fa.alloc(u8, opt_pad);
                         @memset(opt_padded, ' ');
-                        _ = box.print(&.{.{ .text = opt_trunc, .style = os }}, .{ .col_offset = 3, .row_offset = draw_row, .wrap = .none });
-                        _ = box.print(&.{.{ .text = opt_padded, .style = os }}, .{ .col_offset = 3 + @as(u16, @intCast(opt_trunc.len)), .row_offset = draw_row, .wrap = .none });
+                        _ = box.print(&.{.{ .text = opt_trunc, .style = os }}, .{ .col_offset = LABEL_W + 1, .row_offset = draw_row, .wrap = .none });
+                        _ = box.print(&.{.{ .text = opt_padded, .style = os }}, .{ .col_offset = LABEL_W + 1 + @as(u16, @intCast(opt_trunc.len)), .row_offset = draw_row, .wrap = .none });
                         draw_row += 1;
                     }
                     abs_row += 1;
