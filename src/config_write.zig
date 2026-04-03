@@ -1224,3 +1224,90 @@ test "renderConfig includes mtu, wins_servers, and tftp_servers" {
     try std.testing.expect(std.mem.indexOf(u8, out, "      - 10.0.0.6") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "      - 10.0.0.7") != null);
 }
+
+test "renderConfig: MAC class with all structured fields round-trips to YAML" {
+    const allocator = std.testing.allocator;
+
+    var mc_opts = std.StringHashMap([]const u8).init(allocator);
+    try mc_opts.put(
+        try allocator.dupe(u8, "66"),
+        try allocator.dupe(u8, "tftp.phones.local"),
+    );
+
+    const dns_owned = try allocator.alloc([]const u8, 1);
+    dns_owned[0] = try allocator.dupe(u8, "8.8.8.8");
+    const tftp_owned = try allocator.alloc([]const u8, 1);
+    tftp_owned[0] = try allocator.dupe(u8, "10.0.0.6");
+
+    var mac_classes_arr = [_]config_mod.MacClass{.{
+        .name = try allocator.dupe(u8, "FullClass"),
+        .match = try allocator.dupe(u8, "aa:bb:cc"),
+        .router = try allocator.dupe(u8, "10.0.0.254"),
+        .dns_servers = dns_owned,
+        .tftp_servers = tftp_owned,
+        .dhcp_options = mc_opts,
+    }};
+    const mac_classes_slice = try allocator.dupe(config_mod.MacClass, &mac_classes_arr);
+
+    var pool_opts = std.StringHashMap([]const u8).init(allocator);
+    var pools = [_]config_mod.PoolConfig{.{
+        .subnet = "10.0.0.0",
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = "10.0.0.1",
+        .pool_start = "",
+        .pool_end = "",
+        .dns_servers = &.{},
+        .domain_name = "",
+        .domain_search = &.{},
+        .lease_time = 3600,
+        .time_offset = null,
+        .time_servers = &.{},
+        .log_servers = &.{},
+        .ntp_servers = &.{},
+        .mtu = null,
+        .wins_servers = &.{},
+        .tftp_servers = &.{},
+        .boot_filename = "",
+        .http_boot_url = "",
+        .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
+        .dhcp_options = pool_opts,
+        .reservations = &.{},
+        .static_routes = &.{},
+        .mac_classes = mac_classes_slice,
+    }};
+
+    const cfg = config_mod.Config{
+        .allocator = allocator,
+        .listen_address = "0.0.0.0",
+        .state_dir = "/tmp",
+        .log_level = .info,
+        .pool_allocation_random = false,
+        .sync = null,
+        .pools = &pools,
+        .admin_ssh = .{ .enable = false, .port = 2267, .bind = "0.0.0.0", .read_only = false, .host_key = "", .authorized_keys = "" },
+        .metrics = .{ .collect = false, .http_enable = false, .http_port = 9167, .http_bind = "127.0.0.1" },
+    };
+    defer {
+        for (mac_classes_slice) |*mc| @constCast(mc).deinit(allocator);
+        allocator.free(mac_classes_slice);
+        pool_opts.deinit();
+    }
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+    try renderConfig(buf.writer(allocator), &cfg);
+    const out = buf.items;
+
+    // Verify the mac_classes section is present with structured fields.
+    try std.testing.expect(std.mem.indexOf(u8, out, "mac_classes:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "      - name: FullClass") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "        match: \"aa:bb:cc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "        router: 10.0.0.254") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "        dns_servers:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "          - 8.8.8.8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "        tftp_servers:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "          - 10.0.0.6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "        dhcp_options:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "          66: tftp.phones.local") != null);
+}

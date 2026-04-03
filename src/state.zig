@@ -931,3 +931,31 @@ test "forcerenew_nonce lifecycle: store, replace, remove without leak" {
     _ = store.removeLeaseUnlocked("aa:bb:cc:dd:ee:99");
     try std.testing.expect(store.leases.get("aa:bb:cc:dd:ee:99") == null);
 }
+
+test "pruneExpired removes nonce-bearing expired lease without leak" {
+    const alloc = std.testing.allocator;
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+
+    // Add an expired lease with a forcerenew_nonce.
+    try store.addLeaseUnlocked(.{
+        .mac = "aa:bb:cc:dd:ee:77",
+        .ip = "192.168.1.77",
+        .hostname = "nonce-host",
+        .expires = std.time.timestamp() - 10, // already expired
+        .client_id = "01aabbccddeeff",
+        .forcerenew_nonce = "deadbeefdeadbeefdeadbeefdeadbeef",
+    });
+
+    // Verify the lease was stored.
+    try std.testing.expect(store.leases.get("aa:bb:cc:dd:ee:77") != null);
+
+    // pruneExpired should remove it (not reserved, expired).
+    StateStore.pruneExpired(store);
+
+    // Verify the lease was removed.
+    try std.testing.expect(store.leases.get("aa:bb:cc:dd:ee:77") == null);
+
+    // The test allocator will detect any leaked strings (mac, ip, hostname,
+    // client_id, forcerenew_nonce) when the store is deinited.
+}

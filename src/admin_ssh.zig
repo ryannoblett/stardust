@@ -2241,16 +2241,16 @@ fn renderStatsTab(
 
     const ctr = server.counters;
     const counter_lines = [_]struct { label: []const u8, val: u64 }{
-        .{ .label = "DISCOVER", .val = ctr.discover.load(.monotonic) },
-        .{ .label = "OFFER   ", .val = ctr.offer.load(.monotonic) },
-        .{ .label = "REQUEST ", .val = ctr.request.load(.monotonic) },
-        .{ .label = "ACK     ", .val = ctr.ack.load(.monotonic) },
-        .{ .label = "NAK     ", .val = ctr.nak.load(.monotonic) },
-        .{ .label = "RELEASE ", .val = ctr.release.load(.monotonic) },
-        .{ .label = "DECLINE ", .val = ctr.decline.load(.monotonic) },
-        .{ .label = "INFORM  ", .val = ctr.inform.load(.monotonic) },
-        .{ .label = "FORCERNW", .val = ctr.forcerenew.load(.monotonic) },
-        .{ .label = "LEASEQRY", .val = ctr.leasequery.load(.monotonic) },
+        .{ .label = "DISCOVER  ", .val = ctr.discover.load(.monotonic) },
+        .{ .label = "OFFER     ", .val = ctr.offer.load(.monotonic) },
+        .{ .label = "REQUEST   ", .val = ctr.request.load(.monotonic) },
+        .{ .label = "ACK       ", .val = ctr.ack.load(.monotonic) },
+        .{ .label = "NAK       ", .val = ctr.nak.load(.monotonic) },
+        .{ .label = "RELEASE   ", .val = ctr.release.load(.monotonic) },
+        .{ .label = "DECLINE   ", .val = ctr.decline.load(.monotonic) },
+        .{ .label = "INFORM    ", .val = ctr.inform.load(.monotonic) },
+        .{ .label = "FORCERENEW", .val = ctr.forcerenew.load(.monotonic) },
+        .{ .label = "LEASEQUERY", .val = ctr.leasequery.load(.monotonic) },
     };
 
     for (counter_lines) |cl| {

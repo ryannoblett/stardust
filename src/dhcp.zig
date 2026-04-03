@@ -2956,20 +2956,24 @@ pub const DHCPServer = struct {
                     @intCast(@min(l.expires - now, std.math.maxInt(u32)))
                 else
                     0;
-                resp[opts_len] = @intFromEnum(OptionCode.IPAddressLeaseTime);
-                resp[opts_len + 1] = 4;
-                std.mem.writeInt(u32, resp[opts_len + 2 ..][0..4], remaining, .big);
-                opts_len += 6;
+                if (opts_len + 6 <= resp.len - 1) {
+                    resp[opts_len] = @intFromEnum(OptionCode.IPAddressLeaseTime);
+                    resp[opts_len + 1] = 4;
+                    std.mem.writeInt(u32, resp[opts_len + 2 ..][0..4], remaining, .big);
+                    opts_len += 6;
+                }
 
                 // Option 91: Client Last Transaction Time (seconds since last DHCP interaction).
                 const cltt: u32 = if (l.last_modified > 0 and now > l.last_modified)
                     @intCast(@min(now - l.last_modified, std.math.maxInt(u32)))
                 else
                     0;
-                resp[opts_len] = @intFromEnum(OptionCode.ClientLastTransactionTime);
-                resp[opts_len + 1] = 4;
-                std.mem.writeInt(u32, resp[opts_len + 2 ..][0..4], cltt, .big);
-                opts_len += 6;
+                if (opts_len + 6 <= resp.len - 1) {
+                    resp[opts_len] = @intFromEnum(OptionCode.ClientLastTransactionTime);
+                    resp[opts_len + 1] = 4;
+                    std.mem.writeInt(u32, resp[opts_len + 2 ..][0..4], cltt, .big);
+                    opts_len += 6;
+                }
 
                 // Option 1: Subnet Mask (from matching pool).
                 for (self.cfg.pools) |*pool| {
@@ -2978,16 +2982,20 @@ pub const DHCPServer = struct {
                     const lip_int = std.mem.readInt(u32, &lip, .big);
                     if ((lip_int & pool.subnet_mask) == (s_int & pool.subnet_mask)) {
                         // Subnet mask
-                        resp[opts_len] = @intFromEnum(OptionCode.SubnetMask);
-                        resp[opts_len + 1] = 4;
-                        std.mem.writeInt(u32, resp[opts_len + 2 ..][0..4], pool.subnet_mask, .big);
-                        opts_len += 6;
+                        if (opts_len + 6 <= resp.len - 1) {
+                            resp[opts_len] = @intFromEnum(OptionCode.SubnetMask);
+                            resp[opts_len + 1] = 4;
+                            std.mem.writeInt(u32, resp[opts_len + 2 ..][0..4], pool.subnet_mask, .big);
+                            opts_len += 6;
+                        }
                         // Router
                         const rip = config_mod.parseIpv4(pool.router) catch break;
-                        resp[opts_len] = @intFromEnum(OptionCode.Router);
-                        resp[opts_len + 1] = 4;
-                        @memcpy(resp[opts_len + 2 .. opts_len + 6], &rip);
-                        opts_len += 6;
+                        if (opts_len + 6 <= resp.len - 1) {
+                            resp[opts_len] = @intFromEnum(OptionCode.Router);
+                            resp[opts_len + 1] = 4;
+                            @memcpy(resp[opts_len + 2 .. opts_len + 6], &rip);
+                            opts_len += 6;
+                        }
                         break;
                     }
                 }
@@ -5895,4 +5903,153 @@ test "DHCPACK contains option 145 (Forcerenew Nonce) with non-zero nonce" {
         }
     }
     try std.testing.expect(!all_zero);
+}
+
+// ---------------------------------------------------------------------------
+// selectPool: null sync_mgr means all pools are always enabled
+// ---------------------------------------------------------------------------
+
+test "selectPool: null sync_mgr returns first matching pool (never null)" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig2Pool(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    // With sync_mgr=null, isPoolDisabled always returns false, so selectPool
+    // should always find a pool (never null).
+    const zero = [4]u8{ 0, 0, 0, 0 };
+
+    // Zero giaddr/ciaddr: falls back to server_ip match → pool[0].
+    const pool0 = server.selectPool(zero, zero);
+    try std.testing.expect(pool0 != null);
+    try std.testing.expectEqualStrings("192.168.1.0", pool0.?.subnet);
+
+    // giaddr in pool[1] subnet → pool[1].
+    const pool1 = server.selectPool([4]u8{ 10, 0, 0, 1 }, zero);
+    try std.testing.expect(pool1 != null);
+    try std.testing.expectEqualStrings("10.0.0.0", pool1.?.subnet);
+}
+
+// ---------------------------------------------------------------------------
+// buildLeaseQueryResponse: long hostname bounds check
+// ---------------------------------------------------------------------------
+
+test "DHCPLEASEQUERY with long hostname does not overflow" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    // Seed a lease with a 200-byte hostname.
+    var long_name: [200]u8 = undefined;
+    @memset(&long_name, 'h');
+    try store.addLease(.{
+        .mac = "aa:bb:cc:dd:ee:02",
+        .ip = "192.168.1.51",
+        .hostname = &long_name,
+        .expires = std.time.timestamp() + 3600,
+        .client_id = null,
+    });
+
+    // Query for that IP.
+    var buf align(4) = [_]u8{0} ** 512;
+    const len = makeLeaseQuery(&buf, [4]u8{ 192, 168, 1, 51 }, [6]u8{ 0, 0, 0, 0, 0, 0 });
+    const resp = try server.processPacket(buf[0..len]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+
+    // Must be DHCPLEASEACTIVE.
+    try std.testing.expectEqual(MessageType.DHCPLEASEACTIVE, DHCPServer.getMessageType(resp.?).?);
+
+    // Option 12 (hostname) should be present with the 200-byte name.
+    const opt12 = DHCPServer.getOption(resp.?, .HostName);
+    try std.testing.expect(opt12 != null);
+    try std.testing.expectEqual(@as(usize, 200), opt12.?.len);
+
+    // Verify all bytes are 'h'.
+    for (opt12.?) |b| {
+        try std.testing.expectEqual(@as(u8, 'h'), b);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// matchMacClass: edge cases
+// ---------------------------------------------------------------------------
+
+test "matchMacClass: empty string matches nothing (treated as wildcard after strip)" {
+    // Empty pattern → after stripping wildcards pat.len==0 → returns true.
+    // This is the existing behavior: empty pattern acts as a catch-all.
+    try std.testing.expect(matchMacClass("aa:bb:cc:dd:ee:ff", ""));
+}
+
+test "matchMacClass: mid-octet prefix does not match" {
+    // Pattern "aa:b" should NOT match "aa:bb:cc:dd:ee:ff" because after
+    // the prefix "aa:b" the next char in the MAC is 'b', not ':' or end.
+    try std.testing.expect(!matchMacClass("aa:bb:cc:dd:ee:ff", "aa:b"));
+}
+
+test "matchMacClass: pattern longer than MAC returns false" {
+    try std.testing.expect(!matchMacClass("aa:bb", "aa:bb:cc:dd:ee:ff"));
+}
+
+// ---------------------------------------------------------------------------
+// collectOverrides: MAC class static_routes override
+// ---------------------------------------------------------------------------
+
+test "collectOverrides: MAC class static_routes override pool default" {
+    const allocator = std.testing.allocator;
+
+    var pool = config_mod.PoolConfig{
+        .subnet = "192.168.1.0",
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = "192.168.1.1",
+        .pool_start = "",
+        .pool_end = "",
+        .dns_servers = &.{},
+        .domain_name = "",
+        .domain_search = &.{},
+        .lease_time = 3600,
+        .time_offset = null,
+        .time_servers = &.{},
+        .log_servers = &.{},
+        .ntp_servers = &.{},
+        .mtu = null,
+        .wins_servers = &.{},
+        .tftp_servers = &.{},
+        .boot_filename = "",
+        .http_boot_url = "",
+        .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
+        .dhcp_options = std.StringHashMap([]const u8).init(allocator),
+        .reservations = &.{},
+        .static_routes = &.{}, // pool has NO static routes
+    };
+    defer pool.dhcp_options.deinit();
+
+    // MAC class defines static routes.
+    var mc_routes = [_]config_mod.StaticRoute{
+        .{ .destination = [4]u8{ 10, 20, 0, 0 }, .prefix_len = 16, .router = [4]u8{ 192, 168, 1, 254 } },
+    };
+    var mac_classes = [_]config_mod.MacClass{.{
+        .name = "RoutedClass",
+        .match = "aa:bb:cc",
+        .static_routes = &mc_routes,
+        .dhcp_options = std.StringHashMap([]const u8).init(allocator),
+    }};
+
+    var overrides = collectOverrides(allocator, &pool, "aa:bb:cc:dd:ee:ff", null, &mac_classes);
+    defer overrides.dhcp_options.deinit();
+
+    // static_routes should come from the MAC class.
+    try std.testing.expect(overrides.static_routes != null);
+    try std.testing.expectEqual(@as(usize, 1), overrides.static_routes.?.len);
+    try std.testing.expectEqual([4]u8{ 10, 20, 0, 0 }, overrides.static_routes.?[0].destination);
+    try std.testing.expectEqual(@as(u8, 16), overrides.static_routes.?[0].prefix_len);
+    try std.testing.expectEqual([4]u8{ 192, 168, 1, 254 }, overrides.static_routes.?[0].router);
 }

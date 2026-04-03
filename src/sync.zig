@@ -2071,3 +2071,140 @@ test "computeLocalPoolStates: produces correct per-pool hashes" {
     const expected = config_mod.computePerPoolHash(&cfg.pools[0]);
     try std.testing.expectEqualSlices(u8, &expected, &mgr.pool_states[0].local_hash);
 }
+
+fn makeTestConfig2Pool(alloc: std.mem.Allocator) config_mod.Config {
+    const pools = alloc.alloc(config_mod.PoolConfig, 2) catch unreachable;
+    pools[0] = config_mod.PoolConfig{
+        .subnet = alloc.dupe(u8, "192.168.1.0") catch unreachable,
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = alloc.dupe(u8, "192.168.1.1") catch unreachable,
+        .pool_start = alloc.dupe(u8, "192.168.1.10") catch unreachable,
+        .pool_end = alloc.dupe(u8, "192.168.1.200") catch unreachable,
+        .dns_servers = alloc.alloc([]const u8, 0) catch unreachable,
+        .domain_name = alloc.dupe(u8, "") catch unreachable,
+        .domain_search = alloc.alloc([]const u8, 0) catch unreachable,
+        .lease_time = 3600,
+        .time_offset = null,
+        .time_servers = alloc.alloc([]const u8, 0) catch unreachable,
+        .log_servers = alloc.alloc([]const u8, 0) catch unreachable,
+        .ntp_servers = alloc.alloc([]const u8, 0) catch unreachable,
+        .mtu = null,
+        .wins_servers = alloc.alloc([]const u8, 0) catch unreachable,
+        .tftp_servers = alloc.alloc([]const u8, 0) catch unreachable,
+        .boot_filename = alloc.dupe(u8, "") catch unreachable,
+        .http_boot_url = alloc.dupe(u8, "") catch unreachable,
+        .dns_update = .{
+            .enable = false,
+            .server = alloc.dupe(u8, "") catch unreachable,
+            .zone = alloc.dupe(u8, "") catch unreachable,
+            .rev_zone = alloc.dupe(u8, "") catch unreachable,
+            .key_name = alloc.dupe(u8, "") catch unreachable,
+            .key_file = alloc.dupe(u8, "") catch unreachable,
+            .lease_time = 3600,
+        },
+        .dhcp_options = std.StringHashMap([]const u8).init(alloc),
+        .reservations = alloc.alloc(config_mod.Reservation, 0) catch unreachable,
+        .static_routes = alloc.alloc(config_mod.StaticRoute, 0) catch unreachable,
+    };
+    pools[1] = config_mod.PoolConfig{
+        .subnet = alloc.dupe(u8, "10.0.0.0") catch unreachable,
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = alloc.dupe(u8, "10.0.0.1") catch unreachable,
+        .pool_start = alloc.dupe(u8, "10.0.0.10") catch unreachable,
+        .pool_end = alloc.dupe(u8, "10.0.0.200") catch unreachable,
+        .dns_servers = alloc.alloc([]const u8, 0) catch unreachable,
+        .domain_name = alloc.dupe(u8, "") catch unreachable,
+        .domain_search = alloc.alloc([]const u8, 0) catch unreachable,
+        .lease_time = 7200,
+        .time_offset = null,
+        .time_servers = alloc.alloc([]const u8, 0) catch unreachable,
+        .log_servers = alloc.alloc([]const u8, 0) catch unreachable,
+        .ntp_servers = alloc.alloc([]const u8, 0) catch unreachable,
+        .mtu = null,
+        .wins_servers = alloc.alloc([]const u8, 0) catch unreachable,
+        .tftp_servers = alloc.alloc([]const u8, 0) catch unreachable,
+        .boot_filename = alloc.dupe(u8, "") catch unreachable,
+        .http_boot_url = alloc.dupe(u8, "") catch unreachable,
+        .dns_update = .{
+            .enable = false,
+            .server = alloc.dupe(u8, "") catch unreachable,
+            .zone = alloc.dupe(u8, "") catch unreachable,
+            .rev_zone = alloc.dupe(u8, "") catch unreachable,
+            .key_name = alloc.dupe(u8, "") catch unreachable,
+            .key_file = alloc.dupe(u8, "") catch unreachable,
+            .lease_time = 7200,
+        },
+        .dhcp_options = std.StringHashMap([]const u8).init(alloc),
+        .reservations = alloc.alloc(config_mod.Reservation, 0) catch unreachable,
+        .static_routes = alloc.alloc(config_mod.StaticRoute, 0) catch unreachable,
+    };
+    return config_mod.Config{
+        .allocator = alloc,
+        .listen_address = alloc.dupe(u8, "0.0.0.0") catch unreachable,
+        .state_dir = alloc.dupe(u8, "/tmp") catch unreachable,
+        .log_level = .info,
+        .pool_allocation_random = false,
+        .sync = null,
+        .pools = pools,
+        .admin_ssh = .{ .enable = false, .port = 2267, .bind = alloc.dupe(u8, "0.0.0.0") catch unreachable, .read_only = false, .host_key = alloc.dupe(u8, "") catch unreachable, .authorized_keys = alloc.dupe(u8, "") catch unreachable },
+        .metrics = .{ .collect = false, .http_enable = false, .http_port = 9167, .http_bind = alloc.dupe(u8, "127.0.0.1") catch unreachable },
+    };
+}
+
+test "buildHelloPayload v2: two pools produce correct multi-pool structure" {
+    const alloc = std.testing.allocator;
+    var cfg = makeTestConfig2Pool(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStateStore(alloc);
+    defer store.deinit();
+
+    var sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "multi",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+    };
+    const aes_key = SyncManager.deriveKey("hello-v2-2pool");
+    var mgr = makeTestManagerWithCfg(aes_key, &cfg, store);
+    mgr.cfg = &sync_cfg;
+    defer mgr.peers.deinit(alloc);
+
+    var buf: [SyncManager.hello_max_payload]u8 = undefined;
+    const len = mgr.buildHelloPayload(&buf);
+
+    // Version byte
+    try std.testing.expectEqual(@as(u8, HELLO_PROTOCOL_VERSION), buf[0]);
+
+    // Group name "multi" = 5 chars
+    const gn_len: u8 = buf[1];
+    try std.testing.expectEqual(@as(u8, 5), gn_len);
+    try std.testing.expectEqualStrings("multi", buf[2 .. 2 + gn_len]);
+
+    // Pool count must be 2
+    const pool_count = buf[2 + gn_len];
+    try std.testing.expectEqual(@as(u8, 2), pool_count);
+
+    // Expected length: 1 + 1 + 5 + 1 + 2*37 = 82
+    try std.testing.expectEqual(@as(usize, 82), len);
+
+    // Pool 0 entry: subnet_ip=192.168.1.0, prefix_len=24
+    const off0 = 2 + @as(usize, gn_len) + 1;
+    try std.testing.expectEqualSlices(u8, &[4]u8{ 192, 168, 1, 0 }, buf[off0 .. off0 + 4]);
+    try std.testing.expectEqual(@as(u8, 24), buf[off0 + 4]);
+
+    // Pool 1 entry: subnet_ip=10.0.0.0, prefix_len=24, starts 37 bytes after pool 0
+    const off1 = off0 + 37;
+    try std.testing.expectEqualSlices(u8, &[4]u8{ 10, 0, 0, 0 }, buf[off1 .. off1 + 4]);
+    try std.testing.expectEqual(@as(u8, 24), buf[off1 + 4]);
+
+    // Verify hashes match per-pool computation
+    const hash0 = config_mod.computePerPoolHash(&cfg.pools[0]);
+    try std.testing.expectEqualSlices(u8, &hash0, buf[off0 + 5 .. off0 + 37]);
+    const hash1 = config_mod.computePerPoolHash(&cfg.pools[1]);
+    try std.testing.expectEqualSlices(u8, &hash1, buf[off1 + 5 .. off1 + 37]);
+}
