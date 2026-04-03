@@ -242,6 +242,13 @@ fn poolCapacity(pool: *const config_mod.PoolConfig) u64 {
 
     const subnet_bytes = config_mod.parseIpv4(pool.subnet) catch return 0;
     const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
+
+    // /32: single host (RFC 7600)
+    if (pool.subnet_mask == 0xFFFFFFFF) return 1;
+
+    // /31: point-to-point link, both addresses usable (RFC 3021)
+    if (pool.subnet_mask == 0xFFFFFFFE) return 2;
+
     const broadcast_int = subnet_int | ~pool.subnet_mask;
 
     const start_int: u32 = if (start) |s| std.mem.readInt(u32, &s, .big) else subnet_int + 1;

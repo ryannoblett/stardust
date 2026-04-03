@@ -3,6 +3,12 @@
 /// Produces clean YAML that can be round-tripped through config.load().
 /// Note: comments and manual formatting from the original file are NOT preserved.
 /// This is the expected trade-off when using the TUI to edit configuration.
+///
+/// ASSUMPTION: All string values written here have already been validated by the
+/// config parser (config.zig) and/or the TUI form validation, which reject
+/// characters that would require YAML escaping (colons in values, quotes, #,
+/// newlines, etc.).  If raw YAML escaping is ever needed, add a writeYamlValue()
+/// helper that wraps values containing special characters in double quotes.
 const std = @import("std");
 const config_mod = @import("./config.zig");
 

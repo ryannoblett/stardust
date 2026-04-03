@@ -338,6 +338,27 @@ fn isOverridden(overrides: *const std.StringHashMap([]const u8), code: u8) bool 
     return overrides.contains(key);
 }
 
+/// Check if a DHCP option code corresponds to a first-class field that is
+/// actively set (non-null, non-empty) in the override result.  Used to skip
+/// duplicate raw dhcp_options entries for codes that were already written by
+/// the structured first-class field handling earlier in the packet builder.
+fn isFirstClassOverrideActive(overrides: *const OverrideResult, code: u8) bool {
+    return switch (code) {
+        2 => overrides.time_offset != null,
+        3 => overrides.router != null,
+        6 => if (overrides.dns_servers) |s| s.len > 0 else false,
+        7 => if (overrides.log_servers) |s| s.len > 0 else false,
+        15 => if (overrides.domain_name) |d| d.len > 0 else false,
+        42 => if (overrides.ntp_servers) |s| s.len > 0 else false,
+        44 => if (overrides.wins_servers) |s| s.len > 0 else false,
+        66 => if (overrides.tftp_servers) |s| s.len > 0 else false,
+        67 => if (overrides.boot_filename) |b| b.len > 0 else false,
+        119 => if (overrides.domain_search) |s| s.len > 0 else false,
+        150 => if (overrides.tftp_servers) |s| s.len > 0 else false,
+        else => false,
+    };
+}
+
 /// Find a config Reservation by MAC in a pool's reservation list.
 fn findConfigReservation(pool: *const config_mod.PoolConfig, mac: []const u8) ?*const config_mod.Reservation {
     for (pool.reservations) |*r| {
@@ -534,7 +555,8 @@ fn resolveHostToIpv4(name: []const u8, cache: *[RESOLVE_CACHE_SIZE]ResolveCacheE
     const name_hash = std.hash.Wyhash.hash(0, name);
     const now = std.time.timestamp();
     const slot = @as(usize, @intCast(name_hash % RESOLVE_CACHE_SIZE));
-    if (cache[slot].name_hash == name_hash and
+    if (cache[slot].name_len > 0 and
+        cache[slot].name_hash == name_hash and
         cache[slot].name_len == @as(u8, @intCast(@min(name.len, 64))) and
         std.mem.eql(u8, cache[slot].name_buf[0..cache[slot].name_len], name[0..@min(name.len, 64)]) and
         (now - cache[slot].timestamp) < RESOLVE_CACHE_TTL)
@@ -1859,6 +1881,7 @@ pub const DHCPServer = struct {
         while (opts_it.next()) |entry| {
             const code = std.fmt.parseInt(u8, entry.key_ptr.*, 10) catch continue;
             if (!isRequestedCode(prl, code)) continue;
+            if (isFirstClassOverrideActive(&overrides, code)) continue;
             const encoded = encodeOptionValue(opts_buf[opts_len + 2 ..], entry.value_ptr.*);
             if (encoded.len > 255 or opts_len + 2 + encoded.len > opts_buf.len - 1) continue;
             opts_buf[opts_len] = code;
@@ -2246,6 +2269,7 @@ pub const DHCPServer = struct {
         while (opts_it.next()) |entry| {
             const code = std.fmt.parseInt(u8, entry.key_ptr.*, 10) catch continue;
             if (!isRequestedCode(prl, code)) continue;
+            if (isFirstClassOverrideActive(&overrides, code)) continue;
             const encoded = encodeOptionValue(opts_buf[opts_len + 2 ..], entry.value_ptr.*);
             if (encoded.len > 255 or opts_len + 2 + encoded.len > opts_buf.len - 1) continue;
             opts_buf[opts_len] = code;
@@ -2723,6 +2747,7 @@ pub const DHCPServer = struct {
         while (opts_it.next()) |entry| {
             const code = std.fmt.parseInt(u8, entry.key_ptr.*, 10) catch continue;
             if (!isRequestedCode(prl, code)) continue;
+            if (isFirstClassOverrideActive(&overrides, code)) continue;
             const encoded = encodeOptionValue(opts_buf[opts_len + 2 ..], entry.value_ptr.*);
             if (encoded.len > 255 or opts_len + 2 + encoded.len > opts_buf.len - 1) continue;
             opts_buf[opts_len] = code;
@@ -6156,4 +6181,283 @@ test "UEFI HTTP boot: MAC class http_boot_url override in DISCOVER" {
     const opt60 = DHCPServer.getOption(resp.?, .VendorClassIdentifier);
     try std.testing.expect(opt60 != null);
     try std.testing.expectEqualStrings("HTTPClient", opt60.?);
+}
+
+// ---------------------------------------------------------------------------
+// Test: OFFER contains all standard options when PRL requests them
+// ---------------------------------------------------------------------------
+test "OFFER contains all standard options when PRL requests them" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+
+    // Configure pool with dns_servers, domain_name, and ntp_servers.
+    {
+        alloc.free(cfg.pools[0].dns_servers);
+        const dns = try alloc.alloc([]const u8, 1);
+        dns[0] = try alloc.dupe(u8, "8.8.8.8");
+        cfg.pools[0].dns_servers = dns;
+    }
+    {
+        alloc.free(cfg.pools[0].domain_name);
+        cfg.pools[0].domain_name = try alloc.dupe(u8, "test.local");
+    }
+    {
+        alloc.free(cfg.pools[0].ntp_servers);
+        const ntp = try alloc.alloc([]const u8, 1);
+        ntp[0] = try alloc.dupe(u8, "10.0.0.1");
+        cfg.pools[0].ntp_servers = ntp;
+    }
+
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    // DISCOVER with PRL requesting options 1, 3, 6, 15, 42, 51, 53, 54
+    var buf align(4) = [_]u8{0} ** 512;
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(&buf));
+    hdr.op = 1;
+    hdr.htype = 1;
+    hdr.hlen = 6;
+    hdr.xid = 0xAABBCCDD;
+    hdr.magic = dhcp_magic_cookie;
+    @memcpy(hdr.chaddr[0..6], &[6]u8{ 0xAA, 0xBB, 0xCC, 0x10, 0x20, 0x30 });
+    var i: usize = dhcp_min_packet_size;
+    buf[i] = @intFromEnum(OptionCode.MessageType);
+    buf[i + 1] = 1;
+    buf[i + 2] = @intFromEnum(MessageType.DHCPDISCOVER);
+    i += 3;
+    buf[i] = @intFromEnum(OptionCode.ParameterRequestList);
+    buf[i + 1] = 8;
+    buf[i + 2] = 1; // SubnetMask
+    buf[i + 3] = 3; // Router
+    buf[i + 4] = 6; // DomainNameServer
+    buf[i + 5] = 15; // DomainName
+    buf[i + 6] = 42; // NtpServers
+    buf[i + 7] = 51; // IPAddressLeaseTime
+    buf[i + 8] = 53; // MessageType
+    buf[i + 9] = 54; // ServerIdentifier
+    i += 10;
+    buf[i] = @intFromEnum(OptionCode.End);
+    i += 1;
+
+    const resp = try server.processPacket(buf[0..i]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+
+    // Verify it's a DHCPOFFER.
+    try std.testing.expectEqual(MessageType.DHCPOFFER, DHCPServer.getMessageType(resp.?).?);
+
+    // Verify all 8 options are present.
+    try std.testing.expect(DHCPServer.getOption(resp.?, .SubnetMask) != null);
+    try std.testing.expect(DHCPServer.getOption(resp.?, .Router) != null);
+    try std.testing.expect(DHCPServer.getOption(resp.?, .DomainNameServer) != null);
+    try std.testing.expect(DHCPServer.getOption(resp.?, .DomainName) != null);
+    try std.testing.expect(DHCPServer.getOption(resp.?, .NtpServers) != null);
+    try std.testing.expect(DHCPServer.getOption(resp.?, .IPAddressLeaseTime) != null);
+    try std.testing.expect(DHCPServer.getOption(resp.?, .MessageType) != null);
+    try std.testing.expect(DHCPServer.getOption(resp.?, .ServerIdentifier) != null);
+}
+
+// ---------------------------------------------------------------------------
+// Test: Time servers option 4 falls back to ntp_servers
+// ---------------------------------------------------------------------------
+test "OFFER option 4 time servers fallback to ntp_servers" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+
+    // Configure pool with ntp_servers but leave time_servers empty.
+    {
+        alloc.free(cfg.pools[0].ntp_servers);
+        const ntp = try alloc.alloc([]const u8, 1);
+        ntp[0] = try alloc.dupe(u8, "10.0.0.1");
+        cfg.pools[0].ntp_servers = ntp;
+    }
+    // time_servers is already empty from makeTestConfig.
+
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    var buf align(4) = [_]u8{0} ** 512;
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(&buf));
+    hdr.op = 1;
+    hdr.htype = 1;
+    hdr.hlen = 6;
+    hdr.xid = 0x11223344;
+    hdr.magic = dhcp_magic_cookie;
+    @memcpy(hdr.chaddr[0..6], &[6]u8{ 0xAA, 0xBB, 0xCC, 0x11, 0x22, 0x33 });
+    var i: usize = dhcp_min_packet_size;
+    buf[i] = @intFromEnum(OptionCode.MessageType);
+    buf[i + 1] = 1;
+    buf[i + 2] = @intFromEnum(MessageType.DHCPDISCOVER);
+    i += 3;
+    buf[i] = @intFromEnum(OptionCode.ParameterRequestList);
+    buf[i + 1] = 1;
+    buf[i + 2] = 4; // TimeServer
+    i += 3;
+    buf[i] = @intFromEnum(OptionCode.End);
+    i += 1;
+
+    const resp = try server.processPacket(buf[0..i]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+
+    // Option 4 should contain 10.0.0.1 (fallback from ntp_servers).
+    const opt4 = DHCPServer.getOption(resp.?, .TimeServer);
+    try std.testing.expect(opt4 != null);
+    try std.testing.expectEqual(@as(usize, 4), opt4.?.len);
+    try std.testing.expectEqualSlices(u8, &[4]u8{ 10, 0, 0, 1 }, opt4.?);
+}
+
+// ---------------------------------------------------------------------------
+// Test: Lease time in OFFER matches pool configuration
+// ---------------------------------------------------------------------------
+test "OFFER option 51 lease time matches pool config" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+
+    cfg.pools[0].lease_time = 7200;
+
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    var buf align(4) = [_]u8{0} ** 512;
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(&buf));
+    hdr.op = 1;
+    hdr.htype = 1;
+    hdr.hlen = 6;
+    hdr.xid = 0x55667788;
+    hdr.magic = dhcp_magic_cookie;
+    @memcpy(hdr.chaddr[0..6], &[6]u8{ 0xAA, 0xBB, 0xCC, 0x44, 0x55, 0x66 });
+    var i: usize = dhcp_min_packet_size;
+    buf[i] = @intFromEnum(OptionCode.MessageType);
+    buf[i + 1] = 1;
+    buf[i + 2] = @intFromEnum(MessageType.DHCPDISCOVER);
+    i += 3;
+    buf[i] = @intFromEnum(OptionCode.ParameterRequestList);
+    buf[i + 1] = 1;
+    buf[i + 2] = 51; // IPAddressLeaseTime
+    i += 3;
+    buf[i] = @intFromEnum(OptionCode.End);
+    i += 1;
+
+    const resp = try server.processPacket(buf[0..i]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+
+    // Option 51 should contain 7200 as big-endian u32.
+    const opt51 = DHCPServer.getOption(resp.?, .IPAddressLeaseTime);
+    try std.testing.expect(opt51 != null);
+    try std.testing.expectEqual(@as(usize, 4), opt51.?.len);
+    const lease_val = std.mem.readInt(u32, opt51.?[0..4], .big);
+    try std.testing.expectEqual(@as(u32, 7200), lease_val);
+}
+
+// ---------------------------------------------------------------------------
+// Test: Renewal (option 58) and rebinding (option 59) times in OFFER
+// ---------------------------------------------------------------------------
+test "OFFER options 58 and 59 renewal and rebinding times" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+
+    cfg.pools[0].lease_time = 3600;
+
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    var buf align(4) = [_]u8{0} ** 512;
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(&buf));
+    hdr.op = 1;
+    hdr.htype = 1;
+    hdr.hlen = 6;
+    hdr.xid = 0x99AABBCC;
+    hdr.magic = dhcp_magic_cookie;
+    @memcpy(hdr.chaddr[0..6], &[6]u8{ 0xAA, 0xBB, 0xCC, 0x77, 0x88, 0x99 });
+    var i: usize = dhcp_min_packet_size;
+    buf[i] = @intFromEnum(OptionCode.MessageType);
+    buf[i + 1] = 1;
+    buf[i + 2] = @intFromEnum(MessageType.DHCPDISCOVER);
+    i += 3;
+    buf[i] = @intFromEnum(OptionCode.ParameterRequestList);
+    buf[i + 1] = 2;
+    buf[i + 2] = 58; // RenewalTimeValue
+    buf[i + 3] = 59; // RebindingTimeValue
+    i += 4;
+    buf[i] = @intFromEnum(OptionCode.End);
+    i += 1;
+
+    const resp = try server.processPacket(buf[0..i]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+
+    // Option 58: renewal = lease_time / 2 = 1800
+    const opt58 = DHCPServer.getOption(resp.?, .RenewalTimeValue);
+    try std.testing.expect(opt58 != null);
+    try std.testing.expectEqual(@as(usize, 4), opt58.?.len);
+    const renewal = std.mem.readInt(u32, opt58.?[0..4], .big);
+    try std.testing.expectEqual(@as(u32, 1800), renewal);
+
+    // Option 59: rebinding = lease_time * 7 / 8 = 3150
+    const opt59 = DHCPServer.getOption(resp.?, .RebindingTimeValue);
+    try std.testing.expect(opt59 != null);
+    try std.testing.expectEqual(@as(usize, 4), opt59.?.len);
+    const rebind = std.mem.readInt(u32, opt59.?[0..4], .big);
+    try std.testing.expectEqual(@as(u32, 3150), rebind);
+}
+
+// ---------------------------------------------------------------------------
+// Test: Time offset (option 2) in OFFER
+// ---------------------------------------------------------------------------
+test "OFFER option 2 time offset" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+
+    cfg.pools[0].time_offset = 3600;
+
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    var buf align(4) = [_]u8{0} ** 512;
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(&buf));
+    hdr.op = 1;
+    hdr.htype = 1;
+    hdr.hlen = 6;
+    hdr.xid = 0xDDEEFF00;
+    hdr.magic = dhcp_magic_cookie;
+    @memcpy(hdr.chaddr[0..6], &[6]u8{ 0xAA, 0xBB, 0xCC, 0xAA, 0xBB, 0xCC });
+    var i: usize = dhcp_min_packet_size;
+    buf[i] = @intFromEnum(OptionCode.MessageType);
+    buf[i + 1] = 1;
+    buf[i + 2] = @intFromEnum(MessageType.DHCPDISCOVER);
+    i += 3;
+    buf[i] = @intFromEnum(OptionCode.ParameterRequestList);
+    buf[i + 1] = 1;
+    buf[i + 2] = 2; // TimeOffset
+    i += 3;
+    buf[i] = @intFromEnum(OptionCode.End);
+    i += 1;
+
+    const resp = try server.processPacket(buf[0..i]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+
+    // Option 2 should contain 3600 as big-endian i32.
+    const opt2 = DHCPServer.getOption(resp.?, .TimeOffset);
+    try std.testing.expect(opt2 != null);
+    try std.testing.expectEqual(@as(usize, 4), opt2.?.len);
+    const offset_val = std.mem.readInt(i32, opt2.?[0..4], .big);
+    try std.testing.expectEqual(@as(i32, 3600), offset_val);
 }

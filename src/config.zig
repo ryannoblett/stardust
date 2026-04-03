@@ -1555,6 +1555,22 @@ fn validatePoolFields(allocator: std.mem.Allocator, pool: *PoolConfig) bool {
             });
             return false;
         }
+        // Reject router at the network or broadcast address (except /32 where there is only one address).
+        if (pool.subnet_mask != 0xFFFFFFFF) {
+            const broadcast_r = subnet_int | ~pool.subnet_mask;
+            if (r_int == subnet_int) {
+                std.log.err("config: pool {s}/{d}: router {s} is the network address, skipping pool", .{
+                    pool.subnet, pool.prefix_len, pool.router,
+                });
+                return false;
+            }
+            if (r_int == broadcast_r) {
+                std.log.err("config: pool {s}/{d}: router {s} is the broadcast address, skipping pool", .{
+                    pool.subnet, pool.prefix_len, pool.router,
+                });
+                return false;
+            }
+        }
     }
 
     // Lease time: required, > 0, max 1,209,600.

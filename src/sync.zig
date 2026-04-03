@@ -129,6 +129,9 @@ pub const SyncManager = struct {
         // Compute self_ip from listen_address for voting tie-break
         const self_ip_bytes = parseIpv4Local(full_cfg.listen_address) catch [4]u8{ 0, 0, 0, 0 };
         const self_ip = std.mem.readInt(u32, &self_ip_bytes, .big);
+        if (self_ip == 0) {
+            std.log.warn("sync: listen_address is 0.0.0.0; this server will win all sync voting ties. Consider using a specific IP.", .{});
+        }
 
         // Create UDP socket
         const sock_fd = try std.posix.socket(
