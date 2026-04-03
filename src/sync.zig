@@ -605,6 +605,10 @@ pub const SyncManager = struct {
 
         if (version != wire_version) return error.UnknownVersion;
 
+        // Guard against oversized or malicious payload_len values before arithmetic
+        // that could overflow on 32-bit targets (ad_size + payload_len + tag_size).
+        if (payload_len > 8192 or payload_len > datagram.len) return error.Truncated;
+
         const now = std.time.timestamp();
         if (@abs(now - timestamp) > anti_replay_window) return error.ReplayDetected;
 

@@ -1311,3 +1311,150 @@ test "renderConfig: MAC class with all structured fields round-trips to YAML" {
     try std.testing.expect(std.mem.indexOf(u8, out, "        dhcp_options:") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "          66: tftp.phones.local") != null);
 }
+
+test "renderConfig: comprehensive pool with all fields populated" {
+    const allocator = std.testing.allocator;
+
+    var dns_servers = [_][]const u8{ "8.8.8.8", "8.8.4.4" };
+    var domain_search = [_][]const u8{"search.lan"};
+    var log_servers = [_][]const u8{"10.0.0.7"};
+    var ntp_servers = [_][]const u8{"10.0.0.8"};
+    var wins_servers = [_][]const u8{"10.0.0.9"};
+    var tftp_servers = [_][]const u8{"10.0.0.10"};
+
+    var dhcp_opts = std.StringHashMap([]const u8).init(allocator);
+    defer dhcp_opts.deinit();
+    try dhcp_opts.put("66", "tftp.example.com");
+
+    var res_opts = std.StringHashMap([]const u8).init(allocator);
+    defer res_opts.deinit();
+    try res_opts.put("12", "reserved-host");
+
+    var reservations = [_]config_mod.Reservation{.{
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "192.168.1.50",
+        .hostname = "reserved1",
+        .client_id = "01aabbccddeeff",
+        .dhcp_options = res_opts,
+    }};
+    var static_routes = [_]config_mod.StaticRoute{.{
+        .destination = [4]u8{ 10, 20, 0, 0 },
+        .prefix_len = 16,
+        .router = [4]u8{ 192, 168, 1, 254 },
+    }};
+
+    var mc_opts = std.StringHashMap([]const u8).init(allocator);
+    defer mc_opts.deinit();
+    try mc_opts.put("67", "boot.img");
+
+    var mc_dns = [_][]const u8{"1.1.1.1"};
+    var mac_classes_arr = [_]config_mod.MacClass{.{
+        .name = "Phones",
+        .match = "aa:bb:cc",
+        .domain_name = "phones.lan",
+        .dns_servers = &mc_dns,
+        .dhcp_options = mc_opts,
+    }};
+    const mac_classes_slice: []config_mod.MacClass = &mac_classes_arr;
+
+    var pools = [_]config_mod.PoolConfig{.{
+        .subnet = "192.168.1.0",
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = "192.168.1.1",
+        .pool_start = "192.168.1.100",
+        .pool_end = "192.168.1.200",
+        .dns_servers = &dns_servers,
+        .domain_name = "home.local",
+        .domain_search = &domain_search,
+        .lease_time = 3600,
+        .time_offset = -18000,
+        .time_servers = &.{},
+        .log_servers = &log_servers,
+        .ntp_servers = &ntp_servers,
+        .mtu = 1400,
+        .wins_servers = &wins_servers,
+        .tftp_servers = &tftp_servers,
+        .boot_filename = "pxelinux.0",
+        .http_boot_url = "http://boot.example.com/efi",
+        .dns_update = .{
+            .enable = true,
+            .server = "ns1.example.com",
+            .zone = "example.com",
+            .rev_zone = "1.168.192.in-addr.arpa",
+            .key_name = "dhcp-key",
+            .key_file = "/etc/stardust/dns.key",
+            .lease_time = 3600,
+        },
+        .dhcp_options = dhcp_opts,
+        .reservations = &reservations,
+        .static_routes = &static_routes,
+        .mac_classes = mac_classes_slice,
+    }};
+
+    const cfg = config_mod.Config{
+        .allocator = allocator,
+        .listen_address = "0.0.0.0",
+        .state_dir = "/var/lib/stardust",
+        .log_level = .info,
+        .pool_allocation_random = false,
+        .sync = null,
+        .pools = &pools,
+        .admin_ssh = .{ .enable = false, .port = 2267, .bind = "0.0.0.0", .read_only = false, .host_key = "", .authorized_keys = "" },
+        .metrics = .{ .collect = false, .http_enable = false, .http_port = 9167, .http_bind = "127.0.0.1" },
+    };
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+    try renderConfig(buf.writer(allocator), &cfg);
+    const out = buf.items;
+
+    // Verify every pool field is rendered.
+    try std.testing.expect(std.mem.indexOf(u8, out, "subnet: 192.168.1.0/24") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "router: 192.168.1.1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "pool_start: 192.168.1.100") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "pool_end: 192.168.1.200") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "lease_time: 3600") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "dns_servers:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "- 8.8.8.8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "- 8.8.4.4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "domain_name: home.local") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "domain_search:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "- search.lan") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "time_offset: -18000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "log_servers:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "- 10.0.0.7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ntp_servers:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "- 10.0.0.8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "mtu: 1400") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "wins_servers:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "- 10.0.0.9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "tftp_servers:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "- 10.0.0.10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "boot_filename: pxelinux.0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "http_boot_url: http://boot.example.com/efi") != null);
+    // dns_update section
+    try std.testing.expect(std.mem.indexOf(u8, out, "dns_update:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "enable: true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "server: ns1.example.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "zone: example.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "key_name: dhcp-key") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "key_file: /etc/stardust/dns.key") != null);
+    // dhcp_options
+    try std.testing.expect(std.mem.indexOf(u8, out, "dhcp_options:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "66: tftp.example.com") != null);
+    // static_routes
+    try std.testing.expect(std.mem.indexOf(u8, out, "static_routes:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "destination: 10.20.0.0/16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "router: 192.168.1.254") != null);
+    // reservations
+    try std.testing.expect(std.mem.indexOf(u8, out, "reservations:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "mac: aa:bb:cc:dd:ee:ff") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ip: 192.168.1.50") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "hostname: reserved1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "client_id: 01aabbccddeeff") != null);
+    // mac_classes
+    try std.testing.expect(std.mem.indexOf(u8, out, "mac_classes:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "name: Phones") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "match: \"aa:bb:cc\"") != null);
+}

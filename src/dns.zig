@@ -143,6 +143,8 @@ fn encodeDnsName(buf: []u8, name: []const u8) error{NameTooLong}!usize {
     var it = std.mem.splitScalar(u8, n, '.');
     while (it.next()) |label| {
         if (label.len == 0) continue;
+        // RFC 1035 §3.1: each label must be 63 octets or less (high 2 bits reserved for compression).
+        if (label.len > 63) return error.NameTooLong;
         // Need 1 (length byte) + label.len + 1 (root terminator) bytes.
         if (pos + 1 + label.len + 1 > buf.len) return error.NameTooLong;
         buf[pos] = @intCast(label.len);
@@ -617,6 +619,17 @@ test "encodeDnsName: name too long for buffer returns error" {
     // 8-byte buffer cannot hold "example.com" (needs 13 bytes).
     var buf: [8]u8 = undefined;
     try std.testing.expectError(error.NameTooLong, encodeDnsName(&buf, "example.com"));
+}
+
+test "encodeDnsName: label exceeding 63 bytes returns error.NameTooLong" {
+    var buf: [512]u8 = undefined;
+    // A label of 64 'a' characters exceeds the RFC 1035 §3.1 limit of 63 per label.
+    const long_label = "a" ** 64 ++ ".example.com";
+    try std.testing.expectError(error.NameTooLong, encodeDnsName(&buf, long_label));
+
+    // Exactly 63 characters should succeed.
+    const ok_label = "a" ** 63 ++ ".example.com";
+    _ = try encodeDnsName(&buf, ok_label);
 }
 
 test "buildForwardUpdate: add=true has correct header fields and record class" {

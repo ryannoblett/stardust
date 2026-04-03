@@ -368,6 +368,7 @@ pub const StateStore = struct {
                 .expires = lease.expires,
                 .client_id = client_id,
                 .reserved = lease.reserved,
+                .last_modified = lease.last_modified,
                 .forcerenew_nonce = nonce,
             });
         }
@@ -958,4 +959,41 @@ test "pruneExpired removes nonce-bearing expired lease without leak" {
 
     // The test allocator will detect any leaked strings (mac, ip, hostname,
     // client_id, forcerenew_nonce) when the store is deinited.
+}
+
+test "save/load round-trip preserves last_modified" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    const specific_ts: i64 = 1700000000; // a fixed timestamp
+
+    // Save phase: add a lease with an explicit last_modified value.
+    {
+        const store = try makeTestStoreAt(std.testing.allocator, tmp_path);
+        defer store.deinit();
+
+        try store.addLeaseUnlocked(.{
+            .mac = "aa:bb:cc:dd:ee:ff",
+            .ip = "192.168.1.42",
+            .hostname = "persist-host",
+            .expires = std.time.timestamp() + 7200,
+            .client_id = null,
+            .last_modified = specific_ts,
+        });
+        try store.saveUnlocked();
+    }
+
+    // Load phase: verify last_modified survived the round-trip.
+    {
+        const store = try makeTestStoreAt(std.testing.allocator, tmp_path);
+        defer store.deinit();
+        try store.load();
+
+        const lease = store.leases.get("aa:bb:cc:dd:ee:ff");
+        try std.testing.expect(lease != null);
+        try std.testing.expectEqual(specific_ts, lease.?.last_modified);
+    }
 }

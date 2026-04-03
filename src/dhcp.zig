@@ -6053,3 +6053,107 @@ test "collectOverrides: MAC class static_routes override pool default" {
     try std.testing.expectEqual(@as(u8, 16), overrides.static_routes.?[0].prefix_len);
     try std.testing.expectEqual([4]u8{ 192, 168, 1, 254 }, overrides.static_routes.?[0].router);
 }
+
+test "DHCPINFORM with MAC class domain_name override returns phones.lan" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+
+    // Set pool domain_name to "pool.lan".
+    alloc.free(cfg.pools[0].domain_name);
+    cfg.pools[0].domain_name = try alloc.dupe(u8, "pool.lan");
+
+    // Add a MAC class that overrides domain_name to "phones.lan" for OUI aa:bb:cc.
+    const mac_classes = try alloc.alloc(config_mod.MacClass, 1);
+    mac_classes[0] = .{
+        .name = try alloc.dupe(u8, "PhonesDN"),
+        .match = try alloc.dupe(u8, "aa:bb:cc"),
+        .domain_name = try alloc.dupe(u8, "phones.lan"),
+        .dhcp_options = std.StringHashMap([]const u8).init(alloc),
+    };
+    cfg.pools[0].mac_classes = mac_classes;
+
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    // Build a DHCPINFORM from MAC aa:bb:cc:dd:ee:ff (matches OUI "aa:bb:cc").
+    var buf align(4) = [_]u8{0} ** 512;
+    @memset(&buf, 0);
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(&buf));
+    hdr.op = 1;
+    hdr.htype = 1;
+    hdr.hlen = 6;
+    hdr.xid = 0x11223344;
+    hdr.magic = dhcp_magic_cookie;
+    hdr.ciaddr = [4]u8{ 192, 168, 1, 55 };
+    @memcpy(hdr.chaddr[0..6], &[6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF });
+    var i: usize = dhcp_min_packet_size;
+    buf[i] = @intFromEnum(OptionCode.MessageType);
+    buf[i + 1] = 1;
+    buf[i + 2] = @intFromEnum(MessageType.DHCPINFORM);
+    i += 3;
+    buf[i] = @intFromEnum(OptionCode.End);
+    i += 1;
+
+    const resp = try server.processPacket(buf[0..i]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+
+    // Must be DHCPACK.
+    try std.testing.expectEqual(MessageType.DHCPACK, DHCPServer.getMessageType(resp.?).?);
+
+    // Option 15 (DomainName) must contain the MAC class override "phones.lan".
+    const opt15 = DHCPServer.getOption(resp.?, .DomainName);
+    try std.testing.expect(opt15 != null);
+    try std.testing.expectEqualStrings("phones.lan", opt15.?);
+}
+
+test "UEFI HTTP boot: MAC class http_boot_url override in DISCOVER" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+
+    // Pool http_boot_url is empty (default); set pool range.
+    cfg.pools[0].pool_start = blk: {
+        alloc.free(cfg.pools[0].pool_start);
+        break :blk try alloc.dupe(u8, "192.168.1.10");
+    };
+    cfg.pools[0].pool_end = blk: {
+        alloc.free(cfg.pools[0].pool_end);
+        break :blk try alloc.dupe(u8, "192.168.1.20");
+    };
+
+    // Add a MAC class that sets http_boot_url for OUI aa:bb:cc.
+    const mac_classes = try alloc.alloc(config_mod.MacClass, 1);
+    mac_classes[0] = .{
+        .name = try alloc.dupe(u8, "PhonesHTTP"),
+        .match = try alloc.dupe(u8, "aa:bb:cc"),
+        .http_boot_url = try alloc.dupe(u8, "http://boot.phones.local/efi"),
+        .dhcp_options = std.StringHashMap([]const u8).init(alloc),
+    };
+    cfg.pools[0].mac_classes = mac_classes;
+
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    // DISCOVER with HTTPClient VCI from a MAC that matches the class.
+    var buf align(4) = [_]u8{0} ** 512;
+    const len = makeDiscover(&buf, [6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01 }, "HTTPClient");
+    const resp = try server.processPacket(buf[0..len]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+
+    try std.testing.expectEqual(MessageType.DHCPOFFER, DHCPServer.getMessageType(resp.?).?);
+    // Option 67 must contain the MAC class URL.
+    const opt67 = DHCPServer.getOption(resp.?, .BootFileName);
+    try std.testing.expect(opt67 != null);
+    try std.testing.expectEqualStrings("http://boot.phones.local/efi", opt67.?);
+    // Option 60 must echo "HTTPClient".
+    const opt60 = DHCPServer.getOption(resp.?, .VendorClassIdentifier);
+    try std.testing.expect(opt60 != null);
+    try std.testing.expectEqualStrings("HTTPClient", opt60.?);
+}
