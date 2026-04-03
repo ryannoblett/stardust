@@ -96,9 +96,11 @@ pub const OptionCode = enum(u8) {
     ClientID = 61,
     TftpServerName = 66,
     BootFileName = 67,
+    Authentication = 90, // RFC 3118 / RFC 6704
     RelayAgentInformation = 82,
     DomainSearch = 119,
     ClasslessStaticRoutes = 121, // RFC 3442
+    ForcerenewNonce = 145, // RFC 6704
     CiscoTftp = 150, // Cisco TFTP server address
     End = 255,
     _,
@@ -759,12 +761,38 @@ pub const DHCPServer = struct {
 
     /// Send a DHCPFORCERENEW message to a specific client IP, causing it to
     /// initiate a renew cycle. Thread-safe: uses the atomic sock_fd.
+    /// Includes RFC 6704 Forcerenew Nonce Authentication (option 90) when
+    /// the lease has a stored nonce from the original DHCPACK.
     pub fn sendForceRenew(self: *Self, client_ip: [4]u8) void {
         const fd_i32 = self.sock_fd.load(.acquire);
         if (fd_i32 < 0) return; // socket not yet open
         const fd: std.posix.fd_t = @intCast(fd_i32);
 
-        var pkt: [300]u8 align(4) = [_]u8{0} ** 300;
+        // Look up the lease by IP to retrieve the forcerenew nonce and client MAC.
+        var ip_str_buf: [15]u8 = undefined;
+        const ip_str = std.fmt.bufPrint(&ip_str_buf, "{d}.{d}.{d}.{d}", .{
+            client_ip[0], client_ip[1], client_ip[2], client_ip[3],
+        }) catch unreachable;
+        const lease = self.store.getLeaseByIp(ip_str);
+
+        // Decode the nonce from hex if available.
+        var nonce_raw: [16]u8 = undefined;
+        var has_nonce = false;
+        if (lease) |l| {
+            if (l.forcerenew_nonce) |hex_nonce| {
+                if (hex_nonce.len == 32) {
+                    has_nonce = true;
+                    for (0..16) |bi| {
+                        nonce_raw[bi] = std.fmt.parseInt(u8, hex_nonce[bi * 2 ..][0..2], 16) catch {
+                            has_nonce = false;
+                            break;
+                        };
+                    }
+                }
+            }
+        }
+
+        var pkt: [400]u8 align(4) = [_]u8{0} ** 400;
         const hdr: *DHCPHeader = @ptrCast(@alignCast(&pkt));
         hdr.op = 2; // BOOTREPLY
         hdr.htype = 1;
@@ -772,6 +800,16 @@ pub const DHCPServer = struct {
         hdr.xid = std.crypto.random.int(u32);
         hdr.magic = dhcp_magic_cookie;
         @memcpy(&hdr.siaddr, &self.server_ip);
+
+        // Set client MAC in chaddr if we have the lease.
+        if (lease) |l| {
+            // Parse "xx:xx:xx:xx:xx:xx" MAC string into 6 bytes.
+            if (l.mac.len == 17) {
+                for (0..6) |mi| {
+                    hdr.chaddr[mi] = std.fmt.parseInt(u8, l.mac[mi * 3 ..][0..2], 16) catch 0;
+                }
+            }
+        }
 
         var i: usize = dhcp_min_packet_size;
         // Option 53: Message Type = FORCERENEW (9)
@@ -784,9 +822,41 @@ pub const DHCPServer = struct {
         pkt[i + 1] = 4;
         @memcpy(pkt[i + 2 .. i + 6], &self.server_ip);
         i += 6;
+
+        // Option 90: Authentication (RFC 6704 §4 / RFC 3118)
+        // Only included when we have a valid nonce from the original DHCPACK.
+        // Format: [90][27][protocol=3][algorithm=1][rdm=0][replay=8bytes][hmac=16bytes]
+        var auth_info_offset: usize = 0; // offset of the 16-byte HMAC field within pkt
+        if (has_nonce) {
+            pkt[i] = @intFromEnum(OptionCode.Authentication);
+            pkt[i + 1] = 27; // length: 1+1+1+8+16
+            pkt[i + 2] = 3; // protocol: Reconfigure Key Authentication (RFC 6704)
+            pkt[i + 3] = 1; // algorithm: HMAC-MD5
+            pkt[i + 4] = 0; // RDM: Monotonically Increasing Value
+            // Replay detection: current time as u64 big-endian
+            const now_u64: u64 = @intCast(@max(@as(i64, 0), std.time.timestamp()));
+            const replay_bytes = std.mem.toBytes(std.mem.nativeToBig(u64, now_u64));
+            @memcpy(pkt[i + 5 .. i + 13], &replay_bytes);
+            // Authentication Information: 16 bytes HMAC-MD5 (zeroed for now; computed below)
+            auth_info_offset = i + 13;
+            @memset(pkt[auth_info_offset .. auth_info_offset + 16], 0);
+            i += 29; // 2 (code+len) + 27 (data)
+        }
+
         // End
         pkt[i] = 255;
         i += 1;
+
+        // Compute HMAC-MD5 over the entire DHCP message with the Authentication
+        // Information field zeroed (already is). The nonce serves as the HMAC key.
+        if (has_nonce) {
+            const HmacMd5 = std.crypto.auth.hmac.Hmac(std.crypto.hash.Md5);
+            var ctx = HmacMd5.init(&nonce_raw);
+            ctx.update(pkt[0..i]);
+            var mac: [HmacMd5.mac_length]u8 = undefined;
+            ctx.final(&mac);
+            @memcpy(pkt[auth_info_offset .. auth_info_offset + 16], &mac);
+        }
 
         const dest = std.posix.sockaddr.in{
             .family = std.posix.AF.INET,
@@ -801,8 +871,9 @@ pub const DHCPServer = struct {
         };
 
         _ = self.counters.forcerenew.fetchAdd(1, .monotonic);
-        std.log.info("FORCERENEW sent to {d}.{d}.{d}.{d}", .{
-            client_ip[0], client_ip[1], client_ip[2], client_ip[3],
+        std.log.info("FORCERENEW sent to {d}.{d}.{d}.{d}{s}", .{
+            client_ip[0],                              client_ip[1], client_ip[2], client_ip[3],
+            if (has_nonce) " (authenticated)" else "",
         });
     }
 
@@ -1890,6 +1961,19 @@ pub const DHCPServer = struct {
         const now = std.time.timestamp();
         const hostname = getHostname(request);
         const effective_hostname: ?[]const u8 = res_hostname orelse hostname;
+
+        // RFC 6704: generate a 16-byte random nonce for Forcerenew Nonce Authentication.
+        // Stored as a 32-char hex string on the lease for JSON compatibility.
+        var nonce_bytes: [16]u8 = undefined;
+        std.crypto.random.bytes(&nonce_bytes);
+        var nonce_hex: [32]u8 = undefined;
+        _ = std.fmt.bufPrint(&nonce_hex, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
+            nonce_bytes[0],  nonce_bytes[1],  nonce_bytes[2],  nonce_bytes[3],
+            nonce_bytes[4],  nonce_bytes[5],  nonce_bytes[6],  nonce_bytes[7],
+            nonce_bytes[8],  nonce_bytes[9],  nonce_bytes[10], nonce_bytes[11],
+            nonce_bytes[12], nonce_bytes[13], nonce_bytes[14], nonce_bytes[15],
+        }) catch unreachable;
+
         const new_lease = state_mod.Lease{
             .mac = mac_str,
             .ip = ip_str,
@@ -1898,6 +1982,7 @@ pub const DHCPServer = struct {
             .client_id = client_id_hex,
             .reserved = reservation != null,
             .local = true, // this server issued the DHCPACK
+            .forcerenew_nonce = &nonce_hex,
         };
         self.store.addLease(new_lease) catch |err| {
             std.log.warn("Failed to store lease ({s})", .{@errorName(err)});
@@ -2146,6 +2231,16 @@ pub const DHCPServer = struct {
             opts_buf[opts_len] = code;
             opts_buf[opts_len + 1] = @intCast(encoded.len);
             opts_len += 2 + encoded.len;
+        }
+
+        // Option 145: Forcerenew Nonce Authentication (RFC 6704 §3)
+        // Format: [145][17][algorithm=1][16 nonce bytes]
+        if (opts_len + 19 <= opts_buf.len - 1) {
+            opts_buf[opts_len] = @intFromEnum(OptionCode.ForcerenewNonce);
+            opts_buf[opts_len + 1] = 17; // length: 1 (algorithm) + 16 (nonce)
+            opts_buf[opts_len + 2] = 1; // algorithm: HMAC-MD5
+            @memcpy(opts_buf[opts_len + 3 .. opts_len + 19], &nonce_bytes);
+            opts_len += 19;
         }
 
         // End

@@ -14,6 +14,7 @@ pub const Lease = struct {
     reserved: bool = false,
     last_modified: i64 = 0, // unix timestamp; 0 = unknown (old JSON records)
     local: bool = false, // true = this server issued the DHCPACK; not persisted (defaults false on load/sync)
+    forcerenew_nonce: ?[]const u8 = null, // 32-char hex string (16 random bytes); RFC 6704
 };
 
 pub const StateStore = struct {
@@ -50,6 +51,7 @@ pub const StateStore = struct {
             store.allocator.free(lease.ip);
             if (lease.hostname) |h| store.allocator.free(h);
             if (lease.client_id) |c| store.allocator.free(c);
+            if (lease.forcerenew_nonce) |n| store.allocator.free(n);
         }
         store.leases.deinit();
         store.allocator.destroy(store);
@@ -232,6 +234,8 @@ pub const StateStore = struct {
         errdefer if (hostname) |h| store.allocator.free(h);
         const client_id: ?[]const u8 = if (lease.client_id) |c| try store.allocator.dupe(u8, c) else null;
         errdefer if (client_id) |c| store.allocator.free(c);
+        const nonce: ?[]const u8 = if (lease.forcerenew_nonce) |n| try store.allocator.dupe(u8, n) else null;
+        errdefer if (nonce) |n| store.allocator.free(n);
 
         // Now that all allocations succeeded, remove the old entry (if any).
         if (store.leases.fetchRemove(lease.mac)) |kv| {
@@ -239,6 +243,7 @@ pub const StateStore = struct {
             store.allocator.free(kv.value.ip);
             if (kv.value.hostname) |h| store.allocator.free(h);
             if (kv.value.client_id) |c| store.allocator.free(c);
+            if (kv.value.forcerenew_nonce) |n| store.allocator.free(n);
         }
 
         try store.leases.put(mac, .{
@@ -251,6 +256,7 @@ pub const StateStore = struct {
             // Preserve the caller's last_modified if set; otherwise stamp now.
             // Sync peers supply the original timestamp so lease hashes stay in sync.
             .last_modified = if (lease.last_modified != 0) lease.last_modified else std.time.timestamp(),
+            .forcerenew_nonce = nonce,
         });
     }
 
@@ -269,6 +275,7 @@ pub const StateStore = struct {
             store.allocator.free(kv.value.ip);
             if (kv.value.hostname) |h| store.allocator.free(h);
             if (kv.value.client_id) |c| store.allocator.free(c);
+            if (kv.value.forcerenew_nonce) |n| store.allocator.free(n);
             return true;
         }
         return false;
@@ -282,6 +289,7 @@ pub const StateStore = struct {
             store.allocator.free(kv.value.ip);
             if (kv.value.hostname) |h| store.allocator.free(h);
             if (kv.value.client_id) |c| store.allocator.free(c);
+            if (kv.value.forcerenew_nonce) |n| store.allocator.free(n);
             return true;
         }
         return false;
@@ -351,6 +359,8 @@ pub const StateStore = struct {
             errdefer if (hostname) |h| store.allocator.free(h);
             const client_id: ?[]const u8 = if (lease.client_id) |c| try store.allocator.dupe(u8, c) else null;
             errdefer if (client_id) |c| store.allocator.free(c);
+            const nonce: ?[]const u8 = if (lease.forcerenew_nonce) |n| try store.allocator.dupe(u8, n) else null;
+            errdefer if (nonce) |n| store.allocator.free(n);
             try store.leases.put(mac, .{
                 .mac = mac,
                 .ip = ip,
@@ -358,6 +368,7 @@ pub const StateStore = struct {
                 .expires = lease.expires,
                 .client_id = client_id,
                 .reserved = lease.reserved,
+                .forcerenew_nonce = nonce,
             });
         }
     }
