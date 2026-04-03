@@ -1117,9 +1117,9 @@ fn parseMacClasses(allocator: std.mem.Allocator, list: anytype) ![]MacClass {
 
 /// Parse a string list from a mac_class map entry. Returns &.{} if not present.
 fn parseMacClassStringList(allocator: std.mem.Allocator, m: anytype, key: []const u8) ![][]const u8 {
-    const val = m.get(key) orelse return &.{};
-    const list = val.asList() orelse return &.{};
-    if (list.len == 0) return &.{};
+    const val = m.get(key) orelse return try allocator.alloc([]const u8, 0);
+    const list = val.asList() orelse return try allocator.alloc([]const u8, 0);
+    if (list.len == 0) return try allocator.alloc([]const u8, 0);
     const result = try allocator.alloc([]const u8, list.len);
     var count: usize = 0;
     errdefer {
@@ -1135,7 +1135,7 @@ fn parseMacClassStringList(allocator: std.mem.Allocator, m: anytype, key: []cons
     }
     if (count == 0) {
         allocator.free(result);
-        return &.{};
+        return try allocator.alloc([]const u8, 0);
     }
     return allocator.realloc(result, count) catch result[0..count];
 }

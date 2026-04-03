@@ -5258,6 +5258,11 @@ fn buildRoutesFromForm(allocator: std.mem.Allocator, form: *const PoolForm) ![]c
 fn buildMacClassesFromForm(allocator: std.mem.Allocator, form: *const PoolForm) ![]config_mod.MacClass {
     if (form.mac_class_count == 0) return try allocator.alloc(config_mod.MacClass, 0);
     var classes = try allocator.alloc(config_mod.MacClass, form.mac_class_count);
+    var built: usize = 0;
+    errdefer {
+        for (classes[0..built]) |*mc| mc.deinit(allocator);
+        allocator.free(classes);
+    }
     for (0..form.mac_class_count) |i| {
         const mce = &form.mac_classes[i];
         var mcc: config_mod.MacClass = undefined;
@@ -5280,6 +5285,7 @@ fn buildMacClassesFromForm(allocator: std.mem.Allocator, form: *const PoolForm) 
         // Build DHCP options from option entries.
         mcc.dhcp_options = try buildOptionsFromEntries(allocator, &mce.options, mce.option_count);
         classes[i] = mcc;
+        built += 1;
     }
     return classes;
 }

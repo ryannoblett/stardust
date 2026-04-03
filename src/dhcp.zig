@@ -516,6 +516,8 @@ fn appendRawStringOpt(opts_buf: []u8, opts_len: *usize, code: OptionCode, value:
 
 const ResolveCacheEntry = struct {
     name_hash: u64,
+    name_buf: [64]u8 = [_]u8{0} ** 64,
+    name_len: u8 = 0,
     ip: [4]u8,
     timestamp: i64, // epoch seconds
 };
@@ -528,11 +530,13 @@ fn resolveHostToIpv4(name: []const u8, cache: *[RESOLVE_CACHE_SIZE]ResolveCacheE
     // Fast path: direct IPv4 parse.
     if (config_mod.parseIpv4(name)) |ip| return ip else |_| {}
 
-    // Cache lookup by name hash.
+    // Cache lookup by name hash + actual name comparison to avoid collisions.
     const name_hash = std.hash.Wyhash.hash(0, name);
     const now = std.time.timestamp();
     const slot = @as(usize, @intCast(name_hash % RESOLVE_CACHE_SIZE));
     if (cache[slot].name_hash == name_hash and
+        cache[slot].name_len == @as(u8, @intCast(@min(name.len, 64))) and
+        std.mem.eql(u8, cache[slot].name_buf[0..cache[slot].name_len], name[0..@min(name.len, 64)]) and
         (now - cache[slot].timestamp) < RESOLVE_CACHE_TTL)
     {
         return cache[slot].ip;
@@ -573,12 +577,18 @@ fn resolveHostToIpv4(name: []const u8, cache: *[RESOLVE_CACHE_SIZE]ResolveCacheE
     const sin: *const std.posix.sockaddr.in = @ptrCast(@alignCast(sa));
     const ip: [4]u8 = @bitCast(sin.addr);
 
-    // Store in cache.
-    cache[slot] = .{
-        .name_hash = name_hash,
-        .ip = ip,
-        .timestamp = now,
-    };
+    // Store in cache (hostnames > 64 chars skip caching to avoid truncation mismatches).
+    if (name.len <= 64) {
+        var nbuf: [64]u8 = [_]u8{0} ** 64;
+        @memcpy(nbuf[0..name.len], name);
+        cache[slot] = .{
+            .name_hash = name_hash,
+            .name_buf = nbuf,
+            .name_len = @intCast(name.len),
+            .ip = ip,
+            .timestamp = now,
+        };
+    }
     return ip;
 }
 
@@ -749,7 +759,7 @@ pub const DHCPServer = struct {
             .if_info = null,
             .sync_mgr = sync_mgr,
             .counters = .{},
-            .resolve_cache = [_]ResolveCacheEntry{.{ .name_hash = 0, .ip = .{ 0, 0, 0, 0 }, .timestamp = 0 }} ** RESOLVE_CACHE_SIZE,
+            .resolve_cache = [_]ResolveCacheEntry{.{ .name_hash = 0, .name_buf = [_]u8{0} ** 64, .name_len = 0, .ip = .{ 0, 0, 0, 0 }, .timestamp = 0 }} ** RESOLVE_CACHE_SIZE,
         };
         return self;
     }
@@ -894,7 +904,7 @@ pub const DHCPServer = struct {
             if (lease.expires <= now) continue;
             const ip_bytes = config_mod.parseIpv4(lease.ip) catch continue;
             const ip_int = std.mem.readInt(u32, &ip_bytes, .big);
-            if ((ip_int & pool.subnet_mask) != subnet_int) continue;
+            if ((ip_int & pool.subnet_mask) != (subnet_int & pool.subnet_mask)) continue;
             self.sendForceRenew(ip_bytes);
         }
     }
@@ -941,7 +951,7 @@ pub const DHCPServer = struct {
             const g_int = std.mem.readInt(u32, &giaddr, .big);
             for (self.cfg.pools) |*pool| {
                 const s = config_mod.parseIpv4(pool.subnet) catch continue;
-                if ((g_int & pool.subnet_mask) == std.mem.readInt(u32, &s, .big)) {
+                if ((g_int & pool.subnet_mask) == (std.mem.readInt(u32, &s, .big) & pool.subnet_mask)) {
                     if (!self.isPoolDisabled(pool)) return pool;
                 }
             }
@@ -951,7 +961,7 @@ pub const DHCPServer = struct {
             const ci_int = std.mem.readInt(u32, &ciaddr, .big);
             for (self.cfg.pools) |*pool| {
                 const s = config_mod.parseIpv4(pool.subnet) catch continue;
-                if ((ci_int & pool.subnet_mask) == std.mem.readInt(u32, &s, .big)) {
+                if ((ci_int & pool.subnet_mask) == (std.mem.readInt(u32, &s, .big) & pool.subnet_mask)) {
                     if (!self.isPoolDisabled(pool)) return pool;
                 }
             }
@@ -960,7 +970,7 @@ pub const DHCPServer = struct {
         const sv_int = std.mem.readInt(u32, &self.server_ip, .big);
         for (self.cfg.pools) |*pool| {
             const s = config_mod.parseIpv4(pool.subnet) catch continue;
-            if ((sv_int & pool.subnet_mask) == std.mem.readInt(u32, &s, .big)) {
+            if ((sv_int & pool.subnet_mask) == (std.mem.readInt(u32, &s, .big) & pool.subnet_mask)) {
                 if (!self.isPoolDisabled(pool)) return pool;
             }
         }
@@ -2902,7 +2912,7 @@ pub const DHCPServer = struct {
         msg_type: MessageType,
         lease: ?state_mod.Lease,
     ) !?[]u8 {
-        var resp = try self.allocator.alloc(u8, 576);
+        var resp = try self.allocator.alloc(u8, 1024);
         @memset(resp, 0);
 
         const hdr: *DHCPHeader = @ptrCast(@alignCast(resp.ptr));
@@ -2984,7 +2994,7 @@ pub const DHCPServer = struct {
 
                 // Option 12: Hostname (if available).
                 if (l.hostname) |hn| {
-                    if (hn.len > 0 and hn.len <= 255) {
+                    if (hn.len > 0 and hn.len <= 255 and opts_len + 2 + hn.len <= resp.len - 1) {
                         resp[opts_len] = @intFromEnum(OptionCode.HostName);
                         resp[opts_len + 1] = @intCast(hn.len);
                         @memcpy(resp[opts_len + 2 .. opts_len + 2 + hn.len], hn);
@@ -2994,7 +3004,7 @@ pub const DHCPServer = struct {
 
                 // Option 61: Client ID (if available).
                 if (l.client_id) |cid| {
-                    if (cid.len > 0 and cid.len <= 255) {
+                    if (cid.len > 0 and cid.len <= 255 and opts_len + 2 + cid.len <= resp.len - 1) {
                         resp[opts_len] = @intFromEnum(OptionCode.ClientID);
                         resp[opts_len + 1] = @intCast(cid.len);
                         @memcpy(resp[opts_len + 2 .. opts_len + 2 + cid.len], cid);
@@ -3012,7 +3022,9 @@ pub const DHCPServer = struct {
         resp[opts_len] = @intFromEnum(OptionCode.End);
         opts_len += 1;
 
-        return resp[0..opts_len];
+        // Shrink the allocation to the actual packet size so callers can free it correctly.
+        const result = self.allocator.realloc(resp, opts_len) catch resp;
+        return result[0..opts_len];
     }
 };
 
@@ -5682,4 +5694,205 @@ test "OFFER includes option 66 (TFTP server name) from tftp_servers[0] as string
     const opt66 = DHCPServer.getOption(resp.?, .TftpServerName);
     try std.testing.expect(opt66 != null);
     try std.testing.expectEqualStrings("10.0.0.5", opt66.?);
+}
+
+// ---------------------------------------------------------------------------
+// Leasequery tests
+// ---------------------------------------------------------------------------
+
+/// Build a minimal DHCPLEASEQUERY packet. Returns total packet length.
+fn makeLeaseQuery(buf: []u8, ciaddr: [4]u8, chaddr: [6]u8) usize {
+    @memset(buf, 0);
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(buf.ptr));
+    hdr.op = 1; // BOOTREQUEST
+    hdr.htype = 1;
+    hdr.hlen = 6;
+    hdr.xid = 0xABCDABCD;
+    hdr.magic = dhcp_magic_cookie;
+    @memcpy(&hdr.ciaddr, &ciaddr);
+    @memcpy(hdr.chaddr[0..6], &chaddr);
+
+    var i: usize = dhcp_min_packet_size;
+    buf[i] = @intFromEnum(OptionCode.MessageType);
+    buf[i + 1] = 1;
+    buf[i + 2] = @intFromEnum(MessageType.DHCPLEASEQUERY);
+    i += 3;
+    buf[i] = @intFromEnum(OptionCode.End);
+    i += 1;
+    return i;
+}
+
+test "DHCPLEASEQUERY by IP returns DHCPLEASEACTIVE for active lease" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    // Seed an active lease into the store.
+    const now = std.time.timestamp();
+    try store.addLease(.{
+        .mac = "aa:bb:cc:dd:ee:01",
+        .ip = "192.168.1.50",
+        .hostname = "testhost",
+        .expires = now + 3600,
+        .client_id = null,
+    });
+
+    // Build a DHCPLEASEQUERY with ciaddr = 192.168.1.50.
+    var buf align(4) = [_]u8{0} ** 512;
+    const len = makeLeaseQuery(&buf, [4]u8{ 192, 168, 1, 50 }, [6]u8{ 0, 0, 0, 0, 0, 0 });
+    const resp = try server.processPacket(buf[0..len]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+
+    // Message type must be DHCPLEASEACTIVE (13).
+    try std.testing.expectEqual(MessageType.DHCPLEASEACTIVE, DHCPServer.getMessageType(resp.?).?);
+
+    // ciaddr in the response should be the lease IP.
+    const resp_hdr: *const DHCPHeader = @ptrCast(@alignCast(resp.?.ptr));
+    try std.testing.expectEqual([4]u8{ 192, 168, 1, 50 }, resp_hdr.ciaddr);
+
+    // chaddr should be the lease MAC.
+    try std.testing.expectEqual(@as(u8, 0xaa), resp_hdr.chaddr[0]);
+    try std.testing.expectEqual(@as(u8, 0xbb), resp_hdr.chaddr[1]);
+    try std.testing.expectEqual(@as(u8, 0xcc), resp_hdr.chaddr[2]);
+    try std.testing.expectEqual(@as(u8, 0xdd), resp_hdr.chaddr[3]);
+    try std.testing.expectEqual(@as(u8, 0xee), resp_hdr.chaddr[4]);
+    try std.testing.expectEqual(@as(u8, 0x01), resp_hdr.chaddr[5]);
+
+    // Option 51 (lease time) must be present and > 0.
+    const opt51 = DHCPServer.getOption(resp.?, .IPAddressLeaseTime);
+    try std.testing.expect(opt51 != null);
+    const remaining = std.mem.readInt(u32, opt51.?[0..4], .big);
+    try std.testing.expect(remaining > 0);
+
+    // Option 91 (client last transaction time) must be present.
+    const opt91 = DHCPServer.getOption(resp.?, .ClientLastTransactionTime);
+    try std.testing.expect(opt91 != null);
+}
+
+test "DHCPLEASEQUERY by IP returns DHCPLEASEUNKNOWN for IP not in any pool" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    // Query for an IP that is outside the configured 192.168.1.0/24 pool.
+    var buf align(4) = [_]u8{0} ** 512;
+    const len = makeLeaseQuery(&buf, [4]u8{ 10, 99, 99, 99 }, [6]u8{ 0, 0, 0, 0, 0, 0 });
+    const resp = try server.processPacket(buf[0..len]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+
+    // Message type must be DHCPLEASEUNKNOWN (12).
+    try std.testing.expectEqual(MessageType.DHCPLEASEUNKNOWN, DHCPServer.getMessageType(resp.?).?);
+}
+
+// ---------------------------------------------------------------------------
+// collectOverrides: MAC class first-class field overrides
+// ---------------------------------------------------------------------------
+
+test "collectOverrides: MAC class overrides router and dns_servers first-class fields" {
+    const allocator = std.testing.allocator;
+
+    var pool = config_mod.PoolConfig{
+        .subnet = "192.168.1.0",
+        .subnet_mask = 0xFFFFFF00,
+        .prefix_len = 24,
+        .router = "192.168.1.1",
+        .pool_start = "",
+        .pool_end = "",
+        .dns_servers = &.{},
+        .domain_name = "",
+        .domain_search = &.{},
+        .lease_time = 3600,
+        .time_offset = null,
+        .time_servers = &.{},
+        .log_servers = &.{},
+        .ntp_servers = &.{},
+        .mtu = null,
+        .wins_servers = &.{},
+        .tftp_servers = &.{},
+        .boot_filename = "",
+        .http_boot_url = "",
+        .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
+        .dhcp_options = std.StringHashMap([]const u8).init(allocator),
+        .reservations = &.{},
+        .static_routes = &.{},
+    };
+    defer pool.dhcp_options.deinit();
+
+    // MAC class that overrides router and dns_servers (first-class fields, not dhcp_options).
+    var dns_list = [_][]const u8{ "8.8.8.8", "8.8.4.4" };
+    var mac_classes = [_]config_mod.MacClass{.{
+        .name = "CustomDNS",
+        .match = "aa:bb:cc",
+        .router = "10.0.0.1",
+        .dns_servers = &dns_list,
+        .dhcp_options = std.StringHashMap([]const u8).init(allocator),
+    }};
+
+    var overrides = collectOverrides(allocator, &pool, "aa:bb:cc:dd:ee:ff", null, &mac_classes);
+    defer overrides.dhcp_options.deinit();
+
+    // router should come from the MAC class, not the pool.
+    try std.testing.expect(overrides.router != null);
+    try std.testing.expectEqualStrings("10.0.0.1", overrides.router.?);
+
+    // dns_servers should come from the MAC class.
+    try std.testing.expect(overrides.dns_servers != null);
+    try std.testing.expectEqual(@as(usize, 2), overrides.dns_servers.?.len);
+    try std.testing.expectEqualStrings("8.8.8.8", overrides.dns_servers.?[0]);
+    try std.testing.expectEqualStrings("8.8.4.4", overrides.dns_servers.?[1]);
+}
+
+// ---------------------------------------------------------------------------
+// FORCERENEW nonce (option 145) in ACK
+// ---------------------------------------------------------------------------
+
+test "DHCPACK contains option 145 (Forcerenew Nonce) with non-zero nonce" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    // Send a REQUEST (no option 54, renewal-style) for an IP in the pool.
+    var buf align(4) = [_]u8{0} ** 512;
+    const len = makeRequest(
+        &buf,
+        [6]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01 },
+        [4]u8{ 192, 168, 1, 50 },
+        [4]u8{ 192, 168, 1, 1 }, // our server
+        null,
+    );
+    const resp = try server.processPacket(buf[0..len]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+    try std.testing.expectEqual(MessageType.DHCPACK, DHCPServer.getMessageType(resp.?).?);
+
+    // Option 145 must be present: code=145, len=17, algorithm=1, 16 nonce bytes.
+    const opt145 = DHCPServer.getOption(resp.?, .ForcerenewNonce);
+    try std.testing.expect(opt145 != null);
+    try std.testing.expectEqual(@as(usize, 17), opt145.?.len);
+    // First byte is algorithm (1 = HMAC-MD5).
+    try std.testing.expectEqual(@as(u8, 1), opt145.?[0]);
+
+    // Verify the nonce bytes are not all zero (crypto random).
+    var all_zero = true;
+    for (opt145.?[1..17]) |b| {
+        if (b != 0) {
+            all_zero = false;
+            break;
+        }
+    }
+    try std.testing.expect(!all_zero);
 }

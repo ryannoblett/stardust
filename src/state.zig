@@ -892,3 +892,42 @@ test "addLeaseUnlocked: old IP mapping gone after MAC update" {
     }
     try std.testing.expect(!found_old_ip);
 }
+
+test "forcerenew_nonce lifecycle: store, replace, remove without leak" {
+    const alloc = std.testing.allocator;
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+
+    // 1. Add a lease with a nonce string.
+    try store.addLeaseUnlocked(.{
+        .mac = "aa:bb:cc:dd:ee:99",
+        .ip = "192.168.1.99",
+        .hostname = null,
+        .expires = std.time.timestamp() + 3600,
+        .client_id = null,
+        .forcerenew_nonce = "aabbccdd00112233aabbccdd00112233",
+    });
+
+    // Verify the nonce is stored correctly.
+    const l1 = store.leases.get("aa:bb:cc:dd:ee:99").?;
+    try std.testing.expect(l1.forcerenew_nonce != null);
+    try std.testing.expectEqualStrings("aabbccdd00112233aabbccdd00112233", l1.forcerenew_nonce.?);
+
+    // 2. Replace the lease with a new nonce — old nonce must be freed (test allocator detects leaks).
+    try store.addLeaseUnlocked(.{
+        .mac = "aa:bb:cc:dd:ee:99",
+        .ip = "192.168.1.99",
+        .hostname = null,
+        .expires = std.time.timestamp() + 7200,
+        .client_id = null,
+        .forcerenew_nonce = "11223344556677881122334455667788",
+    });
+
+    const l2 = store.leases.get("aa:bb:cc:dd:ee:99").?;
+    try std.testing.expect(l2.forcerenew_nonce != null);
+    try std.testing.expectEqualStrings("11223344556677881122334455667788", l2.forcerenew_nonce.?);
+
+    // 3. Remove the lease — nonce must be freed (test allocator catches leaks on deinit).
+    _ = store.removeLeaseUnlocked("aa:bb:cc:dd:ee:99");
+    try std.testing.expect(store.leases.get("aa:bb:cc:dd:ee:99") == null);
+}
