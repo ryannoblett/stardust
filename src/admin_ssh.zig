@@ -97,6 +97,9 @@ pub const AdminServer = struct {
     counters: *dhcp_mod.Counters,
     /// Non-null when the server is part of a sync group.
     sync_mgr: ?*sync_mod.SyncManager,
+    /// DHCP server reference for sending FORCERENEW messages. Null until set
+    /// from main after both servers are created.
+    dhcp_server: ?*dhcp_mod.DHCPServer = null,
     running: std.atomic.Value(bool),
     /// Number of session threads currently alive. Incremented in runInner
     /// before spawning (so stop() never races a freshly-spawned thread),
@@ -2246,6 +2249,7 @@ fn renderStatsTab(
         .{ .label = "RELEASE ", .val = ctr.release.load(.monotonic) },
         .{ .label = "DECLINE ", .val = ctr.decline.load(.monotonic) },
         .{ .label = "INFORM  ", .val = ctr.inform.load(.monotonic) },
+        .{ .label = "FORCERNW", .val = ctr.forcerenew.load(.monotonic) },
     };
 
     for (counter_lines) |cl| {
@@ -2552,6 +2556,13 @@ fn saveReservation(server: *AdminServer, form: *ReservationForm) ?[]const u8 {
         return "IP not in any configured pool";
     }
 
+    // Send FORCERENEW so the client picks up updated reservation settings.
+    if (server.dhcp_server) |ds| {
+        if (config_mod.parseIpv4(ip)) |ip_bytes| {
+            ds.sendForceRenew(ip_bytes);
+        } else |_| {}
+    }
+
     return null;
 }
 
@@ -2737,6 +2748,12 @@ fn handleDeleteConfirmKey(server: *AdminServer, state: *TuiState, key: vaxis.Key
     if (key.matches('y', .{})) {
         const mac = state.del_mac[0..state.del_mac_len];
         const ip = state.del_ip[0..state.del_ip_len];
+        // Send FORCERENEW before removing the lease so the client re-initiates.
+        if (server.dhcp_server) |ds| {
+            if (config_mod.parseIpv4(ip)) |ip_bytes| {
+                ds.sendForceRenew(ip_bytes);
+            } else |_| {}
+        }
         server.store.forceRemoveLease(mac);
         if (state.del_is_reservation) {
             // Reservation: also remove from config and persist.
@@ -5073,20 +5090,36 @@ fn handlePoolSaveConfirmKey(server: *AdminServer, state: *TuiState, key: vaxis.K
 fn savePoolChanges(server: *AdminServer, state: *TuiState) void {
     const form = &state.pool_form;
 
+    // Track which pool index was modified (for FORCERENEW after save).
+    var affected_pool_idx: ?usize = null;
+
     if (form.isNew()) {
         // Build a new PoolConfig from form fields.
         const pool = buildPoolFromForm(server.allocator, form) orelse return;
         config_write.addPool(server.allocator, server.cfg, pool) catch return;
+        // New pool is appended at the end.
+        affected_pool_idx = server.cfg.pools.len - 1;
     } else {
         // Update existing pool in place.
         const idx = form.editing_index.?;
         if (idx >= server.cfg.pools.len) return;
         applyFormToPool(server.allocator, &server.cfg.pools[idx], form);
+        affected_pool_idx = idx;
     }
 
     // Persist and reload.
     config_write.writeConfig(server.allocator, server.cfg, server.cfg_path) catch return;
     triggerReload(state);
+
+    // Send FORCERENEW to all active leases in the affected pool so clients
+    // pick up the new settings (lease time, options, etc.).
+    if (server.dhcp_server) |ds| {
+        if (affected_pool_idx) |idx| {
+            if (idx < server.cfg.pools.len) {
+                ds.forceRenewPool(&server.cfg.pools[idx]);
+            }
+        }
+    }
 }
 
 fn buildPoolFromForm(allocator: std.mem.Allocator, form: *const PoolForm) ?config_mod.PoolConfig {

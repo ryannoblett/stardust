@@ -326,6 +326,12 @@ pub fn main() !void {
         });
     }
 
+    // Give the admin TUI a reference to the DHCP server so it can send
+    // FORCERENEW messages via the DHCP socket.
+    if (admin_server) |as| {
+        as.dhcp_server = dhcp_server;
+    }
+
     std.log.info("Starting DHCP server...", .{});
     dhcp_server.run() catch |err| {
         fatal("DHCP server error: {s}", .{@errorName(err)});

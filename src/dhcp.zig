@@ -34,6 +34,7 @@ pub const MessageType = enum(u8) {
     DHCPNAK = 6,
     DHCPRELEASE = 7,
     DHCPINFORM = 8,
+    DHCPFORCERENEW = 9,
     _,
 };
 
@@ -665,6 +666,7 @@ pub const Counters = struct {
     release: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     decline: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     inform: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    forcerenew: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     // Defense / security event counters
     probe_conflict: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     decline_ip_quarantined: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -688,6 +690,8 @@ pub const DHCPServer = struct {
     running: std.atomic.Value(bool),
     last_prune: i64,
     server_ip: [4]u8,
+    /// DHCP socket file descriptor. Set in run() after binding; -1 before run().
+    sock_fd: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
     /// Keyed by MAC as a fixed [17]u8 ("xx:xx:xx:xx:xx:xx") — no heap alloc per entry.
     decline_records: std.AutoHashMap([17]u8, DeclineRecord),
     global_decline_count: u32,
@@ -747,6 +751,75 @@ pub const DHCPServer = struct {
         self.decline_records.deinit();
         self.allocator.free(self.cfg_path);
         self.allocator.destroy(self);
+    }
+
+    // -----------------------------------------------------------------------
+    // FORCERENEW (RFC 3203)
+    // -----------------------------------------------------------------------
+
+    /// Send a DHCPFORCERENEW message to a specific client IP, causing it to
+    /// initiate a renew cycle. Thread-safe: uses the atomic sock_fd.
+    pub fn sendForceRenew(self: *Self, client_ip: [4]u8) void {
+        const fd_i32 = self.sock_fd.load(.acquire);
+        if (fd_i32 < 0) return; // socket not yet open
+        const fd: std.posix.fd_t = @intCast(fd_i32);
+
+        var pkt: [300]u8 align(4) = [_]u8{0} ** 300;
+        const hdr: *DHCPHeader = @ptrCast(@alignCast(&pkt));
+        hdr.op = 2; // BOOTREPLY
+        hdr.htype = 1;
+        hdr.hlen = 6;
+        hdr.xid = std.crypto.random.int(u32);
+        hdr.magic = dhcp_magic_cookie;
+        @memcpy(&hdr.siaddr, &self.server_ip);
+
+        var i: usize = dhcp_min_packet_size;
+        // Option 53: Message Type = FORCERENEW (9)
+        pkt[i] = 53;
+        pkt[i + 1] = 1;
+        pkt[i + 2] = 9;
+        i += 3;
+        // Option 54: Server Identifier
+        pkt[i] = 54;
+        pkt[i + 1] = 4;
+        @memcpy(pkt[i + 2 .. i + 6], &self.server_ip);
+        i += 6;
+        // End
+        pkt[i] = 255;
+        i += 1;
+
+        const dest = std.posix.sockaddr.in{
+            .family = std.posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, dhcp_client_port),
+            .addr = std.mem.readInt(u32, &client_ip, .big),
+        };
+        _ = std.posix.sendto(fd, pkt[0..i], 0, @ptrCast(&dest), @sizeOf(std.posix.sockaddr.in)) catch |err| {
+            std.log.debug("FORCERENEW to {d}.{d}.{d}.{d} failed: {s}", .{
+                client_ip[0], client_ip[1], client_ip[2], client_ip[3], @errorName(err),
+            });
+            return;
+        };
+
+        _ = self.counters.forcerenew.fetchAdd(1, .monotonic);
+        std.log.info("FORCERENEW sent to {d}.{d}.{d}.{d}", .{
+            client_ip[0], client_ip[1], client_ip[2], client_ip[3],
+        });
+    }
+
+    /// Send FORCERENEW to all active leases in a specific pool.
+    pub fn forceRenewPool(self: *Self, pool: *const config_mod.PoolConfig) void {
+        const leases = self.store.listLeases() catch return;
+        defer self.allocator.free(leases);
+        const now = std.time.timestamp();
+        const subnet_bytes = config_mod.parseIpv4(pool.subnet) catch return;
+        const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
+        for (leases) |lease| {
+            if (lease.expires <= now) continue;
+            const ip_bytes = config_mod.parseIpv4(lease.ip) catch continue;
+            const ip_int = std.mem.readInt(u32, &ip_bytes, .big);
+            if ((ip_int & pool.subnet_mask) != subnet_int) continue;
+            self.sendForceRenew(ip_bytes);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -966,7 +1039,11 @@ pub const DHCPServer = struct {
             std.posix.SOCK.DGRAM,
             std.posix.IPPROTO.UDP,
         );
-        defer std.posix.close(sock_fd);
+        self.sock_fd.store(@intCast(sock_fd), .release);
+        defer {
+            self.sock_fd.store(-1, .release);
+            std.posix.close(sock_fd);
+        }
 
         // SO_REUSEADDR
         try std.posix.setsockopt(
