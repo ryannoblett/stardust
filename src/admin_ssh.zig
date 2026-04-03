@@ -4747,8 +4747,8 @@ fn computePoolDiff(server: *AdminServer, state: *TuiState) void {
             const mc = &form.mac_classes[mi];
             confirm.changes[confirm.change_count] = .{
                 .label = if (mc.name_len > 0) mc.name_buf[0..mc.name_len] else "MAC Class",
-                .old_val = "(new)",
-                .new_val = if (mc.match_len > 0) mc.match_buf[0..mc.match_len] else "?",
+                .old_val = if (mc.match_len > 0) mc.match_buf[0..mc.match_len] else "?",
+                .new_val = "(new)",
                 .kind = .sync_break,
             };
             confirm.change_count += 1;
@@ -4923,8 +4923,8 @@ fn computePoolDiff(server: *AdminServer, state: *TuiState) void {
                 confirm.has_sync_break = true;
                 confirm.changes[confirm.change_count] = .{
                     .label = if (a.name_len > 0) a.name_buf[0..a.name_len] else "MAC Class",
-                    .old_val = "(new)",
-                    .new_val = if (a.match_len > 0) a.match_buf[0..a.match_len] else "?",
+                    .old_val = if (a.match_len > 0) a.match_buf[0..a.match_len] else "?",
+                    .new_val = "(new)",
                     .kind = .sync_break,
                 };
                 confirm.change_count += 1;
@@ -4952,8 +4952,8 @@ fn computePoolDiff(server: *AdminServer, state: *TuiState) void {
                 confirm.has_sync_break = true;
                 confirm.changes[confirm.change_count] = .{
                     .label = if (a.name_len > 0) a.name_buf[0..a.name_len] else "MAC Class",
-                    .old_val = "(modified)",
-                    .new_val = if (a.match_len > 0) a.match_buf[0..a.match_len] else "?",
+                    .old_val = if (a.match_len > 0) a.match_buf[0..a.match_len] else "?",
+                    .new_val = "(modified)",
                     .kind = .sync_break,
                 };
                 confirm.change_count += 1;
