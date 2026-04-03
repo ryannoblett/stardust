@@ -1474,9 +1474,17 @@ fn runTui(
                             .reservation_form => {
                                 if (state.form.active_field > 0) state.form.active_field -= 1;
                             },
+                            .pool_mac_class_edit => if (state.pool_form.mac_class_edit_field > 0) {
+                                state.pool_form.mac_class_edit_field -= 1;
+                                state.pool_form.mac_class_edit_cursor = mcActiveFieldCursorLen(&state.pool_form.mac_class_edit, state.pool_form.mac_class_edit_field);
+                            },
+                            .pool_option_lookup => state.pool_form.opt_lookup_row -|= 1,
+                            .option_lookup => if (state.form.opt_lookup_row > 0) {
+                                state.form.opt_lookup_row -= 1;
+                            },
                             // All other modals: swallow scroll.
                             .help => state.help_scroll -|= 1,
-                            .delete_confirm, .pool_delete_confirm, .pool_server_edit, .pool_route_edit, .pool_option_edit, .pool_mac_class_edit, .pool_option_lookup, .res_option_edit, .option_lookup, .settings_confirm => {},
+                            .delete_confirm, .pool_delete_confirm, .pool_server_edit, .pool_route_edit, .pool_option_edit, .res_option_edit, .settings_confirm => {},
                         },
                         .wheel_down => switch (state.mode) {
                             .pool_detail => state.pool_detail_scroll +|= 3,
@@ -1496,8 +1504,21 @@ fn runTui(
                             .reservation_form => {
                                 if (state.form.active_field + 1 < state.form.totalFields()) state.form.active_field += 1;
                             },
+                            .pool_mac_class_edit => {
+                                const mc_total = mcTotalFields(&state.pool_form.mac_class_edit);
+                                if (state.pool_form.mac_class_edit_field + 1 < mc_total) {
+                                    state.pool_form.mac_class_edit_field += 1;
+                                    state.pool_form.mac_class_edit_cursor = mcActiveFieldCursorLen(&state.pool_form.mac_class_edit, state.pool_form.mac_class_edit_field);
+                                }
+                            },
+                            .pool_option_lookup => {
+                                state.pool_form.opt_lookup_row +|= 1;
+                            },
+                            .option_lookup => {
+                                state.form.opt_lookup_row +|= 1;
+                            },
                             .help => state.help_scroll +|= 1,
-                            .delete_confirm, .pool_delete_confirm, .pool_server_edit, .pool_route_edit, .pool_option_edit, .pool_mac_class_edit, .pool_option_lookup, .res_option_edit, .option_lookup, .settings_confirm => {},
+                            .delete_confirm, .pool_delete_confirm, .pool_server_edit, .pool_route_edit, .pool_option_edit, .res_option_edit, .settings_confirm => {},
                         },
                         else => {},
                     }
@@ -4721,10 +4742,15 @@ fn computePoolDiff(server: *AdminServer, state: *TuiState) void {
             confirm.changes[confirm.change_count] = .{ .label = "DHCP Options", .old_val = "", .new_val = n, .kind = .drift };
             confirm.change_count += 1;
         }
-        if (form.mac_class_count > 0 and confirm.change_count < confirm.changes.len) {
-            var buf: [32]u8 = undefined;
-            const n = std.fmt.bufPrint(&buf, "{d} class(es)", .{form.mac_class_count}) catch "classes";
-            confirm.changes[confirm.change_count] = .{ .label = "MAC Classes", .old_val = "", .new_val = n, .kind = .sync_break };
+        for (0..form.mac_class_count) |mi| {
+            if (confirm.change_count >= confirm.changes.len) break;
+            const mc = &form.mac_classes[mi];
+            confirm.changes[confirm.change_count] = .{
+                .label = if (mc.name_len > 0) mc.name_buf[0..mc.name_len] else "MAC Class",
+                .old_val = "(new)",
+                .new_val = if (mc.match_len > 0) mc.match_buf[0..mc.match_len] else "?",
+                .kind = .sync_break,
+            };
             confirm.change_count += 1;
         }
         return;
@@ -4873,111 +4899,65 @@ fn computePoolDiff(server: *AdminServer, state: *TuiState) void {
         }
     }
 
-    // Compare MAC classes.
-    if (form.mac_class_count != tmp_form.mac_class_count) {
-        if (confirm.change_count < confirm.changes.len) {
-            var old_buf: [32]u8 = undefined;
-            var new_buf: [32]u8 = undefined;
-            const old_n = std.fmt.bufPrint(&old_buf, "{d} class(es)", .{tmp_form.mac_class_count}) catch "?";
-            const new_n = std.fmt.bufPrint(&new_buf, "{d} class(es)", .{form.mac_class_count}) catch "?";
-            confirm.has_sync_break = true;
-            confirm.changes[confirm.change_count] = .{ .label = "MAC Classes", .old_val = old_n, .new_val = new_n, .kind = .sync_break };
-            confirm.change_count += 1;
-        }
-    } else {
-        // Same count: check if any class changed.
-        var mc_differ = false;
-        for (0..form.mac_class_count) |mi| {
+    // Compare MAC classes — list each changed/added/removed class by name.
+    {
+        const max_mc = @max(form.mac_class_count, tmp_form.mac_class_count);
+        for (0..max_mc) |mi| {
+            if (confirm.change_count >= confirm.changes.len) break;
+            if (mi >= form.mac_class_count) {
+                // Removed class.
+                const b = &tmp_form.mac_classes[mi];
+                confirm.has_sync_break = true;
+                confirm.changes[confirm.change_count] = .{
+                    .label = if (b.name_len > 0) b.name_buf[0..b.name_len] else "MAC Class",
+                    .old_val = if (b.match_len > 0) b.match_buf[0..b.match_len] else "?",
+                    .new_val = "(removed)",
+                    .kind = .sync_break,
+                };
+                confirm.change_count += 1;
+                continue;
+            }
+            if (mi >= tmp_form.mac_class_count) {
+                // Added class.
+                const a = &form.mac_classes[mi];
+                confirm.has_sync_break = true;
+                confirm.changes[confirm.change_count] = .{
+                    .label = if (a.name_len > 0) a.name_buf[0..a.name_len] else "MAC Class",
+                    .old_val = "(new)",
+                    .new_val = if (a.match_len > 0) a.match_buf[0..a.match_len] else "?",
+                    .kind = .sync_break,
+                };
+                confirm.change_count += 1;
+                continue;
+            }
+            // Both exist — check if changed.
             const a = &form.mac_classes[mi];
             const b = &tmp_form.mac_classes[mi];
-            // Compare text fields.
-            if (!std.mem.eql(u8, a.name_buf[0..a.name_len], b.name_buf[0..b.name_len]) or
+            const changed = !std.mem.eql(u8, a.name_buf[0..a.name_len], b.name_buf[0..b.name_len]) or
                 !std.mem.eql(u8, a.match_buf[0..a.match_len], b.match_buf[0..b.match_len]) or
                 !std.mem.eql(u8, a.router_buf[0..a.router_len], b.router_buf[0..b.router_len]) or
                 !std.mem.eql(u8, a.domain_name_buf[0..a.domain_name_len], b.domain_name_buf[0..b.domain_name_len]) or
                 !std.mem.eql(u8, a.time_offset_buf[0..a.time_offset_len], b.time_offset_buf[0..b.time_offset_len]) or
                 !std.mem.eql(u8, a.boot_filename_buf[0..a.boot_filename_len], b.boot_filename_buf[0..b.boot_filename_len]) or
-                !std.mem.eql(u8, a.http_boot_url_buf[0..a.http_boot_url_len], b.http_boot_url_buf[0..b.http_boot_url_len]))
-            {
-                mc_differ = true;
-                break;
-            }
-            // Compare inline entry counts.
-            if (a.domain_search_count != b.domain_search_count or
+                !std.mem.eql(u8, a.http_boot_url_buf[0..a.http_boot_url_len], b.http_boot_url_buf[0..b.http_boot_url_len]) or
+                a.domain_search_count != b.domain_search_count or
                 a.dns_servers_count != b.dns_servers_count or
                 a.ntp_servers_count != b.ntp_servers_count or
                 a.log_servers_count != b.log_servers_count or
                 a.wins_servers_count != b.wins_servers_count or
                 a.tftp_servers_count != b.tftp_servers_count or
                 a.route_count != b.route_count or
-                a.option_count != b.option_count)
-            {
-                mc_differ = true;
-                break;
+                a.option_count != b.option_count;
+            if (changed) {
+                confirm.has_sync_break = true;
+                confirm.changes[confirm.change_count] = .{
+                    .label = if (a.name_len > 0) a.name_buf[0..a.name_len] else "MAC Class",
+                    .old_val = "(modified)",
+                    .new_val = if (a.match_len > 0) a.match_buf[0..a.match_len] else "?",
+                    .kind = .sync_break,
+                };
+                confirm.change_count += 1;
             }
-            // Compare inline entry contents.
-            var entry_differ = false;
-            for (0..a.domain_search_count) |j| {
-                if (!std.mem.eql(u8, a.domain_search[j].buf[0..a.domain_search[j].len], b.domain_search[j].buf[0..b.domain_search[j].len])) {
-                    entry_differ = true;
-                    break;
-                }
-            }
-            if (!entry_differ) for (0..a.dns_servers_count) |j| {
-                if (!std.mem.eql(u8, a.dns_servers[j].buf[0..a.dns_servers[j].len], b.dns_servers[j].buf[0..b.dns_servers[j].len])) {
-                    entry_differ = true;
-                    break;
-                }
-            };
-            if (!entry_differ) for (0..a.ntp_servers_count) |j| {
-                if (!std.mem.eql(u8, a.ntp_servers[j].buf[0..a.ntp_servers[j].len], b.ntp_servers[j].buf[0..b.ntp_servers[j].len])) {
-                    entry_differ = true;
-                    break;
-                }
-            };
-            if (!entry_differ) for (0..a.log_servers_count) |j| {
-                if (!std.mem.eql(u8, a.log_servers[j].buf[0..a.log_servers[j].len], b.log_servers[j].buf[0..b.log_servers[j].len])) {
-                    entry_differ = true;
-                    break;
-                }
-            };
-            if (!entry_differ) for (0..a.wins_servers_count) |j| {
-                if (!std.mem.eql(u8, a.wins_servers[j].buf[0..a.wins_servers[j].len], b.wins_servers[j].buf[0..b.wins_servers[j].len])) {
-                    entry_differ = true;
-                    break;
-                }
-            };
-            if (!entry_differ) for (0..a.tftp_servers_count) |j| {
-                if (!std.mem.eql(u8, a.tftp_servers[j].buf[0..a.tftp_servers[j].len], b.tftp_servers[j].buf[0..b.tftp_servers[j].len])) {
-                    entry_differ = true;
-                    break;
-                }
-            };
-            if (!entry_differ) for (0..a.route_count) |j| {
-                if (!std.mem.eql(u8, a.routes[j].dest_buf[0..a.routes[j].dest_len], b.routes[j].dest_buf[0..b.routes[j].dest_len]) or
-                    !std.mem.eql(u8, a.routes[j].router_buf[0..a.routes[j].router_len], b.routes[j].router_buf[0..b.routes[j].router_len]))
-                {
-                    entry_differ = true;
-                    break;
-                }
-            };
-            if (!entry_differ) for (0..a.option_count) |j| {
-                if (!std.mem.eql(u8, a.options[j].code_buf[0..a.options[j].code_len], b.options[j].code_buf[0..b.options[j].code_len]) or
-                    !std.mem.eql(u8, a.options[j].value_buf[0..a.options[j].value_len], b.options[j].value_buf[0..b.options[j].value_len]))
-                {
-                    entry_differ = true;
-                    break;
-                }
-            };
-            if (entry_differ) {
-                mc_differ = true;
-                break;
-            }
-        }
-        if (mc_differ and confirm.change_count < confirm.changes.len) {
-            confirm.has_sync_break = true;
-            confirm.changes[confirm.change_count] = .{ .label = "MAC Classes", .old_val = "(modified)", .new_val = "(modified)", .kind = .sync_break };
-            confirm.change_count += 1;
         }
     }
 }
@@ -7697,19 +7677,35 @@ fn renderPoolOptionLookup(state: *TuiState, win: vaxis.Window, fa: std.mem.Alloc
         _ = box.print(&.{.{ .text = filter_text, .style = filter_style }}, .{ .col_offset = 1, .row_offset = 2, .wrap = .none });
     }
 
-    // List filtered options.
+    // Count filtered options and clamp selection.
     const filter = form.opt_lookup_filter[0..form.opt_lookup_filter_len];
-    var visible_idx: u16 = 0;
-    const start_row: u16 = 3;
+    var filtered_count: u16 = 0;
     for (known_dhcp_options) |ko| {
         if (filter.len > 0) {
             if (!containsIgnoreCase(ko.code, filter) and !containsIgnoreCase(ko.name, filter)) continue;
         }
-        if (start_row + visible_idx >= BOX_H - 2) break;
-        const is_sel = visible_idx == form.opt_lookup_row;
-        const style = if (is_sel) sel_style else norm_style;
-        const line = try std.fmt.allocPrint(fa, "  {s:<5} {s}", .{ ko.code, ko.name });
-        _ = box.print(&.{.{ .text = line, .style = style }}, .{ .col_offset = 1, .row_offset = start_row + visible_idx, .wrap = .none });
+        filtered_count += 1;
+    }
+    if (filtered_count > 0 and form.opt_lookup_row >= filtered_count) form.opt_lookup_row = filtered_count - 1;
+
+    // Scrollable list.
+    const start_row: u16 = 3;
+    const visible_rows: u16 = BOX_H -| start_row -| 2;
+    var scroll: u16 = 0;
+    if (form.opt_lookup_row >= visible_rows) scroll = form.opt_lookup_row - visible_rows + 1;
+
+    var visible_idx: u16 = 0;
+    for (known_dhcp_options) |ko| {
+        if (filter.len > 0) {
+            if (!containsIgnoreCase(ko.code, filter) and !containsIgnoreCase(ko.name, filter)) continue;
+        }
+        if (visible_idx >= scroll and visible_idx - scroll < visible_rows) {
+            const draw_row = start_row + visible_idx - scroll;
+            const is_sel = visible_idx == form.opt_lookup_row;
+            const style = if (is_sel) sel_style else norm_style;
+            const line = try std.fmt.allocPrint(fa, "  {s:<5} {s}", .{ ko.code, ko.name });
+            _ = box.print(&.{.{ .text = line, .style = style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
+        }
         visible_idx += 1;
     }
 
@@ -7969,19 +7965,35 @@ fn renderOptionLookup(state: *TuiState, win: vaxis.Window, fa: std.mem.Allocator
         _ = box.print(&.{.{ .text = filter_text, .style = filter_style }}, .{ .col_offset = 1, .row_offset = 2, .wrap = .none });
     }
 
-    // List filtered options.
+    // Count filtered options and clamp selection.
     const filter = form.opt_lookup_filter[0..form.opt_lookup_filter_len];
-    var visible_idx: u16 = 0;
-    const start_row: u16 = 3;
+    var filtered_count: u16 = 0;
     for (known_dhcp_options) |ko| {
         if (filter.len > 0) {
             if (!containsIgnoreCase(ko.code, filter) and !containsIgnoreCase(ko.name, filter)) continue;
         }
-        if (start_row + visible_idx >= BOX_H - 2) break;
-        const is_sel = visible_idx == form.opt_lookup_row;
-        const style = if (is_sel) sel_style else norm_style;
-        const line = try std.fmt.allocPrint(fa, "  {s:<5} {s}", .{ ko.code, ko.name });
-        _ = box.print(&.{.{ .text = line, .style = style }}, .{ .col_offset = 1, .row_offset = start_row + visible_idx, .wrap = .none });
+        filtered_count += 1;
+    }
+    if (filtered_count > 0 and form.opt_lookup_row >= filtered_count) form.opt_lookup_row = filtered_count - 1;
+
+    // Scrollable list.
+    const start_row: u16 = 3;
+    const visible_rows: u16 = BOX_H -| start_row -| 2;
+    var scroll: u16 = 0;
+    if (form.opt_lookup_row >= visible_rows) scroll = form.opt_lookup_row - visible_rows + 1;
+
+    var visible_idx: u16 = 0;
+    for (known_dhcp_options) |ko| {
+        if (filter.len > 0) {
+            if (!containsIgnoreCase(ko.code, filter) and !containsIgnoreCase(ko.name, filter)) continue;
+        }
+        if (visible_idx >= scroll and visible_idx - scroll < visible_rows) {
+            const draw_row = start_row + visible_idx - scroll;
+            const is_sel = visible_idx == form.opt_lookup_row;
+            const style = if (is_sel) sel_style else norm_style;
+            const line = try std.fmt.allocPrint(fa, "  {s:<5} {s}", .{ ko.code, ko.name });
+            _ = box.print(&.{.{ .text = line, .style = style }}, .{ .col_offset = 1, .row_offset = draw_row, .wrap = .none });
+        }
         visible_idx += 1;
     }
 
