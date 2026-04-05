@@ -361,6 +361,9 @@ pub const StateStore = struct {
             errdefer if (client_id) |c| store.allocator.free(c);
             const nonce: ?[]const u8 = if (lease.forcerenew_nonce) |n| try store.allocator.dupe(u8, n) else null;
             errdefer if (nonce) |n| store.allocator.free(n);
+            if (store.leases.contains(mac)) {
+                std.log.warn("leases.json: duplicate MAC {s}, keeping last entry", .{mac});
+            }
             try store.leases.put(mac, .{
                 .mac = mac,
                 .ip = ip,

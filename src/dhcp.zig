@@ -262,7 +262,9 @@ fn collectOverrides(
     // Layer 1: pool custom options.
     var pool_it = pool.dhcp_options.iterator();
     while (pool_it.next()) |entry| {
-        result.dhcp_options.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
+        result.dhcp_options.put(entry.key_ptr.*, entry.value_ptr.*) catch {
+            std.log.warn("OOM: failed to apply DHCP option override", .{});
+        };
     }
 
     // Layer 2: MAC class matches, sorted by specificity (shortest match first).
@@ -314,7 +316,9 @@ fn collectOverrides(
         // Apply dhcp_options (overwrites pool layer).
         var mc_it = mc.dhcp_options.iterator();
         while (mc_it.next()) |entry| {
-            result.dhcp_options.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
+            result.dhcp_options.put(entry.key_ptr.*, entry.value_ptr.*) catch {
+                std.log.warn("OOM: failed to apply DHCP option override", .{});
+            };
         }
     }
 
@@ -323,7 +327,9 @@ fn collectOverrides(
         if (res.dhcp_options) |res_opts| {
             var res_it = res_opts.iterator();
             while (res_it.next()) |entry| {
-                result.dhcp_options.put(entry.key_ptr.*, entry.value_ptr.*) catch {};
+                result.dhcp_options.put(entry.key_ptr.*, entry.value_ptr.*) catch {
+                    std.log.warn("OOM: failed to apply DHCP option override", .{});
+                };
             }
         }
     }
@@ -385,6 +391,10 @@ fn encodeOptionValue(dst: []u8, s: []const u8) []u8 {
         len += 4;
     }
     if (len > 0 and all_valid) return dst[0..len]; // all tokens were valid IPs
+    if (len > 0 and !all_valid) {
+        // Some entries parsed as IPs but not all — likely misconfiguration
+        std.log.warn("dhcp_options value '{s}' has mixed IP/non-IP entries, encoding as raw string", .{s});
+    }
     // Fall back to raw string bytes
     const copy_len = @min(s.len, dst.len);
     @memcpy(dst[0..copy_len], s[0..copy_len]);
@@ -417,6 +427,7 @@ fn encodeDnsSearchList(buf: []u8, domains: []const []const u8) usize {
         }
         if (!valid or pos >= buf.len) {
             pos = domain_start; // rewind — skip malformed or overflowing domain
+            std.log.info("domain search: '{s}' skipped (malformed or would overflow option buffer)", .{domain});
             continue;
         }
         buf[pos] = 0; // root label terminator
@@ -511,6 +522,9 @@ fn appendStringOpt(
 ) void {
     if (!isRequested(prl, code) or value.len == 0) return;
     const len = @min(value.len, 255);
+    if (value.len > 255) {
+        std.log.warn("DHCP option {d}: value truncated from {d} to 255 bytes", .{ @intFromEnum(code), value.len });
+    }
     if (opts_len.* + 2 + len > opts_buf.len) return;
     opts_buf[opts_len.*] = @intFromEnum(code);
     opts_buf[opts_len.* + 1] = @intCast(len);
@@ -524,6 +538,9 @@ fn appendStringOpt(
 fn appendRawStringOpt(opts_buf: []u8, opts_len: *usize, code: OptionCode, value: []const u8) void {
     if (value.len == 0) return;
     const len = @min(value.len, 255);
+    if (value.len > 255) {
+        std.log.warn("DHCP option {d}: value truncated from {d} to 255 bytes", .{ @intFromEnum(code), value.len });
+    }
     if (opts_len.* + 2 + len > opts_buf.len) return;
     opts_buf[opts_len.*] = @intFromEnum(code);
     opts_buf[opts_len.* + 1] = @intCast(len);
@@ -2445,7 +2462,9 @@ pub const DHCPServer = struct {
                 mac_str, decline_cooldown_secs, decline_threshold, decline_window_secs,
             });
         }
-        self.decline_records.put(mac_buf, rec) catch {};
+        self.decline_records.put(mac_buf, rec) catch {
+            std.log.warn("OOM: failed to record DHCPDECLINE for {s}", .{&mac_buf});
+        };
     }
 
     /// Scan options for option 50 (Requested IP Address).
@@ -3056,7 +3075,10 @@ pub const DHCPServer = struct {
         opts_len += 1;
 
         // Shrink the allocation to the actual packet size so callers can free it correctly.
-        const result = self.allocator.realloc(resp, opts_len) catch resp;
+        const result = self.allocator.realloc(resp, opts_len) catch blk: {
+            std.log.info("leasequery: realloc to shrink response failed, using original buffer", .{});
+            break :blk resp;
+        };
         return result[0..opts_len];
     }
 };

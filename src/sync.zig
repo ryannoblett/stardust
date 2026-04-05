@@ -509,6 +509,9 @@ pub const SyncManager = struct {
     pub fn notifyLeaseUpdate(self: *Self, lease: state_mod.Lease) void {
         const json = std.json.Stringify.valueAlloc(self.allocator, lease, .{}) catch return;
         defer self.allocator.free(json);
+        if (json.len > 1400) {
+            std.log.warn("sync: lease update for {s} is {d} bytes, may exceed UDP MTU", .{ lease.mac, json.len });
+        }
         var sent: usize = 0;
         for (self.peers.items) |*p| {
             if (p.authenticated) {
@@ -839,6 +842,9 @@ pub const SyncManager = struct {
             off += 37;
         }
         peer.peer_pool_hashes_len = parsed;
+        if (parsed < pool_count) {
+            std.log.warn("sync: HELLO from peer advertised {d} pools but payload only contained {d}", .{ pool_count, parsed });
+        }
 
         if (!is_ack) {
             // Send HELLO_ACK back
