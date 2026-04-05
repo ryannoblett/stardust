@@ -2,7 +2,7 @@
 
 ## Pending
 
-- Create selinux and apparmor profiles, and add those to the builds for RPM and deb packages
+- Include selinux and apparmor profiles in RPM and deb package builds (profiles created in packaging/)
 
 ## Done
 

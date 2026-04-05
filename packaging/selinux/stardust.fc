@@ -1,0 +1,18 @@
+# SELinux File Contexts for Stardust DHCP Server
+# Install alongside stardust.te
+
+# Binary
+/usr/local/bin/stardust    --    gen_context(system_u:object_r:stardust_exec_t,s0)
+
+# Configuration directory and files
+/etc/stardust(/.*)?        --    gen_context(system_u:object_r:stardust_conf_t,s0)
+/etc/stardust              -d    gen_context(system_u:object_r:stardust_conf_t,s0)
+
+# SSH keys and TSIG keys (more restrictive type)
+/etc/stardust/ssh_host_key       --    gen_context(system_u:object_r:stardust_key_t,s0)
+/etc/stardust/authorized_keys    --    gen_context(system_u:object_r:stardust_key_t,s0)
+/etc/stardust/.*\.key            --    gen_context(system_u:object_r:stardust_key_t,s0)
+
+# State directory (leases)
+/var/lib/stardust(/.*)?    --    gen_context(system_u:object_r:stardust_state_t,s0)
+/var/lib/stardust          -d    gen_context(system_u:object_r:stardust_state_t,s0)

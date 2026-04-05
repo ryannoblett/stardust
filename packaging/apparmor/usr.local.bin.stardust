@@ -1,0 +1,60 @@
+# AppArmor profile for Stardust DHCP Server
+# Install: cp usr.local.bin.stardust /etc/apparmor.d/
+# Load:    apparmor_parser -r /etc/apparmor.d/usr.local.bin.stardust
+
+#include <tunables/global>
+
+/usr/local/bin/stardust {
+  #include <abstractions/base>
+  #include <abstractions/nameservice>
+
+  # Binary
+  /usr/local/bin/stardust mr,
+
+  # Configuration (read, optionally write if config_writable=true)
+  /etc/stardust/ r,
+  /etc/stardust/** r,
+  /etc/stardust/config.yaml rw,
+  /etc/stardust/config.yaml.tmp rw,
+
+  # SSH host key and authorized_keys (read-only)
+  /etc/stardust/ssh_host_key r,
+  /etc/stardust/authorized_keys r,
+
+  # TSIG key files (read-only, may be in config dir or elsewhere)
+  /etc/stardust/*.key r,
+
+  # State directory (leases.json, atomic writes)
+  /var/lib/stardust/ rw,
+  /var/lib/stardust/** rw,
+
+  # Runtime directory (PID file, sockets)
+  /run/stardust/ rw,
+  /run/stardust/** rw,
+
+  # Network: DHCP (UDP 67), sync (UDP 647), SSH admin (TCP 2267), metrics (TCP 9167)
+  network inet dgram,
+  network inet stream,
+  network inet6 dgram,
+  network inet6 stream,
+
+  # DNS resolution for server name lookups (getaddrinfo)
+  /etc/resolv.conf r,
+  /etc/hosts r,
+  /etc/nsswitch.conf r,
+  /run/systemd/resolve/stub-resolv.conf r,
+
+  # System libraries and locale
+  /usr/lib/** mr,
+  /lib/** mr,
+  /etc/ld.so.cache r,
+
+  # Proc filesystem (needed for various runtime checks)
+  @{PROC}/sys/net/** r,
+
+  # Deny everything else
+  deny /home/** rwx,
+  deny /root/** rwx,
+  deny /tmp/** rwx,
+  deny /srv/** rwx,
+}

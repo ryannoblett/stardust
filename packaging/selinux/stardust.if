@@ -1,0 +1,22 @@
+# SELinux Interface definitions for Stardust DHCP Server
+# Provides macros for other policies to interact with stardust types.
+
+## <summary>Allow a domain to administer the stardust DHCP server.</summary>
+## <param name="domain">Domain to grant admin access.</param>
+interface(`stardust_admin',`
+    gen_require(`
+        type stardust_t;
+        type stardust_conf_t;
+        type stardust_state_t;
+        type stardust_key_t;
+        type stardust_exec_t;
+    ')
+
+    allow $1 stardust_t:process { ptrace signal_perms };
+    ps_process_pattern($1, stardust_t)
+
+    admin_pattern($1, stardust_conf_t)
+    admin_pattern($1, stardust_state_t)
+    admin_pattern($1, stardust_key_t)
+    admin_pattern($1, stardust_exec_t)
+')

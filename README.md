@@ -411,3 +411,35 @@ sudo install -m 755 packaging/stardust.openrc /etc/init.d/stardust
 sudo rc-update add stardust default
 sudo rc-service stardust start
 ```
+
+## Security profiles
+
+### AppArmor (Debian, Ubuntu, SUSE)
+
+```bash
+sudo cp packaging/apparmor/usr.local.bin.stardust /etc/apparmor.d/
+sudo apparmor_parser -r /etc/apparmor.d/usr.local.bin.stardust
+```
+
+The profile confines stardust to:
+- Read `/etc/stardust/` (config, keys); write `config.yaml` + `.tmp` only
+- Read-write `/var/lib/stardust/` (leases)
+- Network: UDP (DHCP, sync), TCP (SSH admin, metrics)
+- DNS resolution via system resolver
+- Denies access to `/home`, `/root`, `/tmp`, `/srv`
+
+### SELinux (RHEL, Fedora, CentOS, Rocky)
+
+```bash
+cd packaging/selinux
+checkmodule -M -m -o stardust.mod stardust.te
+semodule_package -o stardust.pp -m stardust.mod -f stardust.fc
+sudo semodule -i stardust.pp
+sudo restorecon -Rv /usr/local/bin/stardust /etc/stardust /var/lib/stardust
+```
+
+Types:
+- `stardust_exec_t` — binary (`/usr/local/bin/stardust`)
+- `stardust_conf_t` — config directory (`/etc/stardust/`)
+- `stardust_key_t` — SSH and TSIG keys (read-only subset)
+- `stardust_state_t` — state directory (`/var/lib/stardust/`)

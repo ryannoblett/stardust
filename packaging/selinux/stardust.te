@@ -1,0 +1,70 @@
+# SELinux Type Enforcement policy for Stardust DHCP Server
+# Build:   checkmodule -M -m -o stardust.mod stardust.te
+#          semodule_package -o stardust.pp -m stardust.mod -f stardust.fc
+# Install: semodule -i stardust.pp
+
+policy_module(stardust, 1.0.0)
+
+########################################
+# Type declarations
+########################################
+
+type stardust_t;
+type stardust_exec_t;
+type stardust_conf_t;
+type stardust_state_t;
+type stardust_key_t;
+
+# Transition: systemd starts the binary, enters stardust_t domain
+init_daemon_domain(stardust_t, stardust_exec_t)
+
+########################################
+# Permissions for stardust_t
+########################################
+
+# Configuration files: read always, write for config_writable
+allow stardust_t stardust_conf_t:dir { search getattr read open };
+allow stardust_t stardust_conf_t:file { read getattr open };
+# Config write (atomic temp+rename): only needed when config_writable=true
+allow stardust_t stardust_conf_t:file { write create rename unlink };
+allow stardust_t stardust_conf_t:dir { write add_name remove_name };
+
+# SSH keys and TSIG keys: read-only
+allow stardust_t stardust_key_t:file { read getattr open };
+
+# State directory: full read-write (leases.json, atomic writes)
+allow stardust_t stardust_state_t:dir { search getattr read write open add_name remove_name };
+allow stardust_t stardust_state_t:file { read write create getattr open rename unlink };
+
+# Network: DHCP server (UDP 67), sync (UDP 647), SSH admin (TCP 2267), metrics (TCP 9167)
+allow stardust_t self:udp_socket { create bind connect read write sendto recvfrom getattr setopt getopt };
+allow stardust_t self:tcp_socket { create bind listen accept connect read write getattr setopt getopt };
+
+# Bind to privileged ports (67 for DHCP, 647 for sync)
+allow stardust_t self:capability { net_bind_service net_raw };
+corenet_udp_bind_all_ports(stardust_t)
+corenet_tcp_bind_all_ports(stardust_t)
+corenet_udp_sendrecv_all_ports(stardust_t)
+corenet_tcp_connect_all_ports(stardust_t)
+
+# Raw sockets for ARP probing
+allow stardust_t self:rawip_socket { create bind read write getattr setopt getopt };
+
+# DNS resolution (getaddrinfo for hostname-based server entries)
+sysnet_dns_name_resolve(stardust_t)
+
+# Signal handling (SIGHUP for reload)
+allow stardust_t self:process { signal signull };
+
+# Logging to stderr/journald
+logging_send_syslog_msg(stardust_t)
+
+# Read /proc for network configuration
+kernel_read_net_sysctls(stardust_t)
+kernel_read_network_state(stardust_t)
+
+# Read system clock
+allow stardust_t self:process { getsched };
+
+# Temp files for atomic writes
+files_tmp_filetrans(stardust_t, stardust_state_t, file)
