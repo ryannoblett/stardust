@@ -174,6 +174,7 @@ pub const MetricsServer = struct {
         try w.print("stardust_dhcp_packets_total{{type=\"decline\"}} {d}\n", .{self.counters.decline.load(.monotonic)});
         try w.print("stardust_dhcp_packets_total{{type=\"inform\"}} {d}\n", .{self.counters.inform.load(.monotonic)});
         try w.print("stardust_dhcp_packets_total{{type=\"leasequery\"}} {d}\n", .{self.counters.leasequery.load(.monotonic)});
+        try w.print("stardust_dhcp_packets_total{{type=\"forcerenew\"}} {d}\n", .{self.counters.forcerenew.load(.monotonic)});
 
         // Server uptime
         try w.writeAll("\n# HELP stardust_uptime_seconds Seconds since the DHCP server started\n");
@@ -336,4 +337,37 @@ test "isIpInPool matches correct subnet" {
     try std.testing.expect(isIpInPool("192.168.1.50", &pool));
     try std.testing.expect(!isIpInPool("192.168.2.50", &pool));
     try std.testing.expect(!isIpInPool("10.0.0.1", &pool));
+}
+
+test "poolCapacity /30 subnet returns 2" {
+    var dhcp_options = std.StringHashMap([]const u8).init(std.testing.allocator);
+    defer dhcp_options.deinit();
+
+    const pool = config_mod.PoolConfig{
+        .subnet = "10.0.0.0",
+        .subnet_mask = 0xFFFFFFFC, // /30
+        .prefix_len = 30,
+        .router = "10.0.0.1",
+        .pool_start = "",
+        .pool_end = "",
+        .dns_servers = &.{},
+        .domain_name = "",
+        .domain_search = &.{},
+        .lease_time = 3600,
+        .time_offset = null,
+        .time_servers = &.{},
+        .log_servers = &.{},
+        .ntp_servers = &.{},
+        .mtu = null,
+        .wins_servers = &.{},
+        .tftp_servers = &.{},
+        .boot_filename = "",
+        .http_boot_url = "",
+        .dns_update = .{ .enable = false, .server = "", .zone = "", .rev_zone = "", .key_name = "", .key_file = "", .lease_time = 3600 },
+        .dhcp_options = dhcp_options,
+        .reservations = &.{},
+        .static_routes = &.{},
+    };
+    // /30 has 4 addresses total; exclude network + broadcast = 2 usable.
+    try std.testing.expectEqual(@as(u64, 2), poolCapacity(&pool));
 }

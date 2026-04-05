@@ -6483,3 +6483,60 @@ test "OFFER option 2 time offset" {
     const offset_val = std.mem.readInt(i32, opt2.?[0..4], .big);
     try std.testing.expectEqual(@as(i32, 3600), offset_val);
 }
+
+test "OFFER option 2 MAC class time_offset override" {
+    const alloc = std.testing.allocator;
+    var cfg = try makeTestConfig(alloc);
+    defer cfg.deinit();
+
+    // Pool time_offset = 3600 (UTC+1).
+    cfg.pools[0].time_offset = 3600;
+
+    // Add a MAC class that overrides time_offset to -18000 (UTC-5) for OUI aa:bb:cc.
+    const mac_classes = try alloc.alloc(config_mod.MacClass, 1);
+    mac_classes[0] = .{
+        .name = try alloc.dupe(u8, "EasternTZ"),
+        .match = try alloc.dupe(u8, "aa:bb:cc"),
+        .time_offset = -18000,
+        .dhcp_options = std.StringHashMap([]const u8).init(alloc),
+    };
+    cfg.pools[0].mac_classes = mac_classes;
+
+    const store = try makeTestStore(alloc);
+    defer store.deinit();
+    const server = try DHCPServer.create(alloc, &cfg, "config.yaml", store, &test_log_level, null);
+    defer server.deinit();
+
+    var buf align(4) = [_]u8{0} ** 512;
+    const hdr: *DHCPHeader = @ptrCast(@alignCast(&buf));
+    hdr.op = 1;
+    hdr.htype = 1;
+    hdr.hlen = 6;
+    hdr.xid = 0xAABBCCDD;
+    hdr.magic = dhcp_magic_cookie;
+    @memcpy(hdr.chaddr[0..6], &[6]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01 });
+    var i: usize = dhcp_min_packet_size;
+    buf[i] = @intFromEnum(OptionCode.MessageType);
+    buf[i + 1] = 1;
+    buf[i + 2] = @intFromEnum(MessageType.DHCPDISCOVER);
+    i += 3;
+    buf[i] = @intFromEnum(OptionCode.ParameterRequestList);
+    buf[i + 1] = 1;
+    buf[i + 2] = 2; // TimeOffset
+    i += 3;
+    buf[i] = @intFromEnum(OptionCode.End);
+    i += 1;
+
+    const resp = try server.processPacket(buf[0..i]);
+    try std.testing.expect(resp != null);
+    defer alloc.free(resp.?);
+
+    try std.testing.expectEqual(MessageType.DHCPOFFER, DHCPServer.getMessageType(resp.?).?);
+
+    // Option 2 should contain -18000 (MAC class override), not 3600 (pool default).
+    const opt2 = DHCPServer.getOption(resp.?, .TimeOffset);
+    try std.testing.expect(opt2 != null);
+    try std.testing.expectEqual(@as(usize, 4), opt2.?.len);
+    const offset_val = std.mem.readInt(i32, opt2.?[0..4], .big);
+    try std.testing.expectEqual(@as(i32, -18000), offset_val);
+}

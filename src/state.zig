@@ -332,7 +332,10 @@ pub const StateStore = struct {
         try file.writeAll(json_str);
         file.close();
 
-        try std.fs.rename(std.fs.cwd(), tmp_path, std.fs.cwd(), path);
+        std.fs.rename(std.fs.cwd(), tmp_path, std.fs.cwd(), path) catch |err| {
+            std.fs.cwd().deleteFile(tmp_path) catch {};
+            return err;
+        };
     }
 
     fn load(store: *StateStore) !void {

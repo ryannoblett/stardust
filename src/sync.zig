@@ -1014,7 +1014,7 @@ pub const SyncManager = struct {
 
                 // Persist to config.yaml
                 config_write.writeConfig(self.allocator, self.full_cfg, self.cfg_path) catch |err| {
-                    std.log.err("sync: could not persist pool config update: config write failed ({s})", .{@errorName(err)});
+                    std.log.err("sync: pool config update applied in memory but file write failed ({s}); will retry on next sync cycle", .{@errorName(err)});
                     return;
                 };
 

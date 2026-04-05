@@ -1967,16 +1967,20 @@ fn naturalLessThan(a: []const u8, b: []const u8) bool {
         const a_digit = a[ai] >= '0' and a[ai] <= '9';
         const b_digit = b[bi] >= '0' and b[bi] <= '9';
         if (a_digit and b_digit) {
-            // Both at a digit run — compare numerically.
-            var a_num: u64 = 0;
-            while (ai < a.len and a[ai] >= '0' and a[ai] <= '9') : (ai += 1) {
-                a_num = a_num * 10 + (a[ai] - '0');
-            }
-            var b_num: u64 = 0;
-            while (bi < b.len and b[bi] >= '0' and b[bi] <= '9') : (bi += 1) {
-                b_num = b_num * 10 + (b[bi] - '0');
-            }
-            if (a_num != b_num) return a_num < b_num;
+            // Count digit run lengths first (avoids u64 overflow on 20+ digit runs).
+            const a_start = ai;
+            const b_start = bi;
+            while (ai < a.len and a[ai] >= '0' and a[ai] <= '9') : (ai += 1) {}
+            while (bi < b.len and b[bi] >= '0' and b[bi] <= '9') : (bi += 1) {}
+            const a_run = a[a_start..ai];
+            const b_run = b[b_start..bi];
+            // Skip leading zeros for comparison.
+            const a_sig = std.mem.trimLeft(u8, a_run, "0");
+            const b_sig = std.mem.trimLeft(u8, b_run, "0");
+            // Compare: longer significant run = larger number.
+            if (a_sig.len != b_sig.len) return a_sig.len < b_sig.len;
+            // Same length: compare lexicographically (digits are ordered).
+            if (!std.mem.eql(u8, a_sig, b_sig)) return std.mem.lessThan(u8, a_sig, b_sig);
             // Equal numbers — continue comparing remaining characters.
         } else {
             // At least one side is non-digit — compare bytes.
@@ -9435,4 +9439,18 @@ test "naturalLessThan: empty string edge cases" {
 test "naturalLessThan: misaligned digits" {
     try std.testing.expect(naturalLessThan("abc2def", "abc10xyz")); // 2 < 10, different suffixes
     try std.testing.expect(naturalLessThan("x1y", "x2y")); // 1 < 2
+}
+
+test "naturalLessThan: 25+ digit runs do not overflow" {
+    // 25 nines vs 30 ones: 30-digit number is larger (more significant digits).
+    try std.testing.expect(naturalLessThan("item-" ++ "9" ** 25, "item-" ++ "1" ** 30));
+    try std.testing.expect(!naturalLessThan("item-" ++ "1" ** 30, "item-" ++ "9" ** 25));
+    // Equal very long digit runs.
+    try std.testing.expect(!naturalLessThan("item-" ++ "5" ** 25, "item-" ++ "5" ** 25));
+    // Same length, different digits: lexicographic comparison within equal-length significant runs.
+    try std.testing.expect(naturalLessThan("item-" ++ "1" ** 25, "item-" ++ "2" ** 25));
+    try std.testing.expect(!naturalLessThan("item-" ++ "2" ** 25, "item-" ++ "1" ** 25));
+    // Leading zeros: numerically equal, tie-broken by total string length.
+    try std.testing.expect(naturalLessThan("item-7", "item-007")); // shorter string first
+    try std.testing.expect(!naturalLessThan("item-007", "item-7"));
 }
