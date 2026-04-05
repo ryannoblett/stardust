@@ -97,6 +97,11 @@ pub const SyncManager = struct {
     /// Sync event counters (read atomically by SSH TUI stats tab).
     sync_full_events: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     sync_lease_events: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Config sync event counters (read atomically by SSH TUI stats tab).
+    config_push_events: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    config_recv_events: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    reservation_push_events: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    reservation_recv_events: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     const max_peers = 8;
     const keepalive_interval_s: i64 = 30;
@@ -617,6 +622,7 @@ pub const SyncManager = struct {
                 sent += 1;
             }
         }
+        if (sent > 0) _ = self.reservation_push_events.fetchAdd(1, .monotonic);
         std.log.info("sync: sent reservation update {s} to {d} config-capable peer(s)", .{ reservation.mac, sent });
     }
 
@@ -639,6 +645,7 @@ pub const SyncManager = struct {
                 sent += 1;
             }
         }
+        if (sent > 0) _ = self.reservation_push_events.fetchAdd(1, .monotonic);
         std.log.info("sync: sent reservation delete {s} to {d} config-capable peer(s)", .{ mac, sent });
     }
 
@@ -777,6 +784,7 @@ pub const SyncManager = struct {
             .reserved = true,
         }) catch {};
 
+        _ = self.reservation_recv_events.fetchAdd(1, .monotonic);
         std.log.info("sync: applied reservation update from peer: {s} -> {s} in {s}/{d}", .{
             incoming.mac, incoming.ip, incoming.pool_subnet, incoming.pool_prefix,
         });
@@ -837,6 +845,7 @@ pub const SyncManager = struct {
             return;
         };
 
+        _ = self.reservation_recv_events.fetchAdd(1, .monotonic);
         std.log.info("sync: applied reservation delete from peer: {s} in {s}/{d}", .{
             incoming.mac, incoming.pool_subnet, incoming.pool_prefix,
         });
@@ -885,6 +894,7 @@ pub const SyncManager = struct {
                 sent += 1;
             }
         }
+        if (sent > 0) _ = self.config_push_events.fetchAdd(1, .monotonic);
         std.log.info("sync: sent pool config update {s}/{d} (v={d}) to {d} config-capable peer(s)", .{
             pool.subnet, pool.prefix_len, pool.config_version, sent,
         });
@@ -921,6 +931,7 @@ pub const SyncManager = struct {
         @memcpy(payload[header_size..], yaml_buf.items);
 
         self.sendMsg(peer_addr, .pool_config_update, payload);
+        _ = self.config_push_events.fetchAdd(1, .monotonic);
         std.log.info("sync: sent pool config anti-entropy push {s}/{d} (v={d})", .{
             pool.subnet, pool.prefix_len, pool.config_version,
         });
@@ -1011,6 +1022,7 @@ pub const SyncManager = struct {
                     }) catch {};
                 }
 
+                _ = self.config_recv_events.fetchAdd(1, .monotonic);
                 std.log.info("sync: applied pool config update from peer: {s}/{d} (v={d})", .{
                     subnet_str, prefix_len, incoming_version,
                 });

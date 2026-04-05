@@ -2163,9 +2163,11 @@ fn renderStatsTab(
     //   1 (blank) + 1 (pool header) + 3 * n_pools (label + bar + blank) +
     //   1 (DHCP header) + 10 (DHCP counters) +
     //   1 (blank) + 1 (defense header) + 5 (defense counters) +
-    //   1 (blank) + 1 (backend header) + 5 (backend counters) + 1 (trailing blank)
+    //   1 (blank) + 1 (backend header) + 9 (backend counters) +
+    //   1 (blank) + 1 (sync header) + sync_rows + 1 (trailing blank)
     const n_pools: u16 = @intCast(server.cfg.pools.len);
-    const total_rows: u16 = 1 + 1 + 3 * n_pools + 1 + 10 + 1 + 1 + 5 + 1 + 1 + 5 + 1;
+    const sync_rows: u16 = if (server.sync_mgr != null) 3 else 1; // peers + config sync + local config OR "not configured"
+    const total_rows: u16 = 1 + 1 + 3 * n_pools + 1 + 10 + 1 + 1 + 5 + 1 + 1 + 9 + 1 + 1 + sync_rows + 1;
 
     // Clamp scroll so we never scroll past the last line of content.
     const max_scroll: u16 = if (total_rows > win.height) total_rows - win.height else 0;
@@ -2295,6 +2297,10 @@ fn renderStatsTab(
         .{ .label = "SSH FAILURES    ", .val = ctr.ssh_failures.load(.monotonic) },
         .{ .label = "SYNC FULL       ", .val = if (server.sync_mgr) |s| s.sync_full_events.load(.monotonic) else 0 },
         .{ .label = "SYNC LEASE      ", .val = if (server.sync_mgr) |s| s.sync_lease_events.load(.monotonic) else 0 },
+        .{ .label = "CONFIG PUSH     ", .val = if (server.sync_mgr) |s| s.config_push_events.load(.monotonic) else 0 },
+        .{ .label = "CONFIG RECV     ", .val = if (server.sync_mgr) |s| s.config_recv_events.load(.monotonic) else 0 },
+        .{ .label = "RESV PUSH       ", .val = if (server.sync_mgr) |s| s.reservation_push_events.load(.monotonic) else 0 },
+        .{ .label = "RESV RECV       ", .val = if (server.sync_mgr) |s| s.reservation_recv_events.load(.monotonic) else 0 },
     };
 
     for (backend_lines) |cl| {
@@ -2302,6 +2308,42 @@ fn renderStatsTab(
             const line = try std.fmt.allocPrint(a, "    {s}  {d}", .{ cl.label, cl.val });
             _ = win.print(&.{.{ .text = line, .style = val_style }}, .{ .col_offset = 0, .row_offset = dr, .wrap = .none });
         }
+        vr += 1;
+    }
+
+    // ---- Sync Status ----
+    vr += 1; // blank separator
+    if (statsVr(vr, scroll, win.height)) |dr|
+        _ = win.print(&.{.{ .text = "  Sync Status", .style = hdr_style }}, .{ .col_offset = 0, .row_offset = dr, .wrap = .none });
+    vr += 1;
+
+    if (server.sync_mgr) |sm| {
+        const pc = sm.peerCount();
+        const peers_line = try std.fmt.allocPrint(a, "    Peers           {d} authenticated, {d} config-capable", .{ pc.authenticated, pc.config_capable });
+        if (statsVr(vr, scroll, win.height)) |dr|
+            _ = win.print(&.{.{ .text = peers_line, .style = val_style }}, .{ .col_offset = 0, .row_offset = dr, .wrap = .none });
+        vr += 1;
+
+        const cfg_sync_on = if (server.cfg.sync) |s| s.config_sync else false;
+        const config_sync_line = try std.fmt.allocPrint(a, "    Config Sync     {s}", .{
+            if (cfg_sync_on) "enabled" else "disabled",
+        });
+        if (statsVr(vr, scroll, win.height)) |dr|
+            _ = win.print(&.{.{ .text = config_sync_line, .style = val_style }}, .{ .col_offset = 0, .row_offset = dr, .wrap = .none });
+        vr += 1;
+
+        const local_label = if (server.cfg.config_writable and cfg_sync_on)
+            "    Local Config    writable + sync enabled"
+        else if (server.cfg.config_writable)
+            "    Local Config    writable (sync disabled)"
+        else
+            "    Local Config    read-only";
+        if (statsVr(vr, scroll, win.height)) |dr|
+            _ = win.print(&.{.{ .text = local_label, .style = val_style }}, .{ .col_offset = 0, .row_offset = dr, .wrap = .none });
+        vr += 1;
+    } else {
+        if (statsVr(vr, scroll, win.height)) |dr|
+            _ = win.print(&.{.{ .text = "    Not configured", .style = val_style }}, .{ .col_offset = 0, .row_offset = dr, .wrap = .none });
         vr += 1;
     }
 
