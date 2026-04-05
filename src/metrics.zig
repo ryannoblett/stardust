@@ -264,7 +264,7 @@ fn isIpInPool(ip_str: []const u8, pool: *const config_mod.PoolConfig) bool {
     const ip_int = std.mem.readInt(u32, &ip_bytes, .big);
     const subnet_bytes = config_mod.parseIpv4(pool.subnet) catch return false;
     const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
-    return (ip_int & pool.subnet_mask) == subnet_int;
+    return (ip_int & pool.subnet_mask) == (subnet_int & pool.subnet_mask);
 }
 
 // ---------------------------------------------------------------------------

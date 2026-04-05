@@ -1039,7 +1039,7 @@ pub const DHCPServer = struct {
         const ip_int = std.mem.readInt(u32, &ip_bytes, .big);
         for (self.cfg.pools) |*pool| {
             const s = config_mod.parseIpv4(pool.subnet) catch continue;
-            if ((ip_int & pool.subnet_mask) == std.mem.readInt(u32, &s, .big)) return pool;
+            if ((ip_int & pool.subnet_mask) == (std.mem.readInt(u32, &s, .big) & pool.subnet_mask)) return pool;
         }
         return null;
     }

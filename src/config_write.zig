@@ -446,7 +446,7 @@ pub fn findPoolForIp(cfg: *const config_mod.Config, ip_str: []const u8) ?*config
     for (cfg.pools) |*pool| {
         const subnet_bytes = parseIpv4Local(pool.subnet) catch continue;
         const subnet_int = std.mem.readInt(u32, &subnet_bytes, .big);
-        if ((ip_int & pool.subnet_mask) == subnet_int) return pool;
+        if ((ip_int & pool.subnet_mask) == (subnet_int & pool.subnet_mask)) return pool;
     }
     return null;
 }

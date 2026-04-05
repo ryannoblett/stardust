@@ -230,6 +230,19 @@ pub fn main() !void {
         });
     }
 
+    // Verify config file is writable if config_writable is enabled.
+    if (cfg.config_writable) {
+        const test_path = std.fmt.allocPrint(allocator, "{s}.writetest", .{cfg_path}) catch
+            fatal("OOM checking config writability", .{});
+        defer allocator.free(test_path);
+        if (std.fs.cwd().createFile(test_path, .{})) |f| {
+            f.close();
+            std.fs.cwd().deleteFile(test_path) catch {};
+        } else |_| {
+            fatal("config_writable is true but config path '{s}' is not writable", .{cfg_path});
+        }
+    }
+
     // Initialize state store
     const store = state_mod.StateStore.init(allocator, cfg.state_dir) catch |err| {
         fatal("Failed to initialize state store: {s}", .{@errorName(err)});
