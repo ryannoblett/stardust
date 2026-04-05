@@ -224,6 +224,9 @@ fn renderPool(w: anytype, pool: *const config_mod.PoolConfig) !void {
                     }
                 }
             }
+            if (r.config_modified != 0) {
+                try w.print("        config_modified: {d}\n", .{r.config_modified});
+            }
         }
     }
 

@@ -44,6 +44,7 @@ pub const Reservation = struct {
     hostname: ?[]const u8,
     client_id: ?[]const u8,
     dhcp_options: ?std.StringHashMap([]const u8) = null,
+    config_modified: i64 = 0, // unix timestamp; 0 = unknown/never modified via TUI/sync
 };
 
 /// MAC class rule: matches client MACs by prefix pattern and overrides DHCP options
@@ -801,12 +802,21 @@ fn parseReservations(allocator: std.mem.Allocator, pool: *PoolConfig, list: anyt
             }
         }
 
+        // Parse optional config_modified timestamp.
+        var config_modified_val: i64 = 0;
+        if (m.get("config_modified")) |cm_val| {
+            if (cm_val.asScalar()) |cm_str| {
+                config_modified_val = std.fmt.parseInt(i64, cm_str, 10) catch 0;
+            }
+        }
+
         pool.reservations[idx] = .{
             .mac = mac_owned,
             .ip = ip_owned,
             .hostname = hostname_owned,
             .client_id = client_id_owned,
             .dhcp_options = res_opts,
+            .config_modified = config_modified_val,
         };
         idx += 1;
     }

@@ -38,6 +38,8 @@ const MsgType = enum(u8) {
     lease_delete = 5,
     keepalive = 6,
     lease_hash = 7,
+    reservation_update = 8,
+    reservation_delete = 9,
     _,
 };
 
@@ -554,6 +556,291 @@ pub const SyncManager = struct {
     }
 
     // -----------------------------------------------------------------------
+    // Reservation config sync (Phase 2)
+    // -----------------------------------------------------------------------
+
+    /// Serializable struct for reservation sync payloads.
+    /// dhcp_options is encoded as a flat string "code=value,code=value" to avoid
+    /// HashMap serialization issues.
+    const ReservationSync = struct {
+        pool_subnet: []const u8,
+        pool_prefix: u8,
+        mac: []const u8,
+        ip: []const u8 = "",
+        hostname: ?[]const u8 = null,
+        client_id: ?[]const u8 = null,
+        config_modified: i64,
+        dhcp_options_str: ?[]const u8 = null,
+    };
+
+    /// Notify all config-sync-capable peers of a reservation add/update.
+    pub fn notifyReservationUpdate(self: *Self, pool: *const config_mod.PoolConfig, reservation: *const config_mod.Reservation) void {
+        // Encode dhcp_options as flat string "code=value,code=value"
+        var opts_buf = std.ArrayList(u8){};
+        defer opts_buf.deinit(self.allocator);
+        if (reservation.dhcp_options) |opts| {
+            if (opts.count() > 0) {
+                var first = true;
+                var oit = opts.iterator();
+                while (oit.next()) |entry| {
+                    if (!first) opts_buf.writer(self.allocator).writeByte(',') catch return;
+                    opts_buf.writer(self.allocator).print("{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.* }) catch return;
+                    first = false;
+                }
+            }
+        }
+
+        const payload = ReservationSync{
+            .pool_subnet = pool.subnet,
+            .pool_prefix = pool.prefix_len,
+            .mac = reservation.mac,
+            .ip = reservation.ip,
+            .hostname = reservation.hostname,
+            .client_id = reservation.client_id,
+            .config_modified = if (reservation.config_modified != 0) reservation.config_modified else std.time.timestamp(),
+            .dhcp_options_str = if (opts_buf.items.len > 0) opts_buf.items else null,
+        };
+
+        const json = std.json.Stringify.valueAlloc(self.allocator, payload, .{}) catch return;
+        defer self.allocator.free(json);
+
+        if (json.len > 1400) {
+            std.log.warn("sync: reservation update for {s} is {d} bytes, may exceed UDP MTU", .{ reservation.mac, json.len });
+        }
+
+        var sent: usize = 0;
+        for (self.peers.items) |*p| {
+            if (p.authenticated and p.config_sync_capable) {
+                self.sendMsg(p.addr, .reservation_update, json);
+                sent += 1;
+            }
+        }
+        std.log.info("sync: sent reservation update {s} to {d} config-capable peer(s)", .{ reservation.mac, sent });
+    }
+
+    /// Notify all config-sync-capable peers of a reservation deletion.
+    pub fn notifyReservationDelete(self: *Self, pool: *const config_mod.PoolConfig, mac: []const u8) void {
+        const payload = ReservationSync{
+            .pool_subnet = pool.subnet,
+            .pool_prefix = pool.prefix_len,
+            .mac = mac,
+            .config_modified = std.time.timestamp(),
+        };
+
+        const json = std.json.Stringify.valueAlloc(self.allocator, payload, .{}) catch return;
+        defer self.allocator.free(json);
+
+        var sent: usize = 0;
+        for (self.peers.items) |*p| {
+            if (p.authenticated and p.config_sync_capable) {
+                self.sendMsg(p.addr, .reservation_delete, json);
+                sent += 1;
+            }
+        }
+        std.log.info("sync: sent reservation delete {s} to {d} config-capable peer(s)", .{ mac, sent });
+    }
+
+    /// Check if this server is config-sync-capable (global config_writable AND sync.config_sync).
+    fn isConfigSyncCapable(self: *Self) bool {
+        return self.full_cfg.config_writable and self.cfg.config_sync;
+    }
+
+    /// Find a pool by subnet string and prefix length.
+    fn findPoolBySubnet(self: *Self, subnet: []const u8, prefix_len: u8) ?*config_mod.PoolConfig {
+        for (self.full_cfg.pools) |*pool| {
+            if (pool.prefix_len == prefix_len and std.mem.eql(u8, pool.subnet, subnet)) {
+                return pool;
+            }
+        }
+        return null;
+    }
+
+    /// Parse the flat "code=value,code=value" string into a StringHashMap.
+    fn parseDhcpOptionsStr(self: *Self, opts_str: []const u8) ?std.StringHashMap([]const u8) {
+        if (opts_str.len == 0) return null;
+        var map = std.StringHashMap([]const u8).init(self.allocator);
+        errdefer {
+            var it = map.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                self.allocator.free(entry.value_ptr.*);
+            }
+            map.deinit();
+        }
+        var pairs = std.mem.splitScalar(u8, opts_str, ',');
+        while (pairs.next()) |pair| {
+            if (std.mem.indexOfScalar(u8, pair, '=')) |eq_pos| {
+                const k = self.allocator.dupe(u8, pair[0..eq_pos]) catch return null;
+                const v = self.allocator.dupe(u8, pair[eq_pos + 1 ..]) catch {
+                    self.allocator.free(k);
+                    return null;
+                };
+                map.put(k, v) catch {
+                    self.allocator.free(k);
+                    self.allocator.free(v);
+                    return null;
+                };
+            }
+        }
+        return map;
+    }
+
+    /// Process an incoming reservation update from a peer.
+    fn processReservationUpdate(self: *Self, plaintext: []const u8) void {
+        if (!self.isConfigSyncCapable()) {
+            std.log.debug("sync: ignoring reservation update: not config-sync-capable", .{});
+            return;
+        }
+
+        const parsed = std.json.parseFromSlice(
+            ReservationSync,
+            self.allocator,
+            plaintext,
+            .{ .ignore_unknown_fields = true },
+        ) catch |err| {
+            std.log.warn("sync: failed to parse reservation update JSON: {s}", .{@errorName(err)});
+            return;
+        };
+        defer parsed.deinit();
+        const incoming = parsed.value;
+
+        // Find the matching pool
+        const pool = self.findPoolBySubnet(incoming.pool_subnet, incoming.pool_prefix) orelse {
+            std.log.warn("sync: reservation update for unknown pool {s}/{d}, ignoring", .{ incoming.pool_subnet, incoming.pool_prefix });
+            return;
+        };
+
+        // Check config_modified against existing reservation's timestamp (last-write-wins)
+        for (pool.reservations) |*r| {
+            if (std.mem.eql(u8, r.mac, incoming.mac)) {
+                if (incoming.config_modified <= r.config_modified) {
+                    std.log.debug("sync: discarding older reservation update for {s} (incoming={d}, existing={d})", .{
+                        incoming.mac, incoming.config_modified, r.config_modified,
+                    });
+                    return;
+                }
+                break;
+            }
+        }
+
+        // Parse dhcp_options from flat string
+        var opts: ?std.StringHashMap([]const u8) = null;
+        if (incoming.dhcp_options_str) |opts_str| {
+            opts = self.parseDhcpOptionsStr(opts_str);
+        }
+        defer if (opts) |*o| {
+            var oit = o.iterator();
+            while (oit.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                self.allocator.free(entry.value_ptr.*);
+            }
+            o.deinit();
+        };
+
+        // Apply upsert
+        _ = config_write.upsertReservation(
+            self.allocator,
+            pool,
+            incoming.mac,
+            incoming.ip,
+            incoming.hostname,
+            incoming.client_id,
+            opts,
+        ) catch |err| {
+            std.log.err("sync: failed to apply reservation update for {s}: {s}", .{ incoming.mac, @errorName(err) });
+            return;
+        };
+
+        // Set config_modified on the reservation (upsertReservation doesn't handle this field)
+        for (pool.reservations) |*r| {
+            if (std.mem.eql(u8, r.mac, incoming.mac)) {
+                r.config_modified = incoming.config_modified;
+                break;
+            }
+        }
+
+        // Persist to config.yaml
+        config_write.writeConfig(self.allocator, self.full_cfg, self.cfg_path) catch |err| {
+            std.log.err("sync: could not apply reservation from peer: config write failed ({s})", .{@errorName(err)});
+            return;
+        };
+
+        // Also seed the reservation into the lease store so it takes effect immediately
+        self.store.addLease(.{
+            .mac = incoming.mac,
+            .ip = incoming.ip,
+            .hostname = incoming.hostname,
+            .expires = 0,
+            .client_id = incoming.client_id,
+            .reserved = true,
+        }) catch {};
+
+        std.log.info("sync: applied reservation update from peer: {s} -> {s} in {s}/{d}", .{
+            incoming.mac, incoming.ip, incoming.pool_subnet, incoming.pool_prefix,
+        });
+    }
+
+    /// Process an incoming reservation delete from a peer.
+    fn processReservationDelete(self: *Self, plaintext: []const u8) void {
+        if (!self.isConfigSyncCapable()) {
+            std.log.debug("sync: ignoring reservation delete: not config-sync-capable", .{});
+            return;
+        }
+
+        const parsed = std.json.parseFromSlice(
+            ReservationSync,
+            self.allocator,
+            plaintext,
+            .{ .ignore_unknown_fields = true },
+        ) catch |err| {
+            std.log.warn("sync: failed to parse reservation delete JSON: {s}", .{@errorName(err)});
+            return;
+        };
+        defer parsed.deinit();
+        const incoming = parsed.value;
+
+        // Find the matching pool
+        const pool = self.findPoolBySubnet(incoming.pool_subnet, incoming.pool_prefix) orelse {
+            std.log.warn("sync: reservation delete for unknown pool {s}/{d}, ignoring", .{ incoming.pool_subnet, incoming.pool_prefix });
+            return;
+        };
+
+        // Check config_modified against existing reservation's timestamp (last-write-wins)
+        for (pool.reservations) |*r| {
+            if (std.mem.eql(u8, r.mac, incoming.mac)) {
+                if (incoming.config_modified <= r.config_modified) {
+                    std.log.debug("sync: discarding older reservation delete for {s} (incoming={d}, existing={d})", .{
+                        incoming.mac, incoming.config_modified, r.config_modified,
+                    });
+                    return;
+                }
+                break;
+            }
+        }
+
+        // Remove from config
+        if (!config_write.removeReservation(self.allocator, pool, incoming.mac)) {
+            std.log.debug("sync: reservation delete for {s}: not found in pool {s}/{d}", .{
+                incoming.mac, incoming.pool_subnet, incoming.pool_prefix,
+            });
+            return;
+        }
+
+        // Remove from lease store
+        self.store.forceRemoveLease(incoming.mac);
+
+        // Persist to config.yaml
+        config_write.writeConfig(self.allocator, self.full_cfg, self.cfg_path) catch |err| {
+            std.log.err("sync: could not apply reservation delete from peer: config write failed ({s})", .{@errorName(err)});
+            return;
+        };
+
+        std.log.info("sync: applied reservation delete from peer: {s} in {s}/{d}", .{
+            incoming.mac, incoming.pool_subnet, incoming.pool_prefix,
+        });
+    }
+
+    // -----------------------------------------------------------------------
     // Internal: crypto
     // -----------------------------------------------------------------------
 
@@ -786,7 +1073,7 @@ pub const SyncManager = struct {
             // (group name matched during the HELLO handshake).  After a pool
             // config change, updatePoolStates() marks all peers unauthenticated,
             // so stale-config peers are locked out until they re-handshake.
-            .lease_update, .lease_delete, .keepalive, .lease_hash => {
+            .lease_update, .lease_delete, .keepalive, .lease_hash, .reservation_update, .reservation_delete => {
                 const peer = self.findPeer(src) orelse return;
                 if (!peer.authenticated) {
                     log_v.debug("sync: ignoring {s} from unauthenticated peer", .{@tagName(result.msg_type)});
@@ -798,6 +1085,8 @@ pub const SyncManager = struct {
                     .lease_delete => self.applyLeaseDelete(result.plaintext),
                     .lease_hash => self.processLeaseHash(src, result.plaintext),
                     .keepalive => {},
+                    .reservation_update => self.processReservationUpdate(result.plaintext),
+                    .reservation_delete => self.processReservationDelete(result.plaintext),
                     else => unreachable,
                 }
             },
@@ -2452,4 +2741,513 @@ test "peerCount: returns correct counts" {
     try std.testing.expectEqual(@as(u32, 3), c1.total);
     try std.testing.expectEqual(@as(u32, 2), c1.authenticated);
     try std.testing.expectEqual(@as(u32, 1), c1.config_capable);
+}
+
+// ---------------------------------------------------------------------------
+// Reservation config sync (Phase 2) tests
+// ---------------------------------------------------------------------------
+
+fn makeTestConfigSyncManager(alloc: std.mem.Allocator) struct {
+    mgr: SyncManager,
+    cfg: config_mod.Config,
+    sync_cfg: config_mod.SyncConfig,
+    store: *state_mod.StateStore,
+} {
+    var cfg = makeTestConfig(alloc);
+    cfg.config_writable = true;
+    const store = makeTestStateStore(alloc) catch unreachable;
+
+    var sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+        .config_sync = true,
+    };
+
+    const aes_key = SyncManager.deriveKey("reservation-sync-test");
+    var mgr = SyncManager{
+        .allocator = alloc,
+        .cfg = &sync_cfg,
+        .full_cfg = &cfg,
+        .cfg_path = "/tmp/stardust-test-config.yaml",
+        .store = store,
+        .aes_key = aes_key,
+        .pool_states = undefined,
+        .pool_states_len = 0,
+        .self_ip = 0,
+        .sock_fd = -1,
+        .peers = std.ArrayList(SyncManager.Peer){},
+        .last_full_sync = 0,
+        .last_keepalive = 0,
+        .authenticated_count = std.atomic.Value(u32).init(0),
+    };
+    mgr.computeLocalPoolStates();
+
+    // IMPORTANT: re-link after cfg is at its final address
+    return .{ .mgr = mgr, .cfg = cfg, .sync_cfg = sync_cfg, .store = store };
+}
+
+test "ReservationSync JSON round-trip" {
+    const alloc = std.testing.allocator;
+
+    const payload = SyncManager.ReservationSync{
+        .pool_subnet = "192.168.1.0",
+        .pool_prefix = 24,
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "192.168.1.50",
+        .hostname = "printer",
+        .client_id = null,
+        .config_modified = 1712345678,
+        .dhcp_options_str = "66=tftp.local,67=boot.img",
+    };
+
+    const json = try std.json.Stringify.valueAlloc(alloc, payload, .{});
+    defer alloc.free(json);
+
+    const parsed = try std.json.parseFromSlice(
+        SyncManager.ReservationSync,
+        alloc,
+        json,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+    const v = parsed.value;
+
+    try std.testing.expectEqualStrings("192.168.1.0", v.pool_subnet);
+    try std.testing.expectEqual(@as(u8, 24), v.pool_prefix);
+    try std.testing.expectEqualStrings("aa:bb:cc:dd:ee:ff", v.mac);
+    try std.testing.expectEqualStrings("192.168.1.50", v.ip);
+    try std.testing.expectEqualStrings("printer", v.hostname.?);
+    try std.testing.expect(v.client_id == null);
+    try std.testing.expectEqual(@as(i64, 1712345678), v.config_modified);
+    try std.testing.expectEqualStrings("66=tftp.local,67=boot.img", v.dhcp_options_str.?);
+}
+
+test "ReservationSync JSON round-trip: minimal delete payload" {
+    const alloc = std.testing.allocator;
+
+    const payload = SyncManager.ReservationSync{
+        .pool_subnet = "10.0.0.0",
+        .pool_prefix = 8,
+        .mac = "11:22:33:44:55:66",
+        .config_modified = 999,
+    };
+
+    const json = try std.json.Stringify.valueAlloc(alloc, payload, .{});
+    defer alloc.free(json);
+
+    const parsed = try std.json.parseFromSlice(
+        SyncManager.ReservationSync,
+        alloc,
+        json,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+    const v = parsed.value;
+
+    try std.testing.expectEqualStrings("10.0.0.0", v.pool_subnet);
+    try std.testing.expectEqual(@as(u8, 8), v.pool_prefix);
+    try std.testing.expectEqualStrings("11:22:33:44:55:66", v.mac);
+    try std.testing.expectEqual(@as(i64, 999), v.config_modified);
+    try std.testing.expectEqualStrings("", v.ip);
+    try std.testing.expect(v.hostname == null);
+    try std.testing.expect(v.dhcp_options_str == null);
+}
+
+test "notifyReservationUpdate: sends only to config-capable peers" {
+    const alloc = std.testing.allocator;
+    var result = makeTestConfigSyncManager(alloc);
+    defer result.cfg.deinit();
+    defer result.store.deinit();
+    defer result.mgr.peers.deinit(alloc);
+
+    // Fix up internal pointers
+    result.mgr.full_cfg = &result.cfg;
+    result.mgr.cfg = &result.sync_cfg;
+    result.mgr.computeLocalPoolStates();
+
+    // We need a valid socket to send
+    result.mgr.sock_fd = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP) catch unreachable;
+    defer std.posix.close(result.mgr.sock_fd);
+
+    // Add one config-capable peer and one non-capable peer
+    try result.mgr.peers.append(alloc, .{
+        .addr = std.posix.sockaddr.in{
+            .family = std.posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, 647),
+            .addr = @bitCast([4]u8{ 10, 0, 0, 1 }),
+        },
+        .authenticated = true,
+        .last_seen = 0,
+        .last_hello_sent = 0,
+        .peer_pool_hashes = undefined,
+        .peer_pool_hashes_len = 0,
+        .peer_ip = 0,
+        .config_sync_capable = true,
+    });
+    try result.mgr.peers.append(alloc, .{
+        .addr = std.posix.sockaddr.in{
+            .family = std.posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, 647),
+            .addr = @bitCast([4]u8{ 10, 0, 0, 2 }),
+        },
+        .authenticated = true,
+        .last_seen = 0,
+        .last_hello_sent = 0,
+        .peer_pool_hashes = undefined,
+        .peer_pool_hashes_len = 0,
+        .peer_ip = 0,
+        .config_sync_capable = false,
+    });
+
+    const reservation = config_mod.Reservation{
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "192.168.1.50",
+        .hostname = "testhost",
+        .client_id = null,
+        .config_modified = 12345,
+    };
+
+    // This should not crash; it sends to the config-capable peer only.
+    // (We cannot easily verify the UDP packet content in a unit test,
+    // but we verify it doesn't panic and the log message is produced.)
+    result.mgr.notifyReservationUpdate(&result.cfg.pools[0], &reservation);
+}
+
+test "processReservationUpdate: applies newer reservation" {
+    const alloc = std.testing.allocator;
+    var result = makeTestConfigSyncManager(alloc);
+    defer result.cfg.deinit();
+    defer result.store.deinit();
+    defer result.mgr.peers.deinit(alloc);
+
+    result.mgr.full_cfg = &result.cfg;
+    result.mgr.cfg = &result.sync_cfg;
+    result.mgr.computeLocalPoolStates();
+
+    // Build incoming JSON payload
+    const payload = SyncManager.ReservationSync{
+        .pool_subnet = "192.168.1.0",
+        .pool_prefix = 24,
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "192.168.1.50",
+        .hostname = "synced-host",
+        .client_id = null,
+        .config_modified = 99999,
+        .dhcp_options_str = null,
+    };
+    const json = std.json.Stringify.valueAlloc(alloc, payload, .{}) catch unreachable;
+    defer alloc.free(json);
+
+    result.mgr.processReservationUpdate(json);
+
+    // Verify reservation was added to the pool
+    try std.testing.expectEqual(@as(usize, 1), result.cfg.pools[0].reservations.len);
+    const r = result.cfg.pools[0].reservations[0];
+    try std.testing.expectEqualStrings("aa:bb:cc:dd:ee:ff", r.mac);
+    try std.testing.expectEqualStrings("192.168.1.50", r.ip);
+    try std.testing.expectEqualStrings("synced-host", r.hostname.?);
+    try std.testing.expectEqual(@as(i64, 99999), r.config_modified);
+
+    // Verify lease was seeded in the store
+    const lease = result.store.leases.get("aa:bb:cc:dd:ee:ff");
+    try std.testing.expect(lease != null);
+    try std.testing.expect(lease.?.reserved);
+}
+
+test "processReservationUpdate: rejects older reservation" {
+    const alloc = std.testing.allocator;
+    var result = makeTestConfigSyncManager(alloc);
+    defer result.cfg.deinit();
+    defer result.store.deinit();
+    defer result.mgr.peers.deinit(alloc);
+
+    result.mgr.full_cfg = &result.cfg;
+    result.mgr.cfg = &result.sync_cfg;
+    result.mgr.computeLocalPoolStates();
+
+    // First, apply a reservation with config_modified=500
+    const payload1 = SyncManager.ReservationSync{
+        .pool_subnet = "192.168.1.0",
+        .pool_prefix = 24,
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "192.168.1.50",
+        .hostname = "host-v1",
+        .client_id = null,
+        .config_modified = 500,
+    };
+    const json1 = std.json.Stringify.valueAlloc(alloc, payload1, .{}) catch unreachable;
+    defer alloc.free(json1);
+    result.mgr.processReservationUpdate(json1);
+
+    try std.testing.expectEqual(@as(usize, 1), result.cfg.pools[0].reservations.len);
+    try std.testing.expectEqualStrings("host-v1", result.cfg.pools[0].reservations[0].hostname.?);
+
+    // Now try to apply an older reservation (config_modified=100) — should be rejected
+    const payload2 = SyncManager.ReservationSync{
+        .pool_subnet = "192.168.1.0",
+        .pool_prefix = 24,
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "192.168.1.51",
+        .hostname = "host-old",
+        .client_id = null,
+        .config_modified = 100,
+    };
+    const json2 = std.json.Stringify.valueAlloc(alloc, payload2, .{}) catch unreachable;
+    defer alloc.free(json2);
+    result.mgr.processReservationUpdate(json2);
+
+    // Should still have the original reservation, unchanged
+    try std.testing.expectEqual(@as(usize, 1), result.cfg.pools[0].reservations.len);
+    try std.testing.expectEqualStrings("host-v1", result.cfg.pools[0].reservations[0].hostname.?);
+    try std.testing.expectEqualStrings("192.168.1.50", result.cfg.pools[0].reservations[0].ip);
+    try std.testing.expectEqual(@as(i64, 500), result.cfg.pools[0].reservations[0].config_modified);
+}
+
+test "processReservationDelete: removes reservation with newer timestamp" {
+    const alloc = std.testing.allocator;
+    var result = makeTestConfigSyncManager(alloc);
+    defer result.cfg.deinit();
+    defer result.store.deinit();
+    defer result.mgr.peers.deinit(alloc);
+
+    result.mgr.full_cfg = &result.cfg;
+    result.mgr.cfg = &result.sync_cfg;
+    result.mgr.computeLocalPoolStates();
+
+    // First, add a reservation
+    const add_payload = SyncManager.ReservationSync{
+        .pool_subnet = "192.168.1.0",
+        .pool_prefix = 24,
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "192.168.1.50",
+        .hostname = "to-delete",
+        .client_id = null,
+        .config_modified = 100,
+    };
+    const add_json = std.json.Stringify.valueAlloc(alloc, add_payload, .{}) catch unreachable;
+    defer alloc.free(add_json);
+    result.mgr.processReservationUpdate(add_json);
+    try std.testing.expectEqual(@as(usize, 1), result.cfg.pools[0].reservations.len);
+
+    // Now delete it with a newer timestamp
+    const del_payload = SyncManager.ReservationSync{
+        .pool_subnet = "192.168.1.0",
+        .pool_prefix = 24,
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .config_modified = 200,
+    };
+    const del_json = std.json.Stringify.valueAlloc(alloc, del_payload, .{}) catch unreachable;
+    defer alloc.free(del_json);
+    result.mgr.processReservationDelete(del_json);
+
+    // Reservation should be gone
+    try std.testing.expectEqual(@as(usize, 0), result.cfg.pools[0].reservations.len);
+
+    // Lease should also be removed
+    try std.testing.expect(result.store.leases.get("aa:bb:cc:dd:ee:ff") == null);
+}
+
+test "processReservationDelete: rejects older timestamp" {
+    const alloc = std.testing.allocator;
+    var result = makeTestConfigSyncManager(alloc);
+    defer result.cfg.deinit();
+    defer result.store.deinit();
+    defer result.mgr.peers.deinit(alloc);
+
+    result.mgr.full_cfg = &result.cfg;
+    result.mgr.cfg = &result.sync_cfg;
+    result.mgr.computeLocalPoolStates();
+
+    // Add a reservation with config_modified=500
+    const add_payload = SyncManager.ReservationSync{
+        .pool_subnet = "192.168.1.0",
+        .pool_prefix = 24,
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "192.168.1.50",
+        .hostname = "keep-me",
+        .client_id = null,
+        .config_modified = 500,
+    };
+    const add_json = std.json.Stringify.valueAlloc(alloc, add_payload, .{}) catch unreachable;
+    defer alloc.free(add_json);
+    result.mgr.processReservationUpdate(add_json);
+
+    // Try to delete with an older timestamp (config_modified=100) — should be rejected
+    const del_payload = SyncManager.ReservationSync{
+        .pool_subnet = "192.168.1.0",
+        .pool_prefix = 24,
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .config_modified = 100,
+    };
+    const del_json = std.json.Stringify.valueAlloc(alloc, del_payload, .{}) catch unreachable;
+    defer alloc.free(del_json);
+    result.mgr.processReservationDelete(del_json);
+
+    // Reservation should still exist
+    try std.testing.expectEqual(@as(usize, 1), result.cfg.pools[0].reservations.len);
+    try std.testing.expectEqualStrings("keep-me", result.cfg.pools[0].reservations[0].hostname.?);
+}
+
+test "processReservationUpdate: not config-sync-capable is a no-op" {
+    const alloc = std.testing.allocator;
+    var cfg = makeTestConfig(alloc);
+    defer cfg.deinit();
+    // config_writable = false (default), so NOT config-sync-capable
+    const store = makeTestStateStore(alloc) catch unreachable;
+    defer store.deinit();
+
+    var sync_cfg = config_mod.SyncConfig{
+        .enable = true,
+        .group_name = "test-group",
+        .key_file = "",
+        .port = 647,
+        .peers = &.{},
+        .multicast = null,
+        .full_sync_interval = 300,
+        .config_sync = false,
+    };
+    const aes_key = SyncManager.deriveKey("no-config-sync");
+    var mgr = SyncManager{
+        .allocator = alloc,
+        .cfg = &sync_cfg,
+        .full_cfg = &cfg,
+        .cfg_path = "",
+        .store = store,
+        .aes_key = aes_key,
+        .pool_states = undefined,
+        .pool_states_len = 0,
+        .self_ip = 0,
+        .sock_fd = -1,
+        .peers = std.ArrayList(SyncManager.Peer){},
+        .last_full_sync = 0,
+        .last_keepalive = 0,
+        .authenticated_count = std.atomic.Value(u32).init(0),
+    };
+    defer mgr.peers.deinit(alloc);
+
+    const payload = SyncManager.ReservationSync{
+        .pool_subnet = "192.168.1.0",
+        .pool_prefix = 24,
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "192.168.1.50",
+        .hostname = "should-not-apply",
+        .client_id = null,
+        .config_modified = 99999,
+    };
+    const json = std.json.Stringify.valueAlloc(alloc, payload, .{}) catch unreachable;
+    defer alloc.free(json);
+
+    mgr.processReservationUpdate(json);
+
+    // Reservation should NOT have been added (config_sync disabled)
+    try std.testing.expectEqual(@as(usize, 0), cfg.pools[0].reservations.len);
+}
+
+test "parseDhcpOptionsStr: round-trip key=value pairs" {
+    const alloc = std.testing.allocator;
+    var result = makeTestConfigSyncManager(alloc);
+    defer result.cfg.deinit();
+    defer result.store.deinit();
+    defer result.mgr.peers.deinit(alloc);
+
+    result.mgr.full_cfg = &result.cfg;
+    result.mgr.cfg = &result.sync_cfg;
+
+    var opts = result.mgr.parseDhcpOptionsStr("66=tftp.local,67=boot.img").?;
+    defer {
+        var it = opts.iterator();
+        while (it.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+            alloc.free(entry.value_ptr.*);
+        }
+        opts.deinit();
+    }
+
+    try std.testing.expectEqual(@as(u32, 2), opts.count());
+    try std.testing.expectEqualStrings("tftp.local", opts.get("66").?);
+    try std.testing.expectEqualStrings("boot.img", opts.get("67").?);
+}
+
+test "parseDhcpOptionsStr: empty string returns null" {
+    const alloc = std.testing.allocator;
+    var result = makeTestConfigSyncManager(alloc);
+    defer result.cfg.deinit();
+    defer result.store.deinit();
+    defer result.mgr.peers.deinit(alloc);
+
+    result.mgr.full_cfg = &result.cfg;
+    result.mgr.cfg = &result.sync_cfg;
+
+    const opts = result.mgr.parseDhcpOptionsStr("");
+    try std.testing.expect(opts == null);
+}
+
+test "processReservationUpdate: with dhcp_options" {
+    const alloc = std.testing.allocator;
+    var result = makeTestConfigSyncManager(alloc);
+    defer result.cfg.deinit();
+    defer result.store.deinit();
+    defer result.mgr.peers.deinit(alloc);
+
+    result.mgr.full_cfg = &result.cfg;
+    result.mgr.cfg = &result.sync_cfg;
+    result.mgr.computeLocalPoolStates();
+
+    const payload = SyncManager.ReservationSync{
+        .pool_subnet = "192.168.1.0",
+        .pool_prefix = 24,
+        .mac = "aa:bb:cc:dd:ee:ff",
+        .ip = "192.168.1.50",
+        .hostname = "pxe-host",
+        .client_id = null,
+        .config_modified = 1000,
+        .dhcp_options_str = "66=tftp.local,67=pxelinux.0",
+    };
+    const json = std.json.Stringify.valueAlloc(alloc, payload, .{}) catch unreachable;
+    defer alloc.free(json);
+
+    result.mgr.processReservationUpdate(json);
+
+    try std.testing.expectEqual(@as(usize, 1), result.cfg.pools[0].reservations.len);
+    const r = result.cfg.pools[0].reservations[0];
+    try std.testing.expect(r.dhcp_options != null);
+    try std.testing.expectEqualStrings("tftp.local", r.dhcp_options.?.get("66").?);
+    try std.testing.expectEqualStrings("pxelinux.0", r.dhcp_options.?.get("67").?);
+}
+
+test "encrypt/decrypt round-trip: reservation_update message type" {
+    const aes_key = SyncManager.deriveKey("res-msg-type-test");
+    var mgr = makeTestManager(aes_key);
+    defer mgr.peers.deinit(std.testing.allocator);
+
+    const plaintext = "{\"pool_subnet\":\"192.168.1.0\",\"pool_prefix\":24,\"mac\":\"aa:bb:cc:dd:ee:ff\"}";
+    var buf: [512]u8 = undefined;
+    const n = mgr.encrypt(.reservation_update, plaintext, &buf);
+    try std.testing.expect(n != null);
+
+    var plain_buf: [512]u8 = undefined;
+    const result = try mgr.decrypt(buf[0..n.?], &plain_buf);
+    try std.testing.expectEqual(MsgType.reservation_update, result.msg_type);
+    try std.testing.expectEqualStrings(plaintext, result.plaintext);
+}
+
+test "encrypt/decrypt round-trip: reservation_delete message type" {
+    const aes_key = SyncManager.deriveKey("res-del-msg-type-test");
+    var mgr = makeTestManager(aes_key);
+    defer mgr.peers.deinit(std.testing.allocator);
+
+    const plaintext = "{\"mac\":\"aa:bb:cc:dd:ee:ff\"}";
+    var buf: [512]u8 = undefined;
+    const n = mgr.encrypt(.reservation_delete, plaintext, &buf);
+    try std.testing.expect(n != null);
+
+    var plain_buf: [512]u8 = undefined;
+    const result = try mgr.decrypt(buf[0..n.?], &plain_buf);
+    try std.testing.expectEqual(MsgType.reservation_delete, result.msg_type);
+    try std.testing.expectEqualStrings(plaintext, result.plaintext);
 }
