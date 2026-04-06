@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.3-alpha2 (2026-04-06)
+
+### Config Sync
+
+Per-pool configuration synchronization between peers:
+
+- **Reservation sync**: `RESERVATION_UPDATE` / `RESERVATION_DELETE` messages with per-item `config_modified` timestamps and last-write-wins conflict resolution
+- **Pool config sync**: `POOL_CONFIG_UPDATE` with full pool YAML propagation and per-pool `config_version` timestamps
+- **Anti-entropy**: HELLO exchanges `config_version`; higher version automatically pushes to peers with stale config on reconnect
+- **Two-gate capability**: global `config_writable` (top-level) + `sync.config_sync` (sync-specific) — both must be true for a peer to accept config pushes
+- **TUI integration**: reservation save/delete and pool save trigger immediate sync notifications to capable peers
+- **Settings TUI**: layout-driven click handler (fixes AUDIT.md fragility concern), Config Writable shown read-only, Config Sync toggle editable
+
+### Security Profiles
+
+- **AppArmor** profile for Debian/Ubuntu/SUSE: confines binary to `/etc/stardust` + `/var/lib/stardust`, explicit rules for atomic write patterns (`.tmp`, `.writetest`)
+- **SELinux** policy for RHEL/Fedora: 4 types (`stardust_exec_t`, `stardust_conf_t`, `stardust_key_t`, `stardust_state_t`), file contexts for all default paths
+- Both profiles included in .deb, .rpm, and .tar.gz packages
+
+### TUI Improvements
+
+- **Natural sort** for hostname column: `client-2` sorts before `client-10` (overflow-safe, no u64 arithmetic)
+- **Sync status** on stats tab: peer counts, config capability, 4 config sync counters (CONFIG PUSH/RECV, RESV PUSH/RECV)
+- **Config Writable** displayed as read-only in settings (must be set via config.yaml for safety)
+
+### Infrastructure
+
+- **MIT license** with LGPL-2.1 libssh notice
+- **Auto-detect local IP** for sync voting when listen_address is 0.0.0.0 (falls back to random 255.255.x.x to lose all ties)
+- **Suppress zig-yaml debug logs** on config reload (comptime scope filter)
+- **Config writability startup check**: fatal error if `config_writable=true` but config path isn't writable
+- **Subnet mask consistency**: all 5 remaining single-sided comparisons fixed to mask both sides
+
+### Bug Fixes (rounds 6-7, 7 total)
+
+- `naturalLessThan` used `b[ai]` instead of `b[bi]` — hostname sort was broken
+- `naturalLessThan` u64 overflow on 20+ digit runs — replaced with run-extraction
+- `parsePoolFromYaml` leaked zig-yaml parse_errors on load failure
+- `processPoolConfigUpdate` logged parse failure as `err` instead of `warn`
+- Prometheus output missing `forcerenew` counter
+- `saveUnlocked` temp file not cleaned up on rename failure
+- 9 previously-silent behaviors now log warnings or info messages
+
+### Test Coverage
+
+~440 tests across 10 modules. New tests for malformed JSON/YAML handling, MAC class time_offset override, /30 subnet capacity, natural sort edge cases.
+
+---
+
 ## v0.3-alpha1 (2026-04-03)
 
 ### Per-Pool Sync Protocol (v2)
