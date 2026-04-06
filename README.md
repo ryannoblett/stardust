@@ -126,15 +126,15 @@ Options are layered in order based on the configuration, with higher levels taki
 5. **Per-reservation** — `dhcp_options` map on individual reservations
 
 ```yaml
-mac_classes:
-  - name: "IP Phones"
-    match: "64:16:7f"            # Polycom OUI
-    dhcp_options:
-      66: "tftp.phones.local"
-      150: "10.0.0.5"
-
 pools:
   - subnet: "192.168.1.0/24"
+    mac_classes:
+      - name: "IP Phones"
+        match: "64:16:7f"          # Polycom OUI
+        tftp_servers:
+          - "tftp.phones.local"
+        dhcp_options:
+          150: "10.0.0.5"
     reservations:
       - mac: "64:16:7f:aa:bb:cc"
         ip: "192.168.1.50"
@@ -173,7 +173,8 @@ Non-HTTP clients receive standard TFTP options (66/67) instead.
 pools:
   - subnet: "192.168.1.0/24"
     http_boot_url: "http://boot.stardust.lan/uefi/bootx64.efi"
-    tftp_server_name: "192.168.1.1"  # fallback for non-UEFI clients
+    tftp_servers:                  # fallback for non-UEFI clients
+      - "192.168.1.1"
     boot_filename: "pxelinux.0"
 ```
 
@@ -195,6 +196,25 @@ Quarantine clients that spam the server with DHCPDECLINE messages, either from b
 
 - Per-MAC cooldown after 3 declines within 60 seconds
 - Global rate limit: 20 declines per 5-minute window (blocks MAC-rotation attacks)
+
+### DHCPFORCERENEW (RFC 3203 / RFC 6704)
+
+When pool config changes, reservations are modified, or leases are
+force-released via the TUI, the server sends DHCPFORCERENEW to affected
+clients, prompting them to re-negotiate and pick up updated settings.
+
+Each DHCPACK includes a cryptographic nonce (option 145); FORCERENEW
+messages carry an HMAC-MD5 authentication option (option 90) per
+RFC 6704, allowing clients to verify the message came from their server.
+
+### DHCP Leasequery (RFC 4388 / RFC 6148)
+
+Relay agents and network devices can query lease state:
+
+- **By IP** (ciaddr), **by MAC** (chaddr), **by client ID** (option 61),
+  or **by relay agent** (option 82 + giaddr)
+- Responses: DHCPLEASEACTIVE (with remaining time, last transaction time,
+  subnet mask, router), DHCPLEASEUNASSIGNED, or DHCPLEASEUNKNOWN
 
 ### Dynamic DNS updates (RFC 2136)
 
@@ -263,15 +283,19 @@ Generate a host key: `ssh-keygen -t ed25519 -f /etc/stardust/ssh_host_key -N ""`
 
 ### Lease synchronisation (active-active redundancy)
 
-Two or more Stardust instances serving the same pool can share lease state
-over UDP. Each datagram is encrypted with AES-256-GCM (key derived from a
-shared TSIG secret via HKDF-SHA-256). Peers authenticate each other by
-comparing a SHA-256 hash of the pool configuration — servers with different
-subnet/pool/reservation settings are rejected.
+Two or more Stardust instances serving the same pools can share lease state
+and configuration over UDP. Each datagram is encrypted with AES-256-GCM
+(key derived from a shared TSIG secret via HKDF-SHA-256). Peers authenticate
+on group name and shared secret, then compare per-pool SHA-256 hashes to
+determine which pools can sync. Pools with mismatched configuration are
+disabled via majority voting (ties broken by lowest IP) until configs align.
 
-Conflict resolution is last-write-wins on the `last_modified` timestamp.
-Anti-entropy: peers exchange a lease-set hash periodically and only transmit
-the full lease list when hashes differ.
+Lease conflict resolution is last-write-wins on the `last_modified` timestamp.
+Anti-entropy: peers exchange lease-set and config hashes periodically, pushing
+updates only when they differ.
+
+With `config_writable` and `config_sync` enabled, reservation and pool config
+changes made in the TUI propagate automatically to all capable peers.
 
 ```yaml
 sync:
@@ -332,27 +356,22 @@ See the annotated [`config.yaml`](config.yaml) for all options. Notable top-leve
 | `state_dir` | -- | Directory for `leases.json` (required) |
 | `log_level` | `"info"` | `err` / `warn` / `info` / `verbose` / `debug` |
 | `pool_allocation_random` | `false` | Random vs sequential IP allocation |
-| `mac_classes` | `[]` | MAC prefix rules with DHCP option overrides |
+| `config_writable` | `false` | Allow config writes (TUI saves, sync pushes) |
 
 Each entry in `pools:` is one subnet. Required pool fields: 
 - `subnet` (CIDR)
 - `router`
-- `dns_servers`
 - `lease_time`
 
 Optional: 
-- `pool_start`
-- `pool_end`
-- `domain_name`
-- `domain_search`
-- `reservations`
-- `static_routes`
-- `dhcp_options`
+- `pool_start`, `pool_end`
+- `dns_servers`, `domain_name`, `domain_search`
+- `ntp_servers`, `time_servers`, `time_offset`, `log_servers`
+- `wins_servers`, `mtu`
+- `tftp_servers`, `boot_filename`, `http_boot_url`
+- `static_routes`, `dhcp_options`
+- `reservations`, `mac_classes`
 - `dns_update`
-- `http_boot_url`
-- `mtu`
-- `wins_servers`
-- `tftp_servers`
 
 ## Compilation
 
