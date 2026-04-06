@@ -1,27 +1,21 @@
 # Stardust
 
 [![CI](https://github.com/driftlevel/stardust/actions/workflows/ci.yml/badge.svg)](https://github.com/driftlevel/stardust/actions/workflows/ci.yml)
+A better DHCP server written in Zig.
 
-A production-ready DHCP server written in Zig. Single static binary, zero
-runtime dependencies, with an interactive SSH admin TUI, active-active
-redundancy via encrypted lease and configuration sync, dynamic DNS updates
-(RFC 2136), UEFI HTTP boot, MAC class policy overrides, Prometheus metrics,
-and comprehensive input validation. Designed for small-to-medium networks
-and homelab deployments.
+All the features you want, none of the hassle. Designed for anything from home networks to enterprise deployments.
 
-## Screenshots
+Highlights:
 
-| Leases | Pools | Stats |
-|--------|-------|-------|
-| ![Leases](screenshots/leases.png) | ![Pools](screenshots/pools.png) | ![Stats](screenshots/stats.png) |
-
-| Edit Pool | Edit Reservation | MAC Class |
-|-----------|-----------------|-----------|
-| ![Edit Pool](screenshots/editpool.png) | ![Edit Reservation](screenshots/editreservation.png) | ![MAC Class](screenshots/newmacclass.png) |
-
-| Settings |
-|----------|
-| ![Settings](screenshots/settings.png) |
+- Single static binary, zero runtime dependencies
+- Active-active redundancy
+- Encrypted lease and configuration sync
+- Easy configuration
+- Easy dynamic DNS updates (RFC 2136)
+- Simple UEFI HTTP boot and PXE boot
+- MAC class policy overrides
+- Interactive SSH admin TUI
+- Prometheus metrics
 
 ## Quick start
 
@@ -56,6 +50,20 @@ Reload config without restarting:
 kill -HUP $(pidof stardust)
 ```
 
+## Screenshots
+### Leases and Reservations
+![Leases](screenshots/leases.png) 
+![Edit Reservation](screenshots/editreservation.png) 
+### Pools 
+![Pools](screenshots/pools.png)
+![Edit Pool](screenshots/editpool.png)
+### Stats
+![Stats](screenshots/stats.png)
+### MAC Classes
+![MAC Class](screenshots/newmacclass.png)
+### Settings
+![Settings](screenshots/settings.png)
+
 ## Features
 
 ### Core DHCP
@@ -67,10 +75,13 @@ kill -HUP $(pidof stardust)
   `giaddr` selects the correct pool automatically
 - Configurable lease range (`pool_start` / `pool_end`); defaults to the full
   usable subnet
+- First class configuration options automatically resolve names in the configuration to IPs sent to clients
+- Redundant or superseded DHCP options are combined into single configuration fields, overridable
 - Lease state persisted to JSON and restored at startup (expired leases skipped)
 - SIGHUP config reload — updates all settings without dropping the socket
 
 ### DHCP options
+These options are handled as first-class configuration items in `config.yaml` and the TUI:
 
 | Option | Description |
 |--------|-------------|
@@ -102,17 +113,17 @@ kill -HUP $(pidof stardust)
 | 121 | Classless static routes (RFC 3442) |
 | 150 | Cisco TFTP server address |
 
-Arbitrary additional options can be injected via `dhcp_options` in config
-(numeric keys, IPv4 or raw string values).
+Arbitrary additional options can be injected via `dhcp_options` using the option number and raw value directly.
 
 ### DHCP option overrides
 
-Options can be overridden at three levels, with higher levels taking priority:
+Options are layered in order based on the configuration, with higher levels taking priority:
 
-1. **Pool defaults** — `dhcp_options` map on the pool
-2. **MAC class rules** — match clients by MAC prefix (vendor OUI); applied in
-   specificity order (shortest prefix first, most specific wins)
-3. **Per-reservation** — `dhcp_options` map on individual reservations
+1. **Pool defaults** — Pool settings
+2. **Pool overrides** — `dhcp_options` map on the pool
+3. **MAC class rules** — MAC Class settings - match clients by MAC prefix (vendor OUI); applied in specificity order (shortest prefix first, most specific wins)
+4. **MAC class rules** — MAC Class `dhcp_options` map - same order
+5. **Per-reservation** — `dhcp_options` map on individual reservations
 
 ```yaml
 mac_classes:
@@ -161,7 +172,7 @@ Non-HTTP clients receive standard TFTP options (66/67) instead.
 ```yaml
 pools:
   - subnet: "192.168.1.0/24"
-    http_boot_url: "http://boot.example.com/uefi/bootx64.efi"
+    http_boot_url: "http://boot.stardust.lan/uefi/bootx64.efi"
     tftp_server_name: "192.168.1.1"  # fallback for non-UEFI clients
     boot_filename: "pxelinux.0"
 ```
@@ -180,12 +191,14 @@ the same cooldown used for DHCPDECLINE.
 
 ### DHCPDECLINE protection
 
+Quarantine clients that spam the server with DHCPDECLINE messages, either from being broken or malicious.
+
 - Per-MAC cooldown after 3 declines within 60 seconds
 - Global rate limit: 20 declines per 5-minute window (blocks MAC-rotation attacks)
 
 ### Dynamic DNS updates (RFC 2136)
 
-Stardust can update a BIND-compatible DNS server with A and PTR records when
+Stardust can update any BIND-compatible DNS server with A and PTR records when
 leases are granted or released. Each update sends two separate DNS UPDATE
 messages — one for the forward zone (A record) and one for the reverse zone
 (PTR record) — as required by RFC 2136 S3.1.
@@ -223,7 +236,7 @@ ssh -p 2267 admin@dhcp-server
 
 | Tab | Description |
 |-----|-------------|
-| 1 Leases | Live lease table with sort, filter, yank (copy to clipboard) |
+| 1 Leases | Live lease table with sort, filter, yank (copy to clipboard) and reservation create/edit |
 | 2 Stats | Per-pool capacity bars, DHCP message counters, uptime |
 | 3 Pools | View/edit/add/remove pool configurations with diff preview |
 | 4 Settings | Global config (log level, metrics, allocation mode); editable fields with deferred save |
@@ -231,8 +244,7 @@ ssh -p 2267 admin@dhcp-server
 **Capabilities:**
 - Full mouse support — click tabs, sort columns, select rows, scroll
 - Keyboard navigation — j/k, arrows, Tab/Shift-Tab, Home/End
-- Pool editing — scrollable form with all fields; static routes and DHCP
-  options edited via sub-modals; diff/confirm screen shows sync impact
+- Pool editing — scrollable form with all fields; static routes and DHCP options edited via sub-modals; diff/confirm screen shows sync impact
 - Reservation management — add/edit/delete with inline DHCP option editing and option lookup
 - Force-release — evict any lease (dynamic or reserved) from the TUI
 - Config write-back — changes saved atomically and reloaded via SIGHUP
@@ -251,7 +263,7 @@ Generate a host key: `ssh-keygen -t ed25519 -f /etc/stardust/ssh_host_key -N ""`
 
 ### Lease synchronisation (active-active redundancy)
 
-Two or more Stardust instances serving the same subnet can share lease state
+Two or more Stardust instances serving the same pool can share lease state
 over UDP. Each datagram is encrypted with AES-256-GCM (key derived from a
 shared TSIG secret via HKDF-SHA-256). Peers authenticate each other by
 comparing a SHA-256 hash of the pool configuration — servers with different
@@ -276,17 +288,13 @@ sync:
   #   - "10.0.0.3"
 ```
 
-Enable `pool_allocation_random: true` on all group members to reduce the
-chance of two servers assigning the same address during a network partition.
+Enable `pool_allocation_random: true` on all group members to reduce the chance of two servers assigning the same address during a network partition.
 
-**DNS behaviour in a sync group:**
-DNS updates are sent only by the server that issued the DHCPACK. If that server
-goes offline, the server with the lowest IP takes over DNS until it returns.
+**DNS behavior in a sync group:**
+DNS updates are sent only by the server that issued the DHCPACK. If that server goes offline, the server with the lowest IP takes over DNS until it returns.
 
 **Pool config changes with sync:**
-Changing pool settings that affect the pool hash (subnet, range, lease time,
-reservations, static routes) disconnects all sync peers. All peers must be
-updated with matching config and restarted together.
+Changing pool settings that affect the pool hash (subnet, range, lease time, reservations, static routes) requires updating config on all sync peers. If configuration sync is enabled, it will update automatically when saved in the TUI, otherwise the peers will stop serving the pool, and must be manually updated before they can rejoin the pool.
 
 ### Prometheus metrics
 
@@ -300,8 +308,7 @@ metrics:
 
 ### Logging
 
-Structured log lines on stderr, journald-compatible when `JOURNAL_STREAM` is
-set:
+Structured log lines on stderr, journald-compatible when `JOURNAL_STREAM` is set:
 
 ```
 2025-04-01T12:00:00Z [INFO] DHCPACK 192.168.1.42 to aa:bb:cc:dd:ee:ff host=printer lease=3600s
@@ -317,8 +324,7 @@ set:
 
 ## Configuration reference
 
-See the annotated [`config.yaml`](config.yaml) for all options. Key top-level
-fields:
+See the annotated [`config.yaml`](config.yaml) for all options. Notable top-level fields:
 
 | Field | Default | Description |
 |-------|---------|-------------|
@@ -328,11 +334,25 @@ fields:
 | `pool_allocation_random` | `false` | Random vs sequential IP allocation |
 | `mac_classes` | `[]` | MAC prefix rules with DHCP option overrides |
 
-Each entry in `pools:` is one subnet. Required pool fields: `subnet` (CIDR),
-`router`, `dns_servers`, `lease_time`. Optional: `pool_start`, `pool_end`,
-`domain_name`, `domain_search`, `reservations`, `static_routes`,
-`dhcp_options`, `dns_update`, `http_boot_url`, `mtu`, `wins_servers`,
-`cisco_tftp_servers`, and all time/NTP/PXE options.
+Each entry in `pools:` is one subnet. Required pool fields: 
+- `subnet` (CIDR)
+- `router`
+- `dns_servers`
+- `lease_time`
+
+Optional: 
+- `pool_start`
+- `pool_end`
+- `domain_name`
+- `domain_search`
+- `reservations`
+- `static_routes`
+- `dhcp_options`
+- `dns_update`
+- `http_boot_url`
+- `mtu`
+- `wins_servers`
+- `tftp_servers`
 
 ## Compilation
 
