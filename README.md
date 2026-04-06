@@ -366,11 +366,15 @@ Each entry in `pools:` is one subnet. Required pool fields:
 Optional: 
 - `pool_start`, `pool_end`
 - `dns_servers`, `domain_name`, `domain_search`
-- `ntp_servers`, `time_servers`, `time_offset`, `log_servers`
-- `wins_servers`, `mtu`
+- `ntp_servers`, `time_servers`, `time_offset`
+- `log_servers`
+- `wins_servers`
+- `mtu`
 - `tftp_servers`, `boot_filename`, `http_boot_url`
-- `static_routes`, `dhcp_options`
-- `reservations`, `mac_classes`
+- `static_routes`
+- `dhcp_options`
+- `reservations`
+- `mac_classes`
 - `dns_update`
 
 ## Compilation
