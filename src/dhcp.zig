@@ -22,94 +22,19 @@ pub const Error = error{
 };
 
 // ---------------------------------------------------------------------------
-// DHCP message types (RFC 2132 option 53)
+// Shared DHCP definitions (re-exported from dhcp_common.zig)
 // ---------------------------------------------------------------------------
 
-pub const MessageType = enum(u8) {
-    DHCPDISCOVER = 1,
-    DHCPOFFER = 2,
-    DHCPREQUEST = 3,
-    DHCPDECLINE = 4,
-    DHCPACK = 5,
-    DHCPNAK = 6,
-    DHCPRELEASE = 7,
-    DHCPINFORM = 8,
-    DHCPFORCERENEW = 9,
-    DHCPLEASEQUERY = 10,
-    DHCPLEASEUNASSIGNED = 11,
-    DHCPLEASEUNKNOWN = 12,
-    DHCPLEASEACTIVE = 13,
-    _,
-};
+const dhcp_common = @import("./dhcp_common.zig");
 
-// ---------------------------------------------------------------------------
-// DHCP packet header (RFC 2131)
-// ---------------------------------------------------------------------------
-
-pub const DHCPHeader = extern struct {
-    op: u8,
-    htype: u8,
-    hlen: u8,
-    hops: u8,
-    xid: u32,
-    secs: u16,
-    flags: u16,
-    ciaddr: [4]u8,
-    yiaddr: [4]u8,
-    siaddr: [4]u8,
-    giaddr: [4]u8,
-    chaddr: [16]u8,
-    sname: [64]u8,
-    file: [128]u8,
-    magic: [4]u8,
-};
-
-pub const dhcp_magic_cookie = [4]u8{ 99, 130, 83, 99 };
-pub const dhcp_min_packet_size = @sizeOf(DHCPHeader);
-pub const dhcp_options_offset = 236; // header without magic
-pub const dhcp_server_port: u16 = 67;
-pub const dhcp_client_port: u16 = 68;
-
-// ---------------------------------------------------------------------------
-// DHCP option codes (partial list, RFC 2132)
-// ---------------------------------------------------------------------------
-
-pub const OptionCode = enum(u8) {
-    Pad = 0,
-    SubnetMask = 1,
-    TimeOffset = 2,
-    Router = 3,
-    TimeServer = 4,
-    DomainNameServer = 6,
-    LogServer = 7,
-    HostName = 12,
-    DomainName = 15,
-    InterfaceMTU = 26,
-    BroadcastAddress = 28,
-    StaticRoutes = 33, // RFC 2132 §3.3
-    NtpServers = 42,
-    NetBIOSNameServers = 44,
-    RequestedIPAddress = 50,
-    IPAddressLeaseTime = 51,
-    MessageType = 53,
-    ServerIdentifier = 54,
-    ParameterRequestList = 55,
-    RenewalTimeValue = 58,
-    RebindingTimeValue = 59,
-    VendorClassIdentifier = 60,
-    ClientID = 61,
-    TftpServerName = 66,
-    BootFileName = 67,
-    Authentication = 90, // RFC 3118 / RFC 6704
-    ClientLastTransactionTime = 91, // RFC 4388
-    RelayAgentInformation = 82,
-    DomainSearch = 119,
-    ClasslessStaticRoutes = 121, // RFC 3442
-    ForcerenewNonce = 145, // RFC 6704
-    CiscoTftp = 150, // Cisco TFTP server address
-    End = 255,
-    _,
-};
+pub const MessageType = dhcp_common.MessageType;
+pub const DHCPHeader = dhcp_common.DHCPHeader;
+pub const OptionCode = dhcp_common.OptionCode;
+pub const dhcp_magic_cookie = dhcp_common.dhcp_magic_cookie;
+pub const dhcp_min_packet_size = dhcp_common.dhcp_min_packet_size;
+pub const dhcp_options_offset = dhcp_common.dhcp_options_offset;
+pub const dhcp_server_port = dhcp_common.dhcp_server_port;
+pub const dhcp_client_port = dhcp_common.dhcp_client_port;
 
 // ---------------------------------------------------------------------------
 // Server
@@ -145,49 +70,8 @@ fn probeServerIp() ?[4]u8 {
     return ip;
 }
 
-/// Compute the send destination for a DHCP response from the originating request.
-/// RFC 2131 §4.1 routing rules, in priority order:
-///   1. giaddr != 0  → relay agent at giaddr:67 (server port)
-///   2. ciaddr != 0  → renewing client at ciaddr:68 (unicast)
-///   3. broadcast bit (flags bit 15) set → 255.255.255.255:68
-///   4. else         → 255.255.255.255:68 (broadcast fallback; ARP unicast not implemented)
 fn resolveDestination(request: []const u8) std.posix.sockaddr.in {
-    if (request.len >= dhcp_min_packet_size) {
-        const req: *const DHCPHeader = @ptrCast(@alignCast(request.ptr));
-
-        if (!std.mem.eql(u8, &req.giaddr, &[_]u8{ 0, 0, 0, 0 })) {
-            return .{
-                .family = std.posix.AF.INET,
-                .port = std.mem.nativeToBig(u16, dhcp_server_port),
-                .addr = @bitCast(req.giaddr),
-            };
-        }
-
-        if (!std.mem.eql(u8, &req.ciaddr, &[_]u8{ 0, 0, 0, 0 })) {
-            return .{
-                .family = std.posix.AF.INET,
-                .port = std.mem.nativeToBig(u16, dhcp_client_port),
-                .addr = @bitCast(req.ciaddr),
-            };
-        }
-
-        // flags is in the packet in network byte order; nativeToBig reinterprets
-        // the LE u16 so bit 15 (broadcast) maps to 0x8000.
-        if (std.mem.nativeToBig(u16, req.flags) & 0x8000 != 0) {
-            return .{
-                .family = std.posix.AF.INET,
-                .port = std.mem.nativeToBig(u16, dhcp_client_port),
-                .addr = 0xFFFFFFFF,
-            };
-        }
-    }
-
-    // Fallback: broadcast. ARP unicast to yiaddr is not implemented.
-    return .{
-        .family = std.posix.AF.INET,
-        .port = std.mem.nativeToBig(u16, dhcp_client_port),
-        .addr = 0xFFFFFFFF,
-    };
+    return dhcp_common.resolveDestination(request);
 }
 
 /// Encode an option value string into DHCP wire bytes in dst.
@@ -1401,38 +1285,17 @@ pub const DHCPServer = struct {
         }
     }
 
-    /// Scan DHCP options for the first occurrence of `target`. Returns the value slice or null.
     fn getOption(packet: []const u8, target: OptionCode) ?[]const u8 {
-        if (packet.len < dhcp_min_packet_size) return null;
-        const opts = packet[dhcp_min_packet_size..];
-        var i: usize = 0;
-        while (i + 1 < opts.len) {
-            const code = opts[i];
-            if (code == @intFromEnum(OptionCode.End)) break;
-            if (code == @intFromEnum(OptionCode.Pad)) {
-                i += 1;
-                continue;
-            }
-            const len = opts[i + 1];
-            if (i + 2 + len > opts.len) break;
-            if (code == @intFromEnum(target)) return opts[i + 2 .. i + 2 + len];
-            i += 2 + len;
-        }
-        return null;
+        return dhcp_common.getOption(packet, target);
     }
 
-    /// Returns true if the client's option 60 (Vendor Class Identifier) begins with
-    /// "HTTPClient", indicating a UEFI HTTP/HTTPS network boot request (per UEFI
-    /// Specification §24.4 and RFC 7386).
     fn isHttpClient(packet: []const u8) bool {
         const vci = getOption(packet, .VendorClassIdentifier) orelse return false;
         return std.mem.startsWith(u8, vci, "HTTPClient");
     }
 
     fn getMessageType(packet: []const u8) ?MessageType {
-        const val = getOption(packet, .MessageType) orelse return null;
-        if (val.len < 1) return null;
-        return @enumFromInt(val[0]);
+        return dhcp_common.getMessageType(packet);
     }
 
     /// Scan the pool's subnet for an unallocated host address to offer.
@@ -2499,23 +2362,46 @@ pub const DHCPServer = struct {
     /// No-op if the option is absent.
     fn logRelayAgentInfo(packet: []const u8) void {
         const val = getOption(packet, .RelayAgentInformation) orelse return;
+        if (packet.len < dhcp_min_packet_size) return;
+        const hdr: *const DHCPHeader = @ptrCast(@alignCast(packet.ptr));
+        const gi = hdr.giaddr;
+
+        // Format relay IP once for all sub-option lines.
+        var relay_buf: [15]u8 = undefined;
+        const relay_ip = std.fmt.bufPrint(&relay_buf, "{d}.{d}.{d}.{d}", .{ gi[0], gi[1], gi[2], gi[3] }) catch "?";
+
         var i: usize = 0;
         while (i + 1 < val.len) {
             const sub_code = val[i];
             const sub_len = val[i + 1];
             if (i + 2 + sub_len > val.len) break;
             const sub_data = val[i + 2 .. i + 2 + sub_len];
-            // Truncate logged bytes to 16 to prevent blob output from large
-            // relay-agent sub-options; always show the actual length.
-            const preview = sub_data[0..@min(sub_data.len, 16)];
-            const truncated = sub_data.len > 16;
-            switch (sub_code) {
-                1 => std.log.debug("Option 82 circuit-id ({d}B){s}: {x}", .{ sub_len, if (truncated) "…" else "", preview }),
-                2 => std.log.debug("Option 82 remote-id ({d}B){s}: {x}", .{ sub_len, if (truncated) "…" else "", preview }),
-                else => std.log.debug("Option 82 sub-option {d} ({d}B){s}: {x}", .{ sub_code, sub_len, if (truncated) "…" else "", preview }),
+            const preview = sub_data[0..@min(sub_data.len, 64)];
+            const truncated = sub_data.len > 64;
+            const trunc_mark: []const u8 = if (truncated) "..." else "";
+            // Show as string if all bytes are printable ASCII, hex otherwise.
+            if (isPrintable(preview)) {
+                switch (sub_code) {
+                    1 => std.log.debug("Option 82 from {s}: circuit-id \"{s}{s}\"", .{ relay_ip, preview, trunc_mark }),
+                    2 => std.log.debug("Option 82 from {s}: remote-id \"{s}{s}\"", .{ relay_ip, preview, trunc_mark }),
+                    else => std.log.debug("Option 82 from {s}: sub-option {d} \"{s}{s}\"", .{ relay_ip, sub_code, preview, trunc_mark }),
+                }
+            } else {
+                switch (sub_code) {
+                    1 => std.log.debug("Option 82 from {s}: circuit-id ({d}B) {x}{s}", .{ relay_ip, sub_len, preview, trunc_mark }),
+                    2 => std.log.debug("Option 82 from {s}: remote-id ({d}B) {x}{s}", .{ relay_ip, sub_len, preview, trunc_mark }),
+                    else => std.log.debug("Option 82 from {s}: sub-option {d} ({d}B) {x}{s}", .{ relay_ip, sub_code, sub_len, preview, trunc_mark }),
+                }
             }
             i += 2 + sub_len;
         }
+    }
+
+    fn isPrintable(data: []const u8) bool {
+        for (data) |b| {
+            if (b < 0x20 or b > 0x7e) return false;
+        }
+        return data.len > 0;
     }
 
     /// Returns true if `ip` is a valid host address in the pool's subnet that is either

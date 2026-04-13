@@ -5160,9 +5160,11 @@ fn renderPoolSaveConfirm(server: *AdminServer, state: *TuiState, win: vaxis.Wind
     const confirm = &state.pool_confirm;
     const has_sync = server.sync_mgr != null;
 
+    const cfg_sync_on = if (server.cfg.sync) |s| s.config_sync else false;
+
     const BOX_W: u16 = 64;
     const change_lines: u16 = @intCast(@min(confirm.change_count, 10));
-    const warn_lines: u16 = if (confirm.has_sync_break and has_sync) 3 else 0;
+    const warn_lines: u16 = if (confirm.has_sync_break and has_sync) (if (cfg_sync_on) @as(u16, 4) else @as(u16, 3)) else if (has_sync and cfg_sync_on) @as(u16, 2) else @as(u16, 0);
     const BOX_H: u16 = 7 + change_lines + warn_lines; // border*2 + title + changes + warn + action + hints
     if (win.width < BOX_W or win.height < BOX_H) return;
     const x = (win.width - BOX_W) / 2;
@@ -5208,9 +5210,21 @@ fn renderPoolSaveConfirm(server: *AdminServer, state: *TuiState, win: vaxis.Wind
     // Sync warning.
     if (confirm.has_sync_break and has_sync) {
         row += 1;
-        _ = box.print(&.{.{ .text = "  !! This will break peer sync. All peers must", .style = warn_style }}, .{ .col_offset = 1, .row_offset = row, .wrap = .none });
+        if (cfg_sync_on) {
+            _ = box.print(&.{.{ .text = "  !! Pool hash will change. Peers will be synced", .style = warn_style }}, .{ .col_offset = 1, .row_offset = row, .wrap = .none });
+            row += 1;
+            _ = box.print(&.{.{ .text = "     automatically. If sync fails, peers must be", .style = warn_style }}, .{ .col_offset = 1, .row_offset = row, .wrap = .none });
+            row += 1;
+            _ = box.print(&.{.{ .text = "     updated and restarted manually.", .style = warn_style }}, .{ .col_offset = 1, .row_offset = row, .wrap = .none });
+        } else {
+            _ = box.print(&.{.{ .text = "  !! This will break peer sync. All peers must", .style = warn_style }}, .{ .col_offset = 1, .row_offset = row, .wrap = .none });
+            row += 1;
+            _ = box.print(&.{.{ .text = "     be updated and restarted with matching config.", .style = warn_style }}, .{ .col_offset = 1, .row_offset = row, .wrap = .none });
+        }
         row += 1;
-        _ = box.print(&.{.{ .text = "     be updated and restarted with matching config.", .style = warn_style }}, .{ .col_offset = 1, .row_offset = row, .wrap = .none });
+    } else if (has_sync and cfg_sync_on) {
+        row += 1;
+        _ = box.print(&.{.{ .text = "  Changes will be synced to peers automatically.", .style = drift_style }}, .{ .col_offset = 1, .row_offset = row, .wrap = .none });
         row += 1;
     }
 

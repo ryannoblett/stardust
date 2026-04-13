@@ -51,6 +51,37 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
+    // Relay agent binary — lightweight, no vaxis/libssh dependencies.
+    const relay_mod = b.createModule(.{
+        .root_source_file = b.path("relay_main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    relay_mod.addImport("yaml", yaml_mod);
+    const relay_exe = b.addExecutable(.{
+        .name = "stardust-relay",
+        .root_module = relay_mod,
+    });
+    relay_exe.linkLibC();
+    b.installArtifact(relay_exe);
+    const relay_run_cmd = b.addRunArtifact(relay_exe);
+    if (b.args) |args| relay_run_cmd.addArgs(args);
+    const relay_run_step = b.step("run-relay", "Run the DHCP relay agent");
+    relay_run_step.dependOn(&relay_run_cmd.step);
+
+    // Relay test step
+    const relay_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("relay_main.zig"),
+            .target = target,
+            .optimize = .Debug,
+        }),
+    });
+    relay_tests.root_module.addImport("yaml", yaml_mod);
+    relay_tests.linkLibC();
+    const relay_test_step = b.step("test-relay", "Run relay unit tests");
+    relay_test_step.dependOn(&b.addRunArtifact(relay_tests).step);
+
     // Dev step (debug optimizations)
     const dev_mod = b.createModule(.{
         .root_source_file = b.path("main.zig"),

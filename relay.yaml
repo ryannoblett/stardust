@@ -1,0 +1,28 @@
+# Stardust DHCP Relay Agent configuration
+#
+# Only upstream_servers is required. Downstream interfaces are auto-detected
+# unless overridden with downstream_interfaces or downstream_ip.
+
+log_level: "info"
+
+# Upstream DHCP server(s) to forward client requests to.
+upstream_servers:
+  - "10.0.0.10"
+
+# Optional: manually specify downstream interfaces (skip auto-detection).
+# downstream_interfaces:
+#   - "eth1"
+#   - "eth2"
+
+# Optional: single downstream IP for simple setups (skip auto-detection).
+# downstream_ip: "10.0.1.1"
+
+# Maximum hop count before dropping a packet (loop prevention, RFC 2131).
+max_hops: 16
+
+# Option 82 — Relay Agent Information (RFC 3046).
+option82:
+  enable: true
+  circuit_id: "auto"              # "auto" = use interface name per-interface
+  remote_id: ""                   # empty = omit sub-option 2
+  policy: "replace"               # replace | append | drop | keep

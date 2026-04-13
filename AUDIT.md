@@ -12,6 +12,9 @@ remaining findings that are low-severity or by-design.
 - **Round 5** (2026-04-02): Exhaustive line-by-line final sweep
 - **Round 6** (2026-04-05): Config sync feature audit + natural sort bug
 - **Round 7** (2026-04-05): Exhaustive re-verification after config sync
+- **Round 8** (2026-04-12): DHCP relay agent — initial memory audit
+- **Round 9** (2026-04-12): DHCP relay agent — post-fix verification
+- **Round 10** (2026-04-12): DHCP relay agent — final sweep after SIGHUP reload, upstream socket fix
 
 ---
 
@@ -89,6 +92,39 @@ remaining findings that are low-severity or by-design.
 | 36 | state.zig | Medium | `saveUnlocked` temp file not deleted if `rename` fails — added explicit cleanup in catch block |
 | 37 | sync.zig | Low | `processPoolConfigUpdate` error log didn't clarify that in-memory update succeeded — improved message to note anti-entropy retry |
 
+### Round 8 — Relay Agent Initial Audit
+
+| # | File | Severity | Description |
+|---|------|----------|-------------|
+| 38 | relay_config.zig | Critical | ArenaAllocator stored by value in RelayConfig — copy on return corrupted internal linked list, causing 2 leaked GPA allocations on shutdown. Fixed by heap-allocating the arena via `allocator.create(ArenaAllocator)` |
+| 39 | relay_main.zig | Medium | logFn always printed timestamps (duplicated by journald) and used `[relay]` instead of log level like `[INFO]`. Rewrote to match server's logFn with JOURNAL_STREAM detection |
+| 40 | relay.zig | Medium | `appendOption82` no bounds check before `@intCast(payload.len)` to u8. Added `payload.len > 255` guard |
+| 41 | relay.zig | Medium | `stripOption82Raw` could return packet without End marker if buffer filled exactly. Changed option copy check to reserve +1 byte for End marker |
+
+### Round 9 — Relay Post-Fix Verification
+
+| # | File | Severity | Description |
+|---|------|----------|-------------|
+| 42 | relay_main.zig | Critical | `g_running`/`g_reload` were plain `bool` — data race between signal handler and main loop. Changed to `std.atomic.Value(bool)` with `.monotonic` ordering |
+| 43 | relay_main.zig | Critical | `config_path` pointed into `args` iterator memory — use-after-free when iterator was freed. Fixed by duping into owned memory; args iterator scoped to a block |
+| 44 | relay.zig | Critical | `reloadConfig` freed `self.upstream_addrs` before `toOwnedSlice` succeeded — inconsistent state on OOM. Reordered: finalize new slice first, then free old |
+| 45 | relay_main.zig | Medium | GPA `stack_trace_frames = 8` in production builds added overhead. Made debug-only via `builtin.mode` check |
+| 46 | relay.zig | Medium | `stripOption82Raw` Pad byte copy didn't reserve space for End marker — could overflow if buffer filled with Pads. Changed check to `out_pos + 1 < out_buf.len` |
+
+### Round 10 — Relay Final Sweep
+
+| # | File | Severity | Description |
+|---|------|----------|-------------|
+| 47 | relay.zig | Critical | `upstream_sock` was not polled — server BOOTREPLYs to giaddr:67 were never received. `relayServerToClient` was dead code. Added upstream_sock to poll set, bound to port 67 |
+| 48 | relay.zig | Critical | `upstream_sock` bound to `0.0.0.0:67` without `SO_BINDTODEVICE` — kernel non-deterministically delivered client broadcasts to upstream socket instead of downstream sockets, causing ~50% of DISCOVERs to be silently dropped. Fixed by detecting upstream interface and binding with `SO_BINDTODEVICE` |
+| 49 | relay.zig | Medium | `detectUpstreamIfaceIp` only returned IP — renamed to `detectUpstreamIface`, returns full `IfaceDetectInfo` (name + IP + index) needed for `SO_BINDTODEVICE` |
+| 50 | relay.zig | Low | No logging when BOOTREQUEST dropped on upstream socket. Added debug log for troubleshooting |
+| 51 | admin_ssh.zig | Medium | Pool save confirm screen showed "break peer sync / manual restart needed" even when config_sync was enabled and would auto-push changes. Added config_sync-aware messaging: "Peers will be synced automatically. If sync fails, manual update needed" |
+| 52 | dhcp.zig | Medium | Option 82 sub-options logged as hex (`{x}`) even when printable ASCII (e.g., interface names). Added `isPrintable` check — shows `"eth4"` instead of `65746834` |
+| 53 | dhcp.zig | Low | Option 82 log messages didn't identify which relay sent them. Added giaddr (relay IP) to all Option 82 log lines |
+| 54 | admin_ssh.zig | Low | Uptime display only showed hours/minutes. Extended to years/months/weeks/days/hours/minutes with appropriate unit selection |
+| 55 | metrics.zig | Medium | Defense counters (probe_conflict, decline_ip_quarantined, decline_mac_blocked, decline_global_limited, decline_refused) and SSH counters (attempts, logins, failures) not published to HTTP /metrics endpoint. Added `stardust_defense_events_total` and `stardust_ssh_events_total` metric families |
+
 ---
 
 ## Remaining Findings (not fixed — low severity or by-design)
@@ -120,6 +156,15 @@ remaining findings that are low-severity or by-design.
 | dhcp.zig | `encodeDnsSearchList` skips domains that overflow buffer | **Logs info** with domain name |
 | config.zig | `isValidDomainName` allows single-character TLDs | RFC-compliant; single-char TLDs exist (.x, .z proposed) |
 
+### Relay Agent — Design Limitations
+
+| File | Description | Status |
+|------|-------------|--------|
+| relay.zig | `detectUpstreamIface` fallback: if upstream interface detection fails, upstream socket binds to INADDR_ANY without SO_BINDTODEVICE — can steal downstream broadcasts | **Logs error** with remediation advice (set downstream_interfaces in config). Rare failure case requiring broken routing |
+| relay.zig | `reloadConfig` does not rebind upstream socket — if upstream servers change to route through a different interface, relay needs restart | By design — rebinding mid-operation would drop in-flight replies. Documented limitation |
+| relay.zig | `findIfaceByIp` does not check IFF_UP flag — could bind upstream socket to a down interface | Acceptable — interface may come up later; relay would recover when it does |
+| relay.zig | Server reply reception assumes relay's upstream IP is routable from server, not just giaddr | Standard relay topology assumption per RFC 2131 |
+
 ### Edge Cases (correct but worth noting)
 
 | File | Description |
@@ -134,7 +179,7 @@ remaining findings that are low-severity or by-design.
 
 ## Test Coverage Summary
 
-**Total tests: ~440 across 10 files**
+**Total tests: ~445 across 11 files**
 
 | File | Tests | Coverage |
 |------|-------|----------|
@@ -148,6 +193,7 @@ remaining findings that are low-severity or by-design.
 | util.zig | 4 | String escaping utilities |
 | probe.zig | 2 | ARP/ICMP probe helpers |
 | metrics.zig | 3 | Pool capacity computation (/24, /30, /31, /32) |
+| relay.zig | 5 | Option 82 strip/append, client destination routing (broadcast flag, ciaddr unicast) |
 
 ### Notable test coverage
 
@@ -166,3 +212,8 @@ remaining findings that are low-severity or by-design.
 | Prometheus metrics HTTP response format | Requires HTTP client or socket testing |
 | SSH authorized_keys file parsing | Requires filesystem mocking |
 | Per-MAC decline threshold window expiry | Requires time manipulation |
+| Relay relayClientToServer / relayServerToClient | Requires bound sockets and network interfaces |
+| Relay Option 82 policy branches (.replace, .keep, .append) | Integration test — requires full packet round-trip |
+| Relay reloadConfig success/failure paths | Requires filesystem + config loading |
+| Relay interface auto-detection edge cases | Requires /sys/class/net mocking |
+| Relay poll loop dispatch (upstream vs downstream) | Requires multiple bound sockets |
