@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.4-alpha1 (2026-04-13)
+
+### DHCP Relay Agent (stardust-relay)
+
+New lightweight relay binary (`stardust-relay`, 12MB vs 42MB server) for forwarding DHCP between subnets:
+
+- **Auto-detect downstream interfaces**: excludes the upstream route interface automatically
+- **Per-interface sockets**: SO_BINDTODEVICE with correct giaddr per downstream interface
+- **Option 82 (Relay Agent Information)**: configurable policy — replace, append, drop, or keep
+- **SIGHUP config reload**: upstream servers, option82, max_hops, log level
+- **Shared packet parsing**: new `dhcp_common.zig` module shared between server and relay (no libssh/libvaxis dependencies)
+- **YAML config**: `relay.yaml` with upstream servers, interface list, option82 settings
+
+### Option 82 Server Support (RFC 3046)
+
+- **Echo Option 82**: OFFER, ACK, NAK, and INFORM responses echo relay agent information per RFC 3046 §2.2
+- **Lease storage**: `relay_agent` (hex-encoded Option 82) and `relay_ip` (giaddr) stored on leases and synced to peers
+
+### TUI Improvements
+
+- **Relay columns**: new relay IP and relay port columns in lease table (right-aligned, shrink-first priority)
+- **Compact type column**: dynamic→dyn, reserved→resv, conflict→block
+- **Improved expiry format**: `13d+19h` for >1 day, `11h+04m` for <1 day, `none` for reserved
+- **Hostname sizing**: capped at 24 chars initially, fills remaining terminal width
+
+### Bug Fixes
+
+- Memory leak: relay_agent/relay_ip not freed in remove/forceRemove lease paths
+- Expiry format: i64 remainder cast to u64 to avoid sign display in format string
+
+---
+
 ## v0.3-alpha3 (2026-04-12)
 
 ### TUI Improvements
